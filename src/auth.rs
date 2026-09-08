@@ -58,7 +58,11 @@ impl AccountTrait for CustomTokenAccount {
 
             match &res {
                 Ok(_) => tracing::info!("Mojang sessionserver join successful!"),
-                Err(e) => tracing::error!("Mojang sessionserver join failed: {e:?}"),
+                Err(e) => {
+                    tracing::error!("Mojang sessionserver join failed: {e:?}");
+                    tracing::error!("NOTE: 'ForbiddenOperation' means your MC_TOKEN has expired or is invalid.");
+                    tracing::error!("Please generate a fresh access token from your launcher/auth script and update MC_TOKEN in .env!");
+                }
             }
 
             res
@@ -109,10 +113,29 @@ impl CustomTokenAccount {
             pfd: Vec<ProfileData>,
             #[serde(default)]
             profiles: Option<serde_json::Value>,
+            #[serde(default)]
+            exp: Option<u64>,
         }
 
         let payload: JwtPayload = serde_json::from_slice(&payload_bytes)
             .map_err(|e| anyhow::anyhow!("Failed to parse JWT payload JSON: {e}"))?;
+
+        if let Some(exp) = payload.exp {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if exp <= now {
+                let expired_mins_ago = (now - exp) / 60;
+                tracing::warn!(
+                    "⚠️ WARNING: The provided MC_TOKEN expired ~{} minute(s) ago! (exp: {}, now: {}). Mojang will reject server joins with 'ForbiddenOperation'. Please update MC_TOKEN in .env with a fresh token.",
+                    expired_mins_ago, exp, now
+                );
+            } else {
+                let remaining_mins = (exp - now) / 60;
+                tracing::info!("MC_TOKEN is valid for ~{} more minute(s).", remaining_mins);
+            }
+        }
 
         let mut username = String::new();
         let mut uuid_str = String::new();
