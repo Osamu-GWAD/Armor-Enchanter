@@ -29,9 +29,10 @@ An autonomous, high-performance Minecraft enchanting bot built in Rust with [Aza
     - **Boots**: Blast Protection IV (8 lvl) $\to$ Unbreaking III (4 lvl) $\to$ Mending (5 lvl)
 
 - **Anti-Cheat Resilient & Humanized Interactions**:
-  - **Smooth View Interpolation**: Mimics human mouse rotation using a cosine ease-in-out curve ($\alpha = \frac{1 - \cos(\pi t)}{2}$) over 5–15 ticks, eliminating abrupt aim snapping.
+  - **Smooth View Interpolation**: Mimics human mouse rotation using a cosine ease-in-out curve ($\alpha = \frac{1 - \cos(\pi t)}{2}$) over 2–6 ticks, eliminating abrupt aim snapping while keeping rotations responsive.
   - **Arm Swing Animations**: Sends `ServerboundSwing` packet on every bottle thrown, anvil placement, and anvil block interaction.
   - **Armor Equip Prevention**: Automatically selects safe hotbar slots (holding books or empty hands) when clicking blocks, and actively unequips armor if accidentally worn.
+  - **High-Speed Throughput**: Optimized container packet delays, quickmove transfers (3 ticks / 150ms), and sub-second anvil combines allow the complete order retrieval, placement, and all 12 combines to finish in under 35 seconds.
   - **Strict 4-Piece Verification**: Ensures all 4 pieces (Helmet, Chestplate, Leggings, Boots) are present and verified to have all 3 required enchantments before concluding.
 
 ---

@@ -108,8 +108,12 @@ pub async fn smooth_look(bot: &Client, target_yaw: f32, target_pitch: f32) {
         return;
     }
 
-    // Human rotation speed: approximately 8-15 degrees per tick (clamp between 5 and 15 ticks)
-    let steps = ((total_dist / 10.0).round() as usize).clamp(5, 15);
+    // Fast human rotation speed: approximately 20-35 degrees per tick (clamp between 2 and 6 ticks)
+    if total_dist < 4.0 {
+        bot.set_direction(target_yaw, target_pitch);
+        return;
+    }
+    let steps = ((total_dist / 18.0).round() as usize).clamp(2, 6);
 
     for i in 1..=steps {
         let t = (i as f32) / (steps as f32);
@@ -203,7 +207,7 @@ impl EnchanterManager {
         // Aim smoothly down at the bot's feet
         let dir = bot.direction();
         smooth_look(bot, dir.y_rot(), 90.0).await;
-        bot.wait_ticks(3).await;
+        bot.wait_ticks(1).await;
 
         while current_lvl < target_level && bottles_to_throw > 0 {
             // Find XP bottles in inventory
@@ -231,12 +235,12 @@ impl EnchanterManager {
             } else {
                 info!("Swapping XP bottles from slot #{slot} to hotbar slot #0...");
                 Self::swap_to_hotbar(bot, slot, 0);
-                bot.wait_ticks(6).await;
+                bot.wait_ticks(2).await;
                 0
             };
 
             bot.set_selected_hotbar_slot(hotbar_idx);
-            bot.wait_ticks(3).await;
+            bot.wait_ticks(1).await;
 
             let batch = bottles_to_throw.min(count as u32).min(64);
             info!("Throwing batch of {batch} XP bottles at feet (rapid human click)...");
@@ -251,8 +255,8 @@ impl EnchanterManager {
                 bot.wait_ticks(1).await;
             }
 
-            // Wait 15 ticks for experience orbs to be absorbed and SetExperience to arrive
-            bot.wait_ticks(15).await;
+            // Wait 5 ticks for experience orbs to be absorbed and SetExperience to arrive
+            bot.wait_ticks(5).await;
 
             let (new_lvl, new_prog) = self.get_level_and_progress();
             current_lvl = new_lvl;
@@ -295,7 +299,7 @@ impl EnchanterManager {
         let yaw_t = (-dx_t).atan2(dz_t).to_degrees() as f32;
         let pitch_t = (-dy_t).atan2(h_dist_t).to_degrees() as f32;
         smooth_look(bot, yaw_t, pitch_t).await;
-        bot.wait_ticks(5).await;
+        bot.wait_ticks(2).await;
 
         let hit_res = bot.hit_result();
         let hit_debug = format!("{hit_res:?}");
@@ -344,11 +348,11 @@ impl EnchanterManager {
         if slot != 37 {
             info!("Swapping Anvil from slot #{slot} to hotbar slot #1...");
             Self::swap_to_hotbar(bot, slot, 1);
-            bot.wait_ticks(10).await;
+            bot.wait_ticks(2).await;
         }
 
         bot.set_selected_hotbar_slot(1);
-        bot.wait_ticks(5).await;
+        bot.wait_ticks(1).await;
 
         let player_pos = bot.position();
         let base_x = player_pos.x.floor() as i32;
@@ -371,13 +375,13 @@ impl EnchanterManager {
         let yaw = (-dx).atan2(dz).to_degrees() as f32;
         let pitch = (-dy).atan2(horizontal_dist).to_degrees() as f32;
         smooth_look(bot, yaw, pitch).await;
-        bot.wait_ticks(8).await;
+        bot.wait_ticks(2).await;
 
         info!("Crosshair before place: {:?}", bot.hit_result());
         info!("Placing Anvil on ground block at {:?} (aiming yaw: {yaw:.1}, pitch: {pitch:.1})...", ground_pos);
         bot.block_interact(ground_pos);
         swing_arm(bot);
-        bot.wait_ticks(20).await;
+        bot.wait_ticks(5).await;
 
         self.anvil_pos = Some(BlockPos::new(ground_pos.x, ground_pos.y + 1, ground_pos.z));
         self.anvil_placed = true;
@@ -415,7 +419,7 @@ impl EnchanterManager {
         }
         let target_hotbar = safe_hotbar.unwrap_or(0);
         bot.set_selected_hotbar_slot(target_hotbar);
-        bot.wait_ticks(5).await;
+        bot.wait_ticks(1).await;
 
         let target_pos = self.anvil_pos.unwrap_or_else(|| {
             let p = bot.position();
@@ -436,12 +440,12 @@ impl EnchanterManager {
         let yaw = (-dx).atan2(dz).to_degrees() as f32;
         let pitch = (-dy).atan2(horizontal_dist).to_degrees() as f32;
         smooth_look(bot, yaw, pitch).await;
-        bot.wait_ticks(8).await;
+        bot.wait_ticks(2).await;
 
         info!("Interacting to open Anvil at {:?} with safe hotbar slot #{}...", target_pos, target_hotbar);
         bot.block_interact(target_pos);
         swing_arm(bot);
-        bot.wait_ticks(20).await;
+        bot.wait_ticks(6).await;
     }
 
     /// Handles Anvil GUI opening.
@@ -623,7 +627,7 @@ impl EnchanterManager {
                             carried_item: HashedStack(None),
                         };
                         bot.write_packet(packet);
-                        bot.wait_ticks(10).await;
+                        bot.wait_ticks(3).await;
                     }
                 }
             }
@@ -647,7 +651,7 @@ impl EnchanterManager {
             if !matches!(item2, ItemStack::Empty) {
                 info!("Output slot #2 has an item; collecting it via QuickMove...");
                 self.click_anvil(bot, container_id, 2, ClickType::QuickMove);
-                bot.wait_ticks(20).await;
+                bot.wait_ticks(4).await;
                 return false;
             }
         }
@@ -657,7 +661,7 @@ impl EnchanterManager {
             if !matches!(item0, ItemStack::Empty) {
                 info!("Input slot #0 has a leftover item; clearing it via QuickMove...");
                 self.click_anvil(bot, container_id, 0, ClickType::QuickMove);
-                bot.wait_ticks(15).await;
+                bot.wait_ticks(3).await;
                 return false;
             }
         }
@@ -665,7 +669,7 @@ impl EnchanterManager {
             if !matches!(item1, ItemStack::Empty) {
                 info!("Input slot #1 has a leftover item; clearing it via QuickMove...");
                 self.click_anvil(bot, container_id, 1, ClickType::QuickMove);
-                bot.wait_ticks(15).await;
+                bot.wait_ticks(3).await;
                 return false;
             }
         }
@@ -696,18 +700,18 @@ impl EnchanterManager {
                 task.armor_desc, task.enchant_name, task.required_level, cur_lvl, cur_prog * 100.0, needed_xp, bottles_to_throw
             );
             self.close_anvil(bot, container_id);
-            bot.wait_ticks(15).await;
+            bot.wait_ticks(2).await;
 
             self.throw_exact_xp_bottles(bot, task.required_level).await;
-            bot.wait_ticks(15).await;
+            bot.wait_ticks(2).await;
 
             // Ensure no armor was accidentally equipped
             Self::ensure_no_worn_armor(bot, &self.player_inventory).await;
-            bot.wait_ticks(8).await;
+            bot.wait_ticks(2).await;
 
             info!("Re-opening Anvil to combine {} with {}...", task.armor_desc, task.enchant_name);
             self.open_anvil(bot).await;
-            bot.wait_ticks(25).await;
+            bot.wait_ticks(5).await;
             return false;
         }
 
@@ -733,15 +737,15 @@ impl EnchanterManager {
 
         // Put item into Slot 0
         self.click_anvil(bot, container_id, item_inventory_slot, ClickType::Pickup);
-        bot.wait_ticks(15).await;
+        bot.wait_ticks(3).await;
         self.click_anvil(bot, container_id, 0, ClickType::Pickup);
-        bot.wait_ticks(15).await;
+        bot.wait_ticks(3).await;
 
         // Put book into Slot 1
         self.click_anvil(bot, container_id, book_inventory_slot, ClickType::Pickup);
-        bot.wait_ticks(15).await;
+        bot.wait_ticks(3).await;
         self.click_anvil(bot, container_id, 1, ClickType::Pickup);
-        bot.wait_ticks(25).await; // Wait for server to calculate recipe and update slot 2
+        bot.wait_ticks(5).await; // Wait for server to calculate recipe and update slot 2
 
         let server_cost = self.server_anvil_cost.load(Ordering::SeqCst);
         let cur_lvl = self.current_level.load(Ordering::SeqCst);
@@ -752,16 +756,16 @@ impl EnchanterManager {
         if server_cost > cur_lvl {
             info!("Server cost ({server_cost}) exceeds current level ({cur_lvl})! Taking items back to throw more XP...");
             self.click_anvil(bot, container_id, 0, ClickType::QuickMove);
-            bot.wait_ticks(10).await;
+            bot.wait_ticks(3).await;
             self.click_anvil(bot, container_id, 1, ClickType::QuickMove);
-            bot.wait_ticks(10).await;
+            bot.wait_ticks(3).await;
             return;
         }
 
         // Collect result from Slot 2
         info!("Claiming combined enchanted item from Anvil output slot #2...");
         self.click_anvil(bot, container_id, 2, ClickType::QuickMove);
-        bot.wait_ticks(25).await;
+        bot.wait_ticks(4).await;
 
         self.anvil_slots.remove(&book_inventory_slot);
         self.anvil_slots.remove(&0);

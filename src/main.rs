@@ -141,16 +141,16 @@ async fn handle(bot: Client, event: Event, state: BotState) -> Result<(), anyhow
                 let state_clone = state.clone();
 
                 tokio::spawn(async move {
-                    // Wait 12 seconds (240 ticks) for chunk loading and DonutSMP spawn command cooldown
-                    info!("Waiting 12 seconds (240 ticks) for server spawn cooldown before sending commands...");
-                    bot_clone.wait_ticks(240).await;
+                    // Wait 3 seconds (60 ticks) for chunk loading and DonutSMP spawn command cooldown
+                    info!("Waiting 3 seconds (60 ticks) for server spawn cooldown before sending commands...");
+                    bot_clone.wait_ticks(60).await;
 
                     // Teleport to player base using /home 1 so block interactions (anvil) are in non-protected territory
                     let initial_pos = bot_clone.position();
                     info!("Initial spawn position: {:?}", initial_pos);
                     info!("Teleporting to base via /home 1...");
                     bot_clone.chat("/home 1");
-                    bot_clone.wait_ticks(160).await; // 8 seconds for teleport settle
+                    bot_clone.wait_ticks(40).await; // 2 seconds for teleport settle
 
                     let current_pos = bot_clone.position();
                     info!("Position after /home 1: {:?}", current_pos);
@@ -271,7 +271,7 @@ async fn handle_packet(bot: &Client, packet: &Arc<ClientboundGamePacket>, state:
                     let state_clone = state.clone();
 
                     tokio::spawn(async move {
-                        bot_clone.wait_ticks(15).await;
+                        bot_clone.wait_ticks(5).await;
                         let mut g = state_clone.gui.lock().await;
                         let done = g.process_gui_actions(&bot_clone).await;
 
@@ -282,14 +282,14 @@ async fn handle_packet(bot: &Client, packet: &Arc<ClientboundGamePacket>, state:
                             let player_inv = g.player_inventory.clone();
                             drop(g);
 
-                            bot_clone.wait_ticks(30).await;
+                            bot_clone.wait_ticks(6).await;
                             info!("Placing Anvil on ground adjacent to bot...");
                             {
                                 let mut ench = state_clone.enchanter.lock().await;
                                 ench.place_anvil(&bot_clone, &player_inv).await;
                             }
 
-                            bot_clone.wait_ticks(20).await;
+                            bot_clone.wait_ticks(5).await;
                             info!("Anvil placed! Transitioning to Phase 2: Items Retrieval.");
                             {
                                 let mut g = state_clone.gui.lock().await;
@@ -297,7 +297,7 @@ async fn handle_packet(bot: &Client, packet: &Arc<ClientboundGamePacket>, state:
                                 g.state = OrderWorkflowState::WaitingForNextOrder;
                             }
 
-                            bot_clone.wait_ticks(30).await;
+                            bot_clone.wait_ticks(8).await;
                             info!("Opening /order for Phase 2 (Items Retrieval)...");
                             bot_clone.chat("/order");
                             return;
@@ -367,8 +367,8 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
     let state_clone = state.clone();
 
     tokio::spawn(async move {
-        // Wait 30 ticks for any previous container close packet to settle on the server
-        bot_ench.wait_ticks(30).await;
+        // Wait 6 ticks for any previous container close packet to settle on the server
+        bot_ench.wait_ticks(6).await;
 
         let player_inv = {
             let gui = state_clone.gui.lock().await;
@@ -377,7 +377,7 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
 
         // 1. Ensure any worn armor is unequipped
         EnchanterManager::ensure_no_worn_armor(&bot_ench, &player_inv).await;
-        bot_ench.wait_ticks(15).await;
+        bot_ench.wait_ticks(3).await;
 
         // 2. Ensure Anvil is placed
         {
@@ -385,7 +385,7 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
             ench.place_anvil(&bot_ench, &player_inv).await;
         }
 
-        bot_ench.wait_ticks(25).await;
+        bot_ench.wait_ticks(5).await;
 
         // 3. Open Anvil
         {
@@ -393,7 +393,7 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
             ench.open_anvil_with_inv(&bot_ench, &player_inv).await;
         }
 
-        bot_ench.wait_ticks(30).await;
+        bot_ench.wait_ticks(6).await;
 
         // 4. Single master loop for anvil combines
         loop {
@@ -424,7 +424,7 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
                     let ench = state_clone.enchanter.lock().await;
                     ench.open_anvil_with_inv(&bot_ench, &current_inv).await;
                 }
-                bot_ench.wait_ticks(30).await;
+                bot_ench.wait_ticks(6).await;
                 continue;
             }
 
@@ -440,7 +440,7 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
             }
             drop(ench);
 
-            bot_ench.wait_ticks(25).await;
+            bot_ench.wait_ticks(4).await;
         }
     });
 }

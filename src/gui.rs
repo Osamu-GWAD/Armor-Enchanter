@@ -432,7 +432,7 @@ impl GuiManager {
 
         let dir = bot.direction();
         crate::enchanter::smooth_look(bot, dir.y_rot(), 90.0).await;
-        bot.wait_ticks(5).await;
+        bot.wait_ticks(2).await;
 
         for (slot, count) in bottle_slots {
             if excess_to_throw <= 0 {
@@ -441,14 +441,14 @@ impl GuiManager {
 
             if slot < 36 || slot > 44 {
                 Self::swap_to_hotbar_static(bot, slot, 0);
-                bot.wait_ticks(10).await;
+                bot.wait_ticks(2).await;
             } else {
                 let h = (slot - 36) as u8;
                 bot.set_selected_hotbar_slot(h);
-                bot.wait_ticks(5).await;
+                bot.wait_ticks(1).await;
             }
             bot.set_selected_hotbar_slot(0);
-            bot.wait_ticks(5).await;
+            bot.wait_ticks(1).await;
 
             let throw_count = excess_to_throw.min(count);
             info!("Splashing {throw_count} excess XP bottles at feet with human arm swings...");
@@ -460,13 +460,13 @@ impl GuiManager {
                     x_rot: 90.0,
                 });
                 crate::enchanter::swing_arm(bot);
-                bot.wait_ticks(3).await;
+                bot.wait_ticks(1).await;
             }
             excess_to_throw -= throw_count;
-            bot.wait_ticks(10).await;
+            bot.wait_ticks(2).await;
         }
 
-        bot.wait_ticks(20).await;
+        bot.wait_ticks(5).await;
         self.reset_and_sync_inventory(Some(bot));
         info!(
             "Finished splashing excess XP! Free inventory slots now: {}",
@@ -659,7 +659,7 @@ impl GuiManager {
                     info!("Clicking 'Your Orders' button at slot #{slot}...");
                     self.state = OrderWorkflowState::NavigatingToYourOrders;
                     self.click_slot(bot, slot, ClickType::Pickup);
-                    bot.wait_ticks(20).await;
+                    bot.wait_ticks(5).await;
                     true
                 } else {
                     warn!("Could not find 'Your Orders' button in /order main menu! Available slots:");
@@ -748,7 +748,7 @@ impl GuiManager {
                         info!("Found needed order '{order_name}' at slot #{slot} (Phase: {:?})! Left-clicking to open Edit/Claim submenu...", self.phase);
                         self.target_order_type = Some(order_name.to_string());
                         self.click_slot(bot, slot, ClickType::Pickup);
-                        bot.wait_ticks(20).await;
+                        bot.wait_ticks(5).await;
                         return true;
                     } else {
                         // Mark this slot as not needed for this menu session
@@ -822,7 +822,7 @@ impl GuiManager {
                         self.phase
                     );
                     self.close_current_gui(bot);
-                    bot.wait_ticks(20).await;
+                    bot.wait_ticks(5).await;
                     return true;
                 }
                 self.target_order_type = Some(name.to_string());
@@ -832,7 +832,7 @@ impl GuiManager {
         if let Some(collect_slot) = self.find_collect_button_slot() {
             info!("Clicking 'Collect' button at slot #{collect_slot}...");
             self.click_slot(bot, collect_slot, ClickType::Pickup);
-            bot.wait_ticks(20).await;
+            bot.wait_ticks(5).await;
             return true;
         } else {
             warn!("Could not find Collect button in Edit Order window! Logging slots:");
@@ -902,7 +902,7 @@ impl GuiManager {
                         self.collected.diamond_boots, self.quota.diamond_boots_needed,
                     );
 
-                    bot.wait_ticks(15).await; // 750ms anticheat safe delay
+                    bot.wait_ticks(3).await; // 150ms anticheat safe quickmove delay
 
                     // If quota for this item type is now met, stop withdrawing from this order
                     let (still_needed, _) = self.is_order_needed(&info);
@@ -926,7 +926,7 @@ impl GuiManager {
 
         info!("Closing delivery container...");
         self.close_current_gui(bot);
-        bot.wait_ticks(30).await;
+        bot.wait_ticks(6).await;
 
         let phase_done = match self.phase {
             WithdrawalPhase::AnvilPlacement => self.collected.anvils >= self.quota.anvils_needed,
@@ -944,9 +944,9 @@ impl GuiManager {
             }
             return true;
         } else {
-            info!("Phase {:?} not yet fulfilled. Waiting 40 ticks before opening /order again...", self.phase);
+            info!("Phase {:?} not yet fulfilled. Waiting 8 ticks before opening /order again...", self.phase);
             self.state = OrderWorkflowState::WaitingForNextOrder;
-            bot.wait_ticks(40).await;
+            bot.wait_ticks(8).await;
             info!("Sending /order for next item...");
             bot.chat("/order");
             return true;
