@@ -16,7 +16,20 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tracing::{info, warn};
 
-/// Cumulative XP required to reach a given level from level 0 (Java Edition formula).
+/// Experience points required to advance from Level L to Level L + 1 in Minecraft Java Edition.
+pub fn xp_to_next_level(level: u32) -> u32 {
+    match level {
+        0..=15 => 2 * level + 7,
+        16..=30 => 5 * level - 38,
+        _ => 9 * level - 158,
+    }
+}
+
+/// Cumulative XP required to reach Level L starting from Level 0 with 0 XP (Java Edition formula).
+/// Official formulas:
+/// - Level 0..=16:  L^2 + 6L
+/// - Level 17..=31: 2.5 * L^2 - 40.5 * L + 360
+/// - Level 32+:     4.5 * L^2 - 162.5 * L + 2220
 pub fn total_xp_for_level(level: u32) -> u32 {
     match level {
         0 => 0,
@@ -32,9 +45,36 @@ pub fn total_xp_for_level(level: u32) -> u32 {
     }
 }
 
-/// Calculate the exact number of Bottles o' Enchanting needed to reach `target_level`
-/// from the current XP state.
-/// On Minecraft Java Edition, each bottle yields 3 to 11 XP (average 7.0 XP).
+/// Calculate the true current experience points from the current level and the progress bar (0.0 to 1.0).
+pub fn calculate_current_xp(level: u32, progress: f32) -> u32 {
+    let base_xp = total_xp_for_level(level);
+    let bar_xp = (progress.clamp(0.0, 1.0) * xp_to_next_level(level) as f32).round() as u32;
+    base_xp + bar_xp
+}
+
+/// Computes the exact XP deficit required to go from `from_level` (with progress) to `target_level`.
+pub fn xp_difference(from_level: u32, from_progress: f32, target_level: u32) -> u32 {
+    if from_level >= target_level {
+        return 0;
+    }
+    let target_xp = total_xp_for_level(target_level);
+    let current_xp = calculate_current_xp(from_level, from_progress);
+    target_xp.saturating_sub(current_xp)
+}
+
+/// Calculate the exact number of Bottles o' Enchanting needed to go from `from_level` (with progress) to `target_level`.
+/// Each bottle yields an average of 7.0 XP (random uniform 3..=11).
+/// To ensure reliable level attainment on the first attempt without under-throwing due to RNG variance,
+/// we use an effective conservative rate of 6.8 XP per bottle (ceiling division).
+pub fn bottles_between_levels(from_level: u32, from_progress: f32, target_level: u32) -> u32 {
+    let needed_xp = xp_difference(from_level, from_progress, target_level);
+    if needed_xp == 0 {
+        return 0;
+    }
+    ((needed_xp as f64 / 6.8).ceil() as u32).max(1)
+}
+
+/// Legacy/backward-compatible helper using raw total XP
 pub fn bottles_needed_for_level(current_total_xp: u32, current_level: u32, target_level: u32) -> u32 {
     if current_level >= target_level {
         return 0;
@@ -42,9 +82,9 @@ pub fn bottles_needed_for_level(current_total_xp: u32, current_level: u32, targe
     let target_xp = total_xp_for_level(target_level);
     let deficit = target_xp.saturating_sub(current_total_xp);
     if deficit == 0 {
-        return 1;
+        return 0;
     }
-    (deficit + 6) / 7
+    ((deficit as f64 / 6.8).ceil() as u32).max(1)
 }
 
 /// Smoothly look towards target (yaw, pitch) using human-like ease-in-out cosine interpolation over multiple ticks.
@@ -112,6 +152,7 @@ pub struct EnchanterManager {
     pub anvil_slots: HashMap<i16, ItemStack>,
     pub player_inventory: HashMap<i16, ItemStack>,
     pub current_level: Arc<AtomicU32>,
+    pub experience_progress_milli: Arc<AtomicU32>,
     pub total_experience: Arc<AtomicU32>,
     pub server_anvil_cost: Arc<AtomicU32>,
     pub enchanting_complete: bool,
@@ -128,32 +169,41 @@ impl EnchanterManager {
             anvil_slots: HashMap::new(),
             player_inventory: HashMap::new(),
             current_level: Arc::new(AtomicU32::new(0)),
+            experience_progress_milli: Arc::new(AtomicU32::new(0)),
             total_experience: Arc::new(AtomicU32::new(0)),
             server_anvil_cost: Arc::new(AtomicU32::new(0)),
             enchanting_complete: false,
         }
     }
 
-    /// Splash only the exact number of XP bottles needed to reach `target_level`
-    /// from current experience state.
+    /// Returns the current level and experience progress percentage (0.0 to 1.0)
+    pub fn get_level_and_progress(&self) -> (u32, f32) {
+        let lvl = self.current_level.load(Ordering::SeqCst);
+        let milli = self.experience_progress_milli.load(Ordering::SeqCst);
+        (lvl, (milli as f32) / 1000.0)
+    }
+
+    /// Splash the exact number of XP bottles needed to advance from the current level and progress
+    /// to `target_level` using rapid human-like right clicks and arm swing animations.
     pub async fn throw_exact_xp_bottles(&mut self, bot: &Client, target_level: u32) {
-        let mut current_lvl = self.current_level.load(Ordering::SeqCst);
-        let mut current_xp = self.total_experience.load(Ordering::SeqCst);
+        let (mut current_lvl, mut current_prog) = self.get_level_and_progress();
 
         if current_lvl >= target_level {
             info!("Already at level {} (target: {}). No XP bottles needed.", current_lvl, target_level);
             return;
         }
 
-        let mut bottles_to_throw = bottles_needed_for_level(current_xp, current_lvl, target_level);
+        let mut bottles_to_throw = bottles_between_levels(current_lvl, current_prog, target_level);
+        let needed_xp = xp_difference(current_lvl, current_prog, target_level);
         info!(
-            "Throwing {bottles_to_throw} XP bottles to reach Level {target_level} from Level {current_lvl} (Current Total XP: {current_xp})..."
+            "XP Progression: Current Level {} ({:.1}% progress) -> Target Level {} (Deficit: {} XP). Throwing {} bottles...",
+            current_lvl, current_prog * 100.0, target_level, needed_xp, bottles_to_throw
         );
 
         // Aim smoothly down at the bot's feet
         let dir = bot.direction();
         smooth_look(bot, dir.y_rot(), 90.0).await;
-        bot.wait_ticks(5).await;
+        bot.wait_ticks(3).await;
 
         while current_lvl < target_level && bottles_to_throw > 0 {
             // Find XP bottles in inventory
@@ -181,15 +231,15 @@ impl EnchanterManager {
             } else {
                 info!("Swapping XP bottles from slot #{slot} to hotbar slot #0...");
                 Self::swap_to_hotbar(bot, slot, 0);
-                bot.wait_ticks(10).await;
+                bot.wait_ticks(6).await;
                 0
             };
 
             bot.set_selected_hotbar_slot(hotbar_idx);
-            bot.wait_ticks(5).await;
+            bot.wait_ticks(3).await;
 
             let batch = bottles_to_throw.min(count as u32).min(64);
-            info!("Splashing {batch} XP bottles at feet with human arm swings...");
+            info!("Throwing batch of {batch} XP bottles at feet (rapid human click)...");
             for _ in 0..batch {
                 bot.write_packet(azalea::protocol::packets::game::s_use_item::ServerboundUseItem {
                     hand: InteractionHand::MainHand,
@@ -198,23 +248,28 @@ impl EnchanterManager {
                     x_rot: 90.0,
                 });
                 swing_arm(bot);
-                bot.wait_ticks(3).await;
+                bot.wait_ticks(1).await;
             }
 
-            // Wait 25 ticks (1.25s) for experience orbs to be absorbed and SetExperience to arrive
-            bot.wait_ticks(25).await;
+            // Wait 15 ticks for experience orbs to be absorbed and SetExperience to arrive
+            bot.wait_ticks(15).await;
 
-            current_lvl = self.current_level.load(Ordering::SeqCst);
-            current_xp = self.total_experience.load(Ordering::SeqCst);
-            info!("XP Update after splashing: Current Level: {current_lvl}, Total XP: {current_xp} (Target: {target_level})");
+            let (new_lvl, new_prog) = self.get_level_and_progress();
+            current_lvl = new_lvl;
+            current_prog = new_prog;
+            let current_xp = calculate_current_xp(current_lvl, current_prog);
+            info!(
+                "XP Update: Current Level: {} ({:.1}% progress, True Current XP: {}) [Target: Level {}]",
+                current_lvl, current_prog * 100.0, current_xp, target_level
+            );
 
             if current_lvl >= target_level {
                 break;
             }
 
-            bottles_to_throw = bottles_needed_for_level(current_xp, current_lvl, target_level);
+            bottles_to_throw = bottles_between_levels(current_lvl, current_prog, target_level);
             if bottles_to_throw > 0 {
-                info!("Slight XP shortfall due to drop variation. Throwing {bottles_to_throw} more bottle(s)...");
+                info!("Slight XP shortfall due to RNG variance (need {bottles_to_throw} more bottle(s))...");
             }
         }
 
@@ -631,28 +686,28 @@ impl EnchanterManager {
             }
         };
 
-        let cur_lvl = self.current_level.load(Ordering::SeqCst);
-        let cur_xp = self.total_experience.load(Ordering::SeqCst);
+        let (cur_lvl, cur_prog) = self.get_level_and_progress();
 
         if cur_lvl < task.required_level {
-            let bottles_to_throw = bottles_needed_for_level(cur_xp, cur_lvl, task.required_level);
+            let bottles_to_throw = bottles_between_levels(cur_lvl, cur_prog, task.required_level);
+            let needed_xp = xp_difference(cur_lvl, cur_prog, task.required_level);
             info!(
-                "Next combine: {} with {} requires Level {} (Current: Level {}, Total XP: {}). Closing anvil to throw {} XP bottles...",
-                task.armor_desc, task.enchant_name, task.required_level, cur_lvl, cur_xp, bottles_to_throw
+                "Next combine: {} with {} requires Level {} (Current: Level {}, {:.1}% progress, Need: {} XP). Closing anvil to throw {} XP bottles...",
+                task.armor_desc, task.enchant_name, task.required_level, cur_lvl, cur_prog * 100.0, needed_xp, bottles_to_throw
             );
             self.close_anvil(bot, container_id);
-            bot.wait_ticks(20).await;
+            bot.wait_ticks(15).await;
 
             self.throw_exact_xp_bottles(bot, task.required_level).await;
-            bot.wait_ticks(20).await;
+            bot.wait_ticks(15).await;
 
             // Ensure no armor was accidentally equipped
             Self::ensure_no_worn_armor(bot, &self.player_inventory).await;
-            bot.wait_ticks(10).await;
+            bot.wait_ticks(8).await;
 
             info!("Re-opening Anvil to combine {} with {}...", task.armor_desc, task.enchant_name);
             self.open_anvil(bot).await;
-            bot.wait_ticks(30).await;
+            bot.wait_ticks(25).await;
             return false;
         }
 
@@ -772,24 +827,58 @@ mod tests {
 
     #[test]
     fn test_bottles_needed_calculation() {
-        // From 0 XP to level 4 (40 XP) -> (40 + 6) / 7 = 6 bottles
+        // From 0 XP to level 4 (40 XP) -> (40 / 6.8).ceil() = 6 bottles
         assert_eq!(bottles_needed_for_level(0, 0, 4), 6);
 
-        // From 0 XP to level 5 (55 XP) -> (55 + 6) / 7 = 8 bottles
-        assert_eq!(bottles_needed_for_level(0, 0, 5), 8);
+        // From 0 XP to level 5 (55 XP) -> (55 / 6.8).ceil() = 9 bottles
+        assert_eq!(bottles_needed_for_level(0, 0, 5), 9);
 
-        // From 0 XP to level 8 (112 XP) -> (112 + 6) / 7 = 16 bottles
-        assert_eq!(bottles_needed_for_level(0, 0, 8), 16);
+        // From 0 XP to level 8 (112 XP) -> (112 / 6.8).ceil() = 17 bottles
+        assert_eq!(bottles_needed_for_level(0, 0, 8), 17);
 
-        // From 0 XP to level 15 (315 XP) -> (315 + 6) / 7 = 45 bottles
-        assert_eq!(bottles_needed_for_level(0, 0, 15), 45);
+        // From 0 XP to level 15 (315 XP) -> (315 / 6.8).ceil() = 47 bottles
+        assert_eq!(bottles_needed_for_level(0, 0, 15), 47);
 
         // If already at or above level, 0 bottles needed
         assert_eq!(bottles_needed_for_level(40, 4, 4), 0);
         assert_eq!(bottles_needed_for_level(100, 7, 4), 0);
+    }
 
-        // Deficit when partially leveled: e.g. at 16 XP, need level 4 (40 XP) -> deficit 24 -> 4 bottles
-        assert_eq!(bottles_needed_for_level(16, 2, 4), 4);
+    #[test]
+    fn test_level_to_level_xp_and_bottles() {
+        // Level 0 to 1: 7 XP -> 2 bottles
+        assert_eq!(xp_difference(0, 0.0, 1), 7);
+        assert_eq!(bottles_between_levels(0, 0.0, 1), 2);
+
+        // Level 0 to 4: 40 XP -> 6 bottles
+        assert_eq!(xp_difference(0, 0.0, 4), 40);
+        assert_eq!(bottles_between_levels(0, 0.0, 4), 6);
+
+        // Level 0 to 5: 55 XP -> 9 bottles
+        assert_eq!(xp_difference(0, 0.0, 5), 55);
+        assert_eq!(bottles_between_levels(0, 0.0, 5), 9);
+
+        // Level 0 to 8: 112 XP -> 17 bottles
+        assert_eq!(xp_difference(0, 0.0, 8), 112);
+        assert_eq!(bottles_between_levels(0, 0.0, 8), 17);
+
+        // Level 0 to 13: 247 XP -> 37 bottles
+        assert_eq!(xp_difference(0, 0.0, 13), 247);
+        assert_eq!(bottles_between_levels(0, 0.0, 13), 37);
+
+        // Level 4 to 8: 112 - 40 = 72 XP -> 11 bottles
+        assert_eq!(xp_difference(4, 0.0, 8), 72);
+        assert_eq!(bottles_between_levels(4, 0.0, 8), 11);
+
+        // Level 8 to 13: 247 - 112 = 135 XP -> 20 bottles
+        assert_eq!(xp_difference(8, 0.0, 13), 135);
+        assert_eq!(bottles_between_levels(8, 0.0, 13), 20);
+
+        // Level 3 with 50% progress to Level 4:
+        // Level 3 total: 27 XP, next level needs 13 XP. 50% = 7 XP. Current XP = 34.
+        // Need to reach Level 4 (40 XP) -> deficit 6 XP -> 1 bottle!
+        assert_eq!(xp_difference(3, 0.5, 4), 6);
+        assert_eq!(bottles_between_levels(3, 0.5, 4), 1);
     }
 
     #[test]

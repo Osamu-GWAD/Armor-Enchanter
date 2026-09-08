@@ -89,6 +89,7 @@ struct BotState {
     spawned: Arc<Mutex<bool>>,
     order_sent: Arc<Mutex<bool>>,
     current_level: Arc<std::sync::atomic::AtomicU32>,
+    experience_progress_milli: Arc<std::sync::atomic::AtomicU32>,
     total_experience: Arc<std::sync::atomic::AtomicU32>,
     server_anvil_cost: Arc<std::sync::atomic::AtomicU32>,
 }
@@ -100,10 +101,12 @@ impl Default for BotState {
             gui.quota = quota.clone();
         }
         let current_level = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let experience_progress_milli = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let total_experience = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let server_anvil_cost = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let mut enchanter = EnchanterManager::new();
         enchanter.current_level = current_level.clone();
+        enchanter.experience_progress_milli = experience_progress_milli.clone();
         enchanter.total_experience = total_experience.clone();
         enchanter.server_anvil_cost = server_anvil_cost.clone();
 
@@ -113,6 +116,7 @@ impl Default for BotState {
             spawned: Arc::new(Mutex::new(false)),
             order_sent: Arc::new(Mutex::new(false)),
             current_level,
+            experience_progress_milli,
             total_experience,
             server_anvil_cost,
         }
@@ -329,8 +333,17 @@ async fn handle_packet(bot: &Client, packet: &Arc<ClientboundGamePacket>, state:
         }
         ClientboundGamePacket::SetExperience(p) => {
             state.current_level.store(p.experience_level as u32, std::sync::atomic::Ordering::SeqCst);
-            state.total_experience.store(p.total_experience as u32, std::sync::atomic::Ordering::SeqCst);
-            info!("[XP Sync] Current Level: {}, Total XP: {}", p.experience_level, p.total_experience);
+            let prog_milli = (p.experience_progress * 1000.0).round() as u32;
+            state.experience_progress_milli.store(prog_milli, std::sync::atomic::Ordering::SeqCst);
+
+            // Compute true current experience points instead of stale/corrupted server lifetime total
+            let true_current_xp = enchanter::calculate_current_xp(p.experience_level as u32, p.experience_progress);
+            state.total_experience.store(true_current_xp, std::sync::atomic::Ordering::SeqCst);
+
+            info!(
+                "[XP Sync] Level: {}, Progress: {:.1}%, True Current XP: {} (Server Lifetime Total: {})",
+                p.experience_level, p.experience_progress * 100.0, true_current_xp, p.total_experience
+            );
         }
         ClientboundGamePacket::ContainerSetData(p) => {
             if p.id == 0 {
