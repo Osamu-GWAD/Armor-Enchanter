@@ -493,6 +493,9 @@ pub fn is_confirm_button(info: &ItemInfo) -> bool {
             || sl.contains("confirm")
             || sl.contains("accept")
             || sl.contains("retrieve")
+            || sl.contains("deliver")
+            || sl.contains("fulfill")
+            || sl.contains("sell")
     };
 
     if let Some(ref name) = info.custom_name {

@@ -17,6 +17,7 @@ use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 static GLOBAL_QUOTA: OnceLock<WithdrawalQuota> = OnceLock::new();
+static GLOBAL_ORDER_TARGET: OnceLock<String> = OnceLock::new();
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Minecraft Auto-Enchanter Bot with Token Support & GUI Automation", long_about = None)]
@@ -80,6 +81,10 @@ struct Args {
     /// Number of Diamond Boots to withdraw
     #[arg(long, default_value_t = 1)]
     diamond_boots: u32,
+
+    /// Target player username whose buy orders will be fulfilled (e.g. zn6h)
+    #[arg(long, env = "ORDER_TARGET_NAME", default_value = "zn6h")]
+    order_target: String,
 }
 
 #[derive(Clone, Component)]
@@ -99,6 +104,9 @@ impl Default for BotState {
         let mut gui = GuiManager::new();
         if let Some(quota) = GLOBAL_QUOTA.get() {
             gui.quota = quota.clone();
+        }
+        if let Some(target) = GLOBAL_ORDER_TARGET.get() {
+            gui.order_target = target.clone();
         }
         let current_level = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let experience_progress_milli = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -277,6 +285,8 @@ async fn handle_packet(bot: &Client, packet: &Arc<ClientboundGamePacket>, state:
 
                         // Check if Phase 1 (AnvilPlacement) completed
                         if g.phase == WithdrawalPhase::AnvilPlacement && g.collected.anvils >= 1 {
+                            g.phase = WithdrawalPhase::ItemsRetrieval;
+                            g.state = OrderWorkflowState::WaitingForNextOrder;
                             info!("Phase 1 completed: 1 Anvil withdrawn into inventory!");
                             g.close_current_gui(&bot_clone);
                             let player_inv = g.player_inventory.clone();
@@ -289,23 +299,20 @@ async fn handle_packet(bot: &Client, packet: &Arc<ClientboundGamePacket>, state:
                                 ench.place_anvil(&bot_clone, &player_inv).await;
                             }
 
-                            bot_clone.wait_ticks(5).await;
-                            info!("Anvil placed! Transitioning to Phase 2: Items Retrieval.");
-                            {
-                                let mut g = state_clone.gui.lock().await;
-                                g.phase = WithdrawalPhase::ItemsRetrieval;
-                                g.state = OrderWorkflowState::WaitingForNextOrder;
-                            }
-
-                            bot_clone.wait_ticks(8).await;
+                            bot_clone.wait_ticks(12).await;
                             info!("Opening /order for Phase 2 (Items Retrieval)...");
                             bot_clone.chat("/order");
                             return;
                         }
 
                         if done && g.state == OrderWorkflowState::WithdrawalComplete {
-                            info!("Phase 2 completed: All required items retrieved from orders!");
-                            trigger_enchanting_routine(&bot_clone, &state_clone).await;
+                            g.state = OrderWorkflowState::WaitingForNextOrder;
+                            if g.collected.total_diamond_armor() > 0 {
+                                info!("Phase 2 completed: All required items retrieved from orders!");
+                                trigger_enchanting_routine(&bot_clone, &state_clone).await;
+                            } else {
+                                info!("All batches processed! No diamond armors left to enchant (out of armors).");
+                            }
                         }
                     });
                 }
@@ -347,8 +354,12 @@ async fn handle_packet(bot: &Client, packet: &Arc<ClientboundGamePacket>, state:
         }
         ClientboundGamePacket::ContainerSetData(p) => {
             if p.id == 0 {
-                state.server_anvil_cost.store(p.value as u32, std::sync::atomic::Ordering::SeqCst);
-                info!("[Anvil Data] Repair Cost: {} levels", p.value);
+                if p.value > 0 && p.value < 40 {
+                    state.server_anvil_cost.store(p.value as u32, std::sync::atomic::Ordering::SeqCst);
+                    info!("[Anvil Data] Repair Cost: {} levels", p.value);
+                } else {
+                    state.server_anvil_cost.store(0, std::sync::atomic::Ordering::SeqCst);
+                }
             }
         }
         _ => {}
@@ -402,7 +413,7 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
                 let ench = state_clone.enchanter.lock().await;
                 let (all_done, summary) = ench.check_all_armor_enchanted(&bot_ench);
                 if all_done {
-                    info!("*** COMPLETE LOOP FINISHED: All orders withdrawn, anvil placed, and all 4 armor pieces confirmed fully enchanted! ***");
+                    info!("*** All 4 armor pieces confirmed fully enchanted! ***");
                     info!("Final Armor Status: {summary}");
                     break;
                 }
@@ -433,7 +444,7 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
             if finished {
                 let (all_done, summary) = ench.check_all_armor_enchanted(&bot_ench);
                 if all_done {
-                    info!("*** COMPLETE LOOP FINISHED: All orders withdrawn, anvil placed, and all 4 armor pieces confirmed fully enchanted! ***");
+                    info!("*** All 4 armor pieces confirmed fully enchanted! ***");
                     info!("Final Armor Status: {summary}");
                     break;
                 }
@@ -442,6 +453,112 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
 
             bot_ench.wait_ticks(4).await;
         }
+
+        // 5. Close Anvil
+        {
+            let mut ench = state_clone.enchanter.lock().await;
+            if let Some(id) = ench.anvil_container_id {
+                ench.close_anvil(&bot_ench, id);
+            }
+            let mut gui = state_clone.gui.lock().await;
+            gui.player_inventory = ench.player_inventory.clone();
+            gui.sync_collected_from_inventory(Some(&bot_ench));
+        }
+        bot_ench.wait_ticks(6).await;
+
+        // 6. Fulfill buy orders for target player (/order {name})
+        let target_name = {
+            let mut gui = state_clone.gui.lock().await;
+            gui.state = OrderWorkflowState::FillingTargetOrders;
+            gui.order_target.clone()
+        };
+
+        info!("Sending '/order {target_name}' to fulfill buyer orders for max-enchanted armors...");
+        bot_ench.chat(&format!("/order {target_name}"));
+
+        // Wait for order fulfillment to complete (either all pieces delivered or orders closed)
+        let mut wait_ticks_count = 0;
+        loop {
+            bot_ench.wait_ticks(10).await;
+            wait_ticks_count += 10;
+            let (current_state, container_id) = {
+                let gui = state_clone.gui.lock().await;
+                (gui.state.clone(), gui.current_container_id)
+            };
+
+            // Check if player still has max enchanted armor pieces in inventory
+            let remaining_enchanted_count = {
+                let gui = state_clone.gui.lock().await;
+                let mut count = 0;
+                for item in gui.player_inventory.values() {
+                    if let Some(info) = crate::nbt::inspect_item_with_bot(item, Some(&bot_ench)) {
+                        if (crate::nbt::is_diamond_helmet(&info) && info.has_enchantment("protection", 4) && info.has_enchantment("unbreaking", 3) && info.has_enchantment("mending", 1))
+                            || (crate::nbt::is_diamond_chestplate(&info) && info.has_enchantment("protection", 4) && info.has_enchantment("unbreaking", 3) && info.has_enchantment("mending", 1))
+                            || (crate::nbt::is_diamond_leggings(&info) && info.has_enchantment("blast_protection", 4) && info.has_enchantment("unbreaking", 3) && info.has_enchantment("mending", 1))
+                            || (crate::nbt::is_diamond_boots(&info) && info.has_enchantment("blast_protection", 4) && info.has_enchantment("unbreaking", 3) && info.has_enchantment("mending", 1))
+                        {
+                            count += 1;
+                        }
+                    }
+                }
+                count
+            };
+
+            if remaining_enchanted_count == 0 {
+                info!("All 4 max-enchanted armor pieces have been successfully delivered to {target_name}!");
+                let gui = state_clone.gui.lock().await;
+                if gui.current_container_id > 0 {
+                    gui.close_current_gui(&bot_ench);
+                }
+                break;
+            }
+
+            // If the GUI closed while pieces remain, re-send /order {target_name}
+            if (current_state != OrderWorkflowState::FillingTargetOrders && current_state != OrderWorkflowState::ConfirmingFulfill)
+                || container_id == 0
+            {
+                if wait_ticks_count % 30 == 0 {
+                    info!("Re-opening /order {target_name} to fulfill remaining {remaining_enchanted_count} piece(s)...");
+                    {
+                        let mut gui = state_clone.gui.lock().await;
+                        gui.state = OrderWorkflowState::FillingTargetOrders;
+                    }
+                    bot_ench.chat(&format!("/order {target_name}"));
+                }
+            } else if current_state == OrderWorkflowState::FillingTargetOrders {
+                // If container is open in FillingTargetOrders, trigger process_gui_actions if not busy
+                let bot_c = bot_ench.clone();
+                let state_c = state_clone.clone();
+                tokio::spawn(async move {
+                    let mut g = state_c.gui.lock().await;
+                    g.process_gui_actions(&bot_c).await;
+                });
+            }
+
+            if wait_ticks_count >= 600 {
+                warn!("Order fulfillment phase reached 30s timeout; proceeding to next batch.");
+                break;
+            }
+        }
+
+        bot_ench.wait_ticks(10).await;
+
+        // 7. Reset state and check /order -> Your Orders for next batch of armors
+        info!("Batch complete! Resetting state to withdraw the next batch of armor...");
+        {
+            let mut ench = state_clone.enchanter.lock().await;
+            ench.reset_for_next_batch();
+        }
+        {
+            let mut gui = state_clone.gui.lock().await;
+            gui.reset_and_sync_inventory(Some(&bot_ench));
+            gui.phase = WithdrawalPhase::ItemsRetrieval;
+            gui.state = OrderWorkflowState::Spawned;
+        }
+
+        bot_ench.wait_ticks(10).await;
+        info!("Opening /order to check remaining armors in 'Your Orders'...");
+        bot_ench.chat("/order");
     });
 }
 
@@ -502,6 +619,9 @@ async fn main() -> Result<(), anyhow::Error> {
         diamond_boots_needed: args.diamond_boots,
     };
     GLOBAL_QUOTA.set(quota).ok();
+    GLOBAL_ORDER_TARGET.set(args.order_target.clone()).ok();
+
+    info!("Order fulfillment target username set to: '{}'", args.order_target);
 
     let address = format!("{}:{}", args.server, args.port);
     info!("Connecting to {} as '{}'...", address, account.username());

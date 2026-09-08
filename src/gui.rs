@@ -1,8 +1,8 @@
 use crate::nbt::{
     inspect_item, inspect_item_with_bot, is_anvil, is_blast_protection_4, is_confirm_button,
-    is_diamond_boots, is_diamond_chestplate, is_diamond_helmet, is_diamond_leggings, is_mending,
-    is_protection_4, is_unbreaking_3, is_xp_bottle, is_your_orders_button, normalize_small_caps,
-    strip_color_and_normalize, ItemInfo,
+    is_diamond_armor, is_diamond_boots, is_diamond_chestplate, is_diamond_helmet,
+    is_diamond_leggings, is_mending, is_protection_4, is_unbreaking_3, is_xp_bottle,
+    is_your_orders_button, normalize_small_caps, strip_color_and_normalize, ItemInfo,
 };
 
 use azalea::inventory::operations::ClickType;
@@ -107,6 +107,8 @@ pub enum OrderWorkflowState {
     InCollectDeliveryMenu,
     WaitingForNextOrder,
     WithdrawalComplete,
+    FillingTargetOrders,
+    ConfirmingFulfill,
 }
 
 pub struct GuiManager {
@@ -122,6 +124,7 @@ pub struct GuiManager {
     pub target_order_type: Option<String>,
     pub action_in_progress: bool,
     pub current_menu_skipped_slots: Vec<i16>,
+    pub order_target: String,
 }
 
 impl GuiManager {
@@ -139,6 +142,7 @@ impl GuiManager {
             target_order_type: None,
             action_in_progress: false,
             current_menu_skipped_slots: Vec::new(),
+            order_target: "zn6h".to_string(),
         }
     }
 
@@ -501,6 +505,22 @@ impl GuiManager {
         }
 
         let clean_title = normalize_small_caps(&strip_color_and_normalize(title)).to_lowercase();
+
+        if self.state == OrderWorkflowState::FillingTargetOrders || self.state == OrderWorkflowState::ConfirmingFulfill {
+            if clean_title.contains("confirm")
+                || clean_title.contains("deliver")
+                || clean_title.contains("fulfill")
+                || clean_title.contains("sell")
+            {
+                info!("Transitioned to ConfirmingFulfill ('{clean_title}')");
+                self.state = OrderWorkflowState::ConfirmingFulfill;
+            } else {
+                info!("Target player orders screen opened ('{clean_title}'). State: FillingTargetOrders");
+                self.state = OrderWorkflowState::FillingTargetOrders;
+            }
+            return;
+        }
+
         if clean_title.contains("collect item") || clean_title.contains("collect items") {
             info!("Transitioned to InCollectDeliveryMenu ('{clean_title}')");
             self.state = OrderWorkflowState::InCollectDeliveryMenu;
@@ -620,7 +640,11 @@ impl GuiManager {
 
     /// Perform the next automated action in the current GUI.
     pub async fn process_gui_actions(&mut self, bot: &Client) -> bool {
-        if self.state == OrderWorkflowState::WithdrawalComplete || self.phase == WithdrawalPhase::Done {
+        if self.state == OrderWorkflowState::WithdrawalComplete
+            || (self.phase == WithdrawalPhase::Done
+                && self.state != OrderWorkflowState::FillingTargetOrders
+                && self.state != OrderWorkflowState::ConfirmingFulfill)
+        {
             if self.current_container_id > 0 {
                 self.close_current_gui(bot);
             }
@@ -631,6 +655,18 @@ impl GuiManager {
             return false;
         }
         self.action_in_progress = true;
+
+        if self.state == OrderWorkflowState::FillingTargetOrders {
+            let res = self.process_fill_target_order(bot).await;
+            self.action_in_progress = false;
+            return res;
+        }
+
+        if self.state == OrderWorkflowState::ConfirmingFulfill {
+            let res = self.confirm_target_order_fulfill(bot).await;
+            self.action_in_progress = false;
+            return res;
+        }
 
         self.sync_collected_from_inventory(Some(bot));
 
@@ -766,6 +802,16 @@ impl GuiManager {
             return true;
         }
 
+        let available_armor_orders = self.count_available_armor_orders(bot);
+        let current_diamond_armor = self.collected.total_diamond_armor();
+        if self.phase == WithdrawalPhase::ItemsRetrieval && available_armor_orders == 0 && current_diamond_armor == 0 {
+            info!("*** OUT OF ARMORS: No diamond armor orders remain in Your Orders (and 0 in inventory). Routine complete! ***");
+            self.close_current_gui(bot);
+            self.phase = WithdrawalPhase::Done;
+            self.state = OrderWorkflowState::WithdrawalComplete;
+            return true;
+        }
+
         if self.collected.is_fulfilled(&self.quota) {
             info!("All required items have been fulfilled! Closing GUI.");
             self.close_current_gui(bot);
@@ -779,26 +825,45 @@ impl GuiManager {
 
     /// Find the collect button in the 'Orders -> Edit Order' submenu.
     fn find_collect_button_slot(&self) -> Option<i16> {
-        // First check slot 13 (the canonical DonutSMP collect button)
-        if let Some(item) = self.current_slots.get(&13) {
+        // Priority 1: Check slot 15 (DonutSMP Edit Order Collect button)
+        if let Some(item) = self.current_slots.get(&15) {
             if let Some(info) = inspect_item(item) {
-                if info.kind.to_lowercase().contains("chest") || is_confirm_button(&info) {
-                    info!("Identified slot #13 as 'Collect' button ({})", info.kind);
-                    return Some(13);
+                if info.kind.to_lowercase().contains("chest")
+                    || info.custom_name.as_deref().unwrap_or("").to_lowercase().contains("collect")
+                    || is_confirm_button(&info)
+                {
+                    info!("Identified slot #15 as 'Collect' button ({})", info.kind);
+                    return Some(15);
                 }
             }
         }
 
-        // Fallback: scan all slots for collect / claim / confirm
-        for (&slot, item) in &self.current_slots {
-            if slot == 10 {
-                // Slot 10 is the item preview icon, not the button
-                continue;
-            }
+        // Priority 2: Check slot 13 (if not Cancel)
+        if let Some(item) = self.current_slots.get(&13) {
             if let Some(info) = inspect_item(item) {
-                if is_confirm_button(&info) {
-                    info!("Identified slot #{slot} as 'Collect' button via lore/title ({})", info.kind);
-                    return Some(slot);
+                let name = info.custom_name.as_deref().unwrap_or("").to_lowercase();
+                if !name.contains("cancel") && !info.kind.to_lowercase().contains("terracotta") {
+                    if info.kind.to_lowercase().contains("chest") || is_confirm_button(&info) {
+                        info!("Identified slot #13 as 'Collect' button ({})", info.kind);
+                        return Some(13);
+                    }
+                }
+            }
+        }
+
+        // Priority 3: Scan ONLY container slots (0..open_container_size or 0..27)
+        let max_slot = if self.open_container_size > 0 { self.open_container_size } else { 27 };
+        for slot in 0..max_slot {
+            if slot == 10 || slot == 13 {
+                continue; // 10 is item preview, 13 is cancel
+            }
+            if let Some(item) = self.current_slots.get(&slot) {
+                if let Some(info) = inspect_item(item) {
+                    let name = info.custom_name.as_deref().unwrap_or("").to_lowercase();
+                    if name.contains("collect") || info.kind.to_lowercase().contains("chest") || is_confirm_button(&info) {
+                        info!("Identified slot #{slot} as 'Collect' button via name/kind ({})", info.kind);
+                        return Some(slot);
+                    }
                 }
             }
         }
@@ -951,6 +1016,180 @@ impl GuiManager {
             bot.chat("/order");
             return true;
         }
+    }
+
+    /// Counts how many diamond armor orders are available in the open Your Orders container.
+    pub fn count_available_armor_orders(&self, bot: &Client) -> u32 {
+        let mut count = 0;
+        for slot in 0..=44 {
+            if let Some(item) = self.current_slots.get(&slot) {
+                if let Some(info) = inspect_item_with_bot(item, Some(bot)) {
+                    if is_diamond_armor(&info) {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    /// Automatically fulfills buyer orders in the target player's /order {player} GUI.
+    pub async fn process_fill_target_order(&mut self, bot: &Client) -> bool {
+        self.sync_collected_from_inventory(Some(bot));
+
+        // Audit player inventory to see which max-enchanted armor pieces are present
+        let mut has_helm = false;
+        let mut has_chest = false;
+        let mut has_legs = false;
+        let mut has_boots = false;
+
+        for item in self.player_inventory.values() {
+            if let Some(info) = inspect_item_with_bot(item, Some(bot)) {
+                if is_diamond_helmet(&info)
+                    && info.has_enchantment("protection", 4)
+                    && info.has_enchantment("unbreaking", 3)
+                    && info.has_enchantment("mending", 1)
+                {
+                    has_helm = true;
+                } else if is_diamond_chestplate(&info)
+                    && info.has_enchantment("protection", 4)
+                    && info.has_enchantment("unbreaking", 3)
+                    && info.has_enchantment("mending", 1)
+                {
+                    has_chest = true;
+                } else if is_diamond_leggings(&info)
+                    && info.has_enchantment("blast_protection", 4)
+                    && info.has_enchantment("unbreaking", 3)
+                    && info.has_enchantment("mending", 1)
+                {
+                    has_legs = true;
+                } else if is_diamond_boots(&info)
+                    && info.has_enchantment("blast_protection", 4)
+                    && info.has_enchantment("unbreaking", 3)
+                    && info.has_enchantment("mending", 1)
+                {
+                    has_boots = true;
+                }
+            }
+        }
+
+        info!(
+            "Fulfilling orders for '{}'. Enchanted pieces in inventory: Helm: {has_helm}, Chest: {has_chest}, Legs: {has_legs}, Boots: {has_boots}",
+            self.order_target
+        );
+
+        if !has_helm && !has_chest && !has_legs && !has_boots {
+            info!("All max-enchanted armor pieces have been delivered to {}!", self.order_target);
+            self.close_current_gui(bot);
+            self.state = OrderWorkflowState::WaitingForNextOrder;
+            return true;
+        }
+
+        // Priority 0: Check if a direct confirmation/deliver button (non-armor) is already open on screen
+        for (&slot, item) in &self.current_slots {
+            if let Some(info) = inspect_item_with_bot(item, Some(bot)) {
+                if !is_diamond_armor(&info) && is_confirm_button(&info) {
+                    let name = info.custom_name.as_deref().unwrap_or("").to_lowercase();
+                    info!("Direct confirm/deliver button found at slot #{slot} ('{name}', kind: {})! Clicking...", info.kind);
+                    self.click_slot(bot, slot, ClickType::Pickup);
+                    bot.wait_ticks(6).await;
+                    return true;
+                }
+            }
+        }
+
+        // Scan slots 0..=44 for target player's buy orders
+        for slot in 0..=44 {
+            if let Some(item) = self.current_slots.get(&slot) {
+                if let Some(info) = inspect_item_with_bot(item, Some(bot)) {
+                    if info.kind.to_lowercase().contains("glasspane")
+                        || info.kind.to_lowercase().contains("barrier")
+                    {
+                        continue;
+                    }
+
+                    let matches_helm = has_helm && (is_diamond_helmet(&info) || info.kind.contains("Helmet") || info.custom_name.as_deref().unwrap_or("").contains("Helmet"));
+                    let matches_chest = has_chest && (is_diamond_chestplate(&info) || info.kind.contains("Chestplate") || info.custom_name.as_deref().unwrap_or("").contains("Chestplate"));
+                    let matches_legs = has_legs && (is_diamond_leggings(&info) || info.kind.contains("Leggings") || info.custom_name.as_deref().unwrap_or("").contains("Leggings"));
+                    let matches_boots = has_boots && (is_diamond_boots(&info) || info.kind.contains("Boots") || info.custom_name.as_deref().unwrap_or("").contains("Boots"));
+
+                    if matches_helm || matches_chest || matches_legs || matches_boots {
+                        let armor_name = if matches_helm {
+                            "Diamond Helmet"
+                        } else if matches_chest {
+                            "Diamond Chestplate"
+                        } else if matches_legs {
+                            "Diamond Leggings"
+                        } else {
+                            "Diamond Boots"
+                        };
+
+                        info!(
+                            "Found buy order for '{armor_name}' at slot #{slot} (Item: '{}', Name: {:?}, Lore: {:?})! Clicking to fulfill...",
+                            info.kind, info.custom_name, info.lore
+                        );
+                        self.click_slot(bot, slot, ClickType::Pickup);
+                        bot.wait_ticks(6).await;
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Check if there is a next page arrow at slot 53
+        if let Some(item53) = self.current_slots.get(&53) {
+            if let Some(info53) = inspect_item_with_bot(item53, Some(bot)) {
+                if info53.kind.to_lowercase().contains("arrow") {
+                    info!("Checking next page in orders (clicking slot #53)...");
+                    self.click_slot(bot, 53, ClickType::Pickup);
+                    bot.wait_ticks(6).await;
+                    return true;
+                }
+            }
+        }
+
+        warn!(
+            "No more matching buy orders found for remaining armors in {}'s order menu! Closing GUI.",
+            self.order_target
+        );
+        self.close_current_gui(bot);
+        self.state = OrderWorkflowState::WaitingForNextOrder;
+        true
+    }
+
+    /// Click confirm/deliver button if order fulfillment opens a confirmation screen.
+    pub async fn confirm_target_order_fulfill(&mut self, bot: &Client) -> bool {
+        info!("Scanning confirmation screen for confirm/deliver button...");
+        for (&slot, item) in &self.current_slots {
+            if let Some(info) = inspect_item_with_bot(item, Some(bot)) {
+                let name = info.custom_name.as_deref().unwrap_or("").to_lowercase();
+                let lore = info.lore.join(" ").to_lowercase();
+                let kind = info.kind.to_lowercase();
+
+                if is_confirm_button(&info)
+                    || name.contains("confirm")
+                    || name.contains("deliver")
+                    || name.contains("fulfill")
+                    || name.contains("sell")
+                    || name.contains("yes")
+                    || lore.contains("confirm")
+                    || lore.contains("deliver")
+                    || lore.contains("click to fulfill")
+                    || lore.contains("click to deliver")
+                    || lore.contains("click to sell")
+                {
+                    info!("Found confirmation/deliver button at slot #{slot} ('{name}', kind: {kind})! Clicking to complete delivery...");
+                    self.click_slot(bot, slot, ClickType::Pickup);
+                    bot.wait_ticks(6).await;
+                    self.state = OrderWorkflowState::FillingTargetOrders;
+                    return true;
+                }
+            }
+        }
+
+        warn!("Could not identify confirmation button. Logging all slots:");
+        self.log_all_slot_nbt(Some(bot));
+        false
     }
 
     /// Click a slot by sending a ServerboundContainerClick packet.

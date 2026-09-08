@@ -180,6 +180,15 @@ impl EnchanterManager {
         }
     }
 
+    /// Reset enchanting state so the bot can start the next batch of armor combining.
+    pub fn reset_for_next_batch(&mut self) {
+        self.enchanting_complete = false;
+        self.is_enchanting = false;
+        self.anvil_slots.clear();
+        self.anvil_container_id = None;
+        self.server_anvil_cost.store(0, Ordering::SeqCst);
+    }
+
     /// Returns the current level and experience progress percentage (0.0 to 1.0)
     pub fn get_level_and_progress(&self) -> (u32, f32) {
         let lvl = self.current_level.load(Ordering::SeqCst);
@@ -190,6 +199,11 @@ impl EnchanterManager {
     /// Splash the exact number of XP bottles needed to advance from the current level and progress
     /// to `target_level` using rapid human-like right clicks and arm swing animations.
     pub async fn throw_exact_xp_bottles(&mut self, bot: &Client, target_level: u32) {
+        let target_level = target_level.min(39);
+        if target_level == 0 {
+            return;
+        }
+
         let (mut current_lvl, mut current_prog) = self.get_level_and_progress();
 
         if current_lvl >= target_level {
@@ -454,6 +468,7 @@ impl EnchanterManager {
         self.anvil_container_id = Some(container_id);
         self.anvil_slots.clear();
         self.anvil_state_id.store(0, Ordering::SeqCst);
+        self.server_anvil_cost.store(0, Ordering::SeqCst);
     }
 
     /// Updates anvil slots and player inventory tracking when content packet is received.
@@ -646,32 +661,65 @@ impl EnchanterManager {
             None => return false,
         };
 
-        // First check if slot 2 has an uncollected output from previous combine
-        if let Some(item2) = self.anvil_slots.get(&2) {
-            if !matches!(item2, ItemStack::Empty) {
-                info!("Output slot #2 has an item; collecting it via QuickMove...");
-                self.click_anvil(bot, container_id, 2, ClickType::QuickMove);
-                bot.wait_ticks(4).await;
-                return false;
-            }
-        }
+        let cur_lvl = self.current_level.load(Ordering::SeqCst);
+        let server_cost = self.server_anvil_cost.load(Ordering::SeqCst);
 
-        // Check if slot 0 or slot 1 has a leftover item that should be returned to inventory
-        if let Some(item0) = self.anvil_slots.get(&0) {
-            if !matches!(item0, ItemStack::Empty) {
-                info!("Input slot #0 has a leftover item; clearing it via QuickMove...");
+        let has_input0 = self.anvil_slots.get(&0).map(|s| !matches!(s, ItemStack::Empty)).unwrap_or(false);
+        let has_input1 = self.anvil_slots.get(&1).map(|s| !matches!(s, ItemStack::Empty)).unwrap_or(false);
+        let has_output2 = self.anvil_slots.get(&2).map(|s| !matches!(s, ItemStack::Empty)).unwrap_or(false);
+
+        // If inputs exist and server cost > current level, return inputs to inventory and throw XP
+        if (has_input0 || has_input1) && server_cost > 0 && server_cost < 40 && server_cost > cur_lvl {
+            info!("Anvil inputs present but server cost ({server_cost}) > current level ({cur_lvl})! Returning inputs to inventory to throw XP...");
+            if has_input0 {
                 self.click_anvil(bot, container_id, 0, ClickType::QuickMove);
                 bot.wait_ticks(3).await;
-                return false;
             }
-        }
-        if let Some(item1) = self.anvil_slots.get(&1) {
-            if !matches!(item1, ItemStack::Empty) {
-                info!("Input slot #1 has a leftover item; clearing it via QuickMove...");
+            if has_input1 {
                 self.click_anvil(bot, container_id, 1, ClickType::QuickMove);
                 bot.wait_ticks(3).await;
-                return false;
             }
+            self.anvil_slots.remove(&0);
+            self.anvil_slots.remove(&1);
+            self.anvil_slots.remove(&2);
+
+            self.close_anvil(bot, container_id);
+            bot.wait_ticks(2).await;
+            self.throw_exact_xp_bottles(bot, server_cost).await;
+            bot.wait_ticks(2).await;
+            Self::ensure_no_worn_armor(bot, &self.player_inventory).await;
+            bot.wait_ticks(2).await;
+            self.open_anvil(bot).await;
+            bot.wait_ticks(5).await;
+            return false;
+        }
+
+        // If output slot 2 has an item and level suffices, collect it via QuickMove
+        if has_output2 && (server_cost == 0 || (server_cost < 40 && cur_lvl >= server_cost)) {
+            info!("Output slot #2 has an item and level suffices (Level {cur_lvl} >= Cost {server_cost}); collecting via QuickMove...");
+            self.click_anvil(bot, container_id, 2, ClickType::QuickMove);
+            bot.wait_ticks(6).await;
+            self.anvil_slots.remove(&0);
+            self.anvil_slots.remove(&1);
+            self.anvil_slots.remove(&2);
+            self.server_anvil_cost.store(0, Ordering::SeqCst);
+            return false;
+        }
+
+        // Clear any leftover inputs
+        if has_input0 {
+            info!("Input slot #0 has a leftover item; clearing it via QuickMove...");
+            self.click_anvil(bot, container_id, 0, ClickType::QuickMove);
+            bot.wait_ticks(3).await;
+            self.anvil_slots.remove(&0);
+            return false;
+        }
+        if has_input1 {
+            info!("Input slot #1 has a leftover item; clearing it via QuickMove...");
+            self.click_anvil(bot, container_id, 1, ClickType::QuickMove);
+            bot.wait_ticks(3).await;
+            self.anvil_slots.remove(&1);
+            return false;
         }
 
         let task = match self.find_next_combine_task(bot) {
@@ -731,6 +779,7 @@ impl EnchanterManager {
         item_inventory_slot: i16,
         book_inventory_slot: i16,
     ) {
+        self.server_anvil_cost.store(0, Ordering::SeqCst);
         info!(
             "Anvil Combine: Moving item from slot #{item_inventory_slot} and book from slot #{book_inventory_slot} into Anvil..."
         );
@@ -749,28 +798,41 @@ impl EnchanterManager {
 
         let server_cost = self.server_anvil_cost.load(Ordering::SeqCst);
         let cur_lvl = self.current_level.load(Ordering::SeqCst);
-        if server_cost > 0 {
+        if server_cost > 0 && server_cost < 40 {
             info!("Server Anvil Cost confirmed: {server_cost} levels (Current Level: {cur_lvl})");
         }
 
-        if server_cost > cur_lvl {
+        if server_cost > 0 && server_cost < 40 && server_cost > cur_lvl {
             info!("Server cost ({server_cost}) exceeds current level ({cur_lvl})! Taking items back to throw more XP...");
             self.click_anvil(bot, container_id, 0, ClickType::QuickMove);
             bot.wait_ticks(3).await;
             self.click_anvil(bot, container_id, 1, ClickType::QuickMove);
             bot.wait_ticks(3).await;
+            self.anvil_slots.remove(&0);
+            self.anvil_slots.remove(&1);
+            self.anvil_slots.remove(&2);
+
+            self.close_anvil(bot, container_id);
+            bot.wait_ticks(2).await;
+            self.throw_exact_xp_bottles(bot, server_cost).await;
+            bot.wait_ticks(2).await;
+            Self::ensure_no_worn_armor(bot, &self.player_inventory).await;
+            bot.wait_ticks(2).await;
+            self.open_anvil(bot).await;
+            bot.wait_ticks(5).await;
             return;
         }
 
         // Collect result from Slot 2
         info!("Claiming combined enchanted item from Anvil output slot #2...");
         self.click_anvil(bot, container_id, 2, ClickType::QuickMove);
-        bot.wait_ticks(4).await;
+        bot.wait_ticks(6).await; // 6 ticks wait for SetExperience and inventory updates
 
         self.anvil_slots.remove(&book_inventory_slot);
         self.anvil_slots.remove(&0);
         self.anvil_slots.remove(&1);
         self.anvil_slots.remove(&2);
+        self.server_anvil_cost.store(0, Ordering::SeqCst);
         info!("Anvil combine finished! Slot #2 collected, checking next combine...");
     }
 
@@ -794,6 +856,7 @@ impl EnchanterManager {
         info!("Closing Anvil GUI (container #{container_id})...");
         bot.write_packet(ServerboundContainerClose { container_id });
         self.anvil_container_id = None;
+        self.server_anvil_cost.store(0, Ordering::SeqCst);
     }
 
     fn swap_to_hotbar(bot: &Client, inv_slot: i16, hotbar_idx: u8) {
