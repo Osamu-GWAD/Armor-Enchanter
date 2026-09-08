@@ -6,6 +6,8 @@ use crate::nbt::{
 use azalea::inventory::operations::ClickType;
 use azalea::inventory::ItemStack;
 use azalea::protocol::packets::game::s_container_click::{HashedStack, ServerboundContainerClick};
+use azalea::protocol::packets::game::s_interact::InteractionHand;
+use azalea::protocol::packets::game::s_swing::ServerboundSwing;
 use azalea::protocol::packets::game::ServerboundContainerClose;
 use azalea::BlockPos;
 use azalea::Client;
@@ -43,6 +45,51 @@ pub fn bottles_needed_for_level(current_total_xp: u32, current_level: u32, targe
         return 1;
     }
     (deficit + 6) / 7
+}
+
+/// Smoothly look towards target (yaw, pitch) using human-like ease-in-out cosine interpolation over multiple ticks.
+pub async fn smooth_look(bot: &Client, target_yaw: f32, target_pitch: f32) {
+    let current_dir = bot.direction();
+    let start_yaw = current_dir.y_rot();
+    let start_pitch = current_dir.x_rot();
+
+    let mut diff_yaw = (target_yaw - start_yaw) % 360.0;
+    if diff_yaw > 180.0 {
+        diff_yaw -= 360.0;
+    } else if diff_yaw < -180.0 {
+        diff_yaw += 360.0;
+    }
+
+    let diff_pitch = (target_pitch - start_pitch).clamp(-90.0, 90.0);
+    let total_dist = (diff_yaw * diff_yaw + diff_pitch * diff_pitch).sqrt();
+
+    if total_dist < 1.0 {
+        bot.set_direction(target_yaw, target_pitch);
+        return;
+    }
+
+    // Human rotation speed: approximately 8-15 degrees per tick (clamp between 5 and 15 ticks)
+    let steps = ((total_dist / 10.0).round() as usize).clamp(5, 15);
+
+    for i in 1..=steps {
+        let t = (i as f32) / (steps as f32);
+        // Cosine ease-in-out: 0.5 * (1 - cos(pi * t))
+        let ease = (1.0 - (std::f32::consts::PI * t).cos()) / 2.0;
+
+        let cur_yaw = start_yaw + diff_yaw * ease;
+        let cur_pitch = start_pitch + diff_pitch * ease;
+        bot.set_direction(cur_yaw, cur_pitch);
+        bot.wait_ticks(1).await;
+    }
+
+    bot.set_direction(target_yaw, target_pitch);
+}
+
+/// Send arm swing animation to the server (visible to other players & anticheats)
+pub fn swing_arm(bot: &Client) {
+    bot.write_packet(ServerboundSwing {
+        hand: InteractionHand::MainHand,
+    });
 }
 
 /// An individual combine task inside the anvil.
@@ -103,9 +150,9 @@ impl EnchanterManager {
             "Throwing {bottles_to_throw} XP bottles to reach Level {target_level} from Level {current_lvl} (Current Total XP: {current_xp})..."
         );
 
-        // Aim directly down at the bot's feet
+        // Aim smoothly down at the bot's feet
         let dir = bot.direction();
-        bot.set_direction(dir.y_rot(), 90.0);
+        smooth_look(bot, dir.y_rot(), 90.0).await;
         bot.wait_ticks(5).await;
 
         while current_lvl < target_level && bottles_to_throw > 0 {
@@ -142,15 +189,16 @@ impl EnchanterManager {
             bot.wait_ticks(5).await;
 
             let batch = bottles_to_throw.min(count as u32).min(64);
-            info!("Splashing {batch} XP bottles at feet...");
+            info!("Splashing {batch} XP bottles at feet with human arm swings...");
             for _ in 0..batch {
                 bot.write_packet(azalea::protocol::packets::game::s_use_item::ServerboundUseItem {
-                    hand: Default::default(),
+                    hand: InteractionHand::MainHand,
                     seq: 0,
                     y_rot: dir.y_rot(),
                     x_rot: 90.0,
                 });
-                bot.wait_ticks(2).await;
+                swing_arm(bot);
+                bot.wait_ticks(3).await;
             }
 
             // Wait 25 ticks (1.25s) for experience orbs to be absorbed and SetExperience to arrive
@@ -191,7 +239,7 @@ impl EnchanterManager {
         let h_dist_t = (dx_t * dx_t + dz_t * dz_t).sqrt();
         let yaw_t = (-dx_t).atan2(dz_t).to_degrees() as f32;
         let pitch_t = (-dy_t).atan2(h_dist_t).to_degrees() as f32;
-        bot.set_direction(yaw_t, pitch_t);
+        smooth_look(bot, yaw_t, pitch_t).await;
         bot.wait_ticks(5).await;
 
         let hit_res = bot.hit_result();
@@ -260,20 +308,20 @@ impl EnchanterManager {
             return;
         }
 
-        // Aim directly at the top center of the ground block face
+        // Aim smoothly at the top center of the ground block face
         let dx = (ground_pos.x as f64 + 0.5) - player_pos.x;
         let dy = (ground_pos.y as f64 + 1.0) - (player_pos.y + 1.62);
         let dz = (ground_pos.z as f64 + 0.5) - player_pos.z;
         let horizontal_dist = (dx * dx + dz * dz).sqrt();
         let yaw = (-dx).atan2(dz).to_degrees() as f32;
         let pitch = (-dy).atan2(horizontal_dist).to_degrees() as f32;
-        bot.set_direction(yaw, pitch);
-        bot.wait_ticks(10).await;
+        smooth_look(bot, yaw, pitch).await;
+        bot.wait_ticks(8).await;
 
         info!("Crosshair before place: {:?}", bot.hit_result());
         info!("Placing Anvil on ground block at {:?} (aiming yaw: {yaw:.1}, pitch: {pitch:.1})...", ground_pos);
         bot.block_interact(ground_pos);
-        bot.start_use_item();
+        swing_arm(bot);
         bot.wait_ticks(20).await;
 
         self.anvil_pos = Some(BlockPos::new(ground_pos.x, ground_pos.y + 1, ground_pos.z));
@@ -286,24 +334,31 @@ impl EnchanterManager {
         self.open_anvil_with_inv(bot, &self.player_inventory).await;
     }
 
-    /// Right-click the placed anvil with explicit inventory reference.
+    /// Right-click the placed anvil with explicit inventory reference and safe hotbar slot selection.
     pub async fn open_anvil_with_inv(&self, bot: &Client, player_inventory: &HashMap<i16, ItemStack>) {
-        // Switch to an empty or non-block hotbar slot so right-clicking interacts with the anvil
-        let mut target_hotbar = 8u8;
-        for h in 0..9 {
-            let inv_slot = 36 + h;
+        // Select a safe hotbar slot: prioritize empty slot, then book/bottle, NEVER armor or anvil!
+        let mut safe_hotbar = None;
+        for h in 0..9u8 {
+            let inv_slot = 36 + h as i16;
             match player_inventory.get(&inv_slot) {
                 None => {
-                    target_hotbar = h as u8;
+                    safe_hotbar = Some(h);
                     break;
                 }
-                Some(item) if matches!(item, ItemStack::Empty) => {
-                    target_hotbar = h as u8;
+                Some(ItemStack::Empty) => {
+                    safe_hotbar = Some(h);
                     break;
                 }
-                _ => {}
+                Some(item) => {
+                    if let Some(info) = inspect_item_with_bot(item, Some(bot)) {
+                        if !is_diamond_armor(&info) && !is_anvil(&info) {
+                            safe_hotbar = Some(h);
+                        }
+                    }
+                }
             }
         }
+        let target_hotbar = safe_hotbar.unwrap_or(0);
         bot.set_selected_hotbar_slot(target_hotbar);
         bot.wait_ticks(5).await;
 
@@ -317,7 +372,7 @@ impl EnchanterManager {
             )
         });
 
-        // Aim directly at the target anvil block
+        // Aim smoothly at the target anvil block
         let player_pos = bot.position();
         let dx = (target_pos.x as f64 + 0.5) - player_pos.x;
         let dy = (target_pos.y as f64 + 0.5) - (player_pos.y + 1.62);
@@ -325,12 +380,12 @@ impl EnchanterManager {
         let horizontal_dist = (dx * dx + dz * dz).sqrt();
         let yaw = (-dx).atan2(dz).to_degrees() as f32;
         let pitch = (-dy).atan2(horizontal_dist).to_degrees() as f32;
-        bot.set_direction(yaw, pitch);
-        bot.wait_ticks(10).await;
+        smooth_look(bot, yaw, pitch).await;
+        bot.wait_ticks(8).await;
 
-        info!("Interacting to open Anvil at {:?} with hotbar slot #{}...", target_pos, target_hotbar);
+        info!("Interacting to open Anvil at {:?} with safe hotbar slot #{}...", target_pos, target_hotbar);
         bot.block_interact(target_pos);
-        bot.start_use_item();
+        swing_arm(bot);
         bot.wait_ticks(20).await;
     }
 
@@ -426,6 +481,100 @@ impl EnchanterManager {
         None
     }
 
+    /// Check if all 4 diamond armor pieces are present and fully enchanted according to user specifications.
+    pub fn check_all_armor_enchanted(&self, bot: &Client) -> (bool, String) {
+        let mut items = Vec::new();
+
+        // Check Anvil container slots (player section 3..38)
+        for slot in 3..=38 {
+            if let Some(item) = self.anvil_slots.get(&slot) {
+                if let Some(info) = inspect_item_with_bot(item, Some(bot)) {
+                    items.push(info);
+                }
+            }
+        }
+
+        // Also check tracked player inventory
+        for item in self.player_inventory.values() {
+            if let Some(info) = inspect_item_with_bot(item, Some(bot)) {
+                items.push(info);
+            }
+        }
+
+        self.check_all_armor_enchanted_from_info(&items)
+    }
+
+    /// Pure helper to verify full enchantment across a collection of ItemInfo.
+    pub fn check_all_armor_enchanted_from_info(&self, items: &[ItemInfo]) -> (bool, String) {
+        let mut helm = false;
+        let mut chest = false;
+        let mut legs = false;
+        let mut boots = false;
+
+        for info in items {
+            if is_diamond_helmet(info)
+                && info.has_enchantment("protection", 4)
+                && info.has_enchantment("unbreaking", 3)
+                && info.has_enchantment("mending", 1)
+            {
+                helm = true;
+            } else if is_diamond_chestplate(info)
+                && info.has_enchantment("protection", 4)
+                && info.has_enchantment("unbreaking", 3)
+                && info.has_enchantment("mending", 1)
+            {
+                chest = true;
+            } else if is_diamond_leggings(info)
+                && info.has_enchantment("blast_protection", 4)
+                && info.has_enchantment("unbreaking", 3)
+                && info.has_enchantment("mending", 1)
+            {
+                legs = true;
+            } else if is_diamond_boots(info)
+                && info.has_enchantment("blast_protection", 4)
+                && info.has_enchantment("unbreaking", 3)
+                && info.has_enchantment("mending", 1)
+            {
+                boots = true;
+            }
+        }
+
+        let all_done = helm && chest && legs && boots;
+        let summary = format!(
+            "Helmet: {}, Chestplate: {}, Leggings: {}, Boots: {}",
+            if helm { "MAXED" } else { "INCOMPLETE" },
+            if chest { "MAXED" } else { "INCOMPLETE" },
+            if legs { "MAXED" } else { "INCOMPLETE" },
+            if boots { "MAXED" } else { "INCOMPLETE" },
+        );
+
+        (all_done, summary)
+    }
+
+    /// Unequip any armor worn in equipment slots 5..=8 back into player inventory.
+    pub async fn ensure_no_worn_armor(bot: &Client, player_inv: &HashMap<i16, ItemStack>) {
+        for armor_slot in 5..=8i16 {
+            if let Some(item) = player_inv.get(&armor_slot) {
+                if !matches!(item, ItemStack::Empty) {
+                    if let Some(info) = inspect_item_with_bot(item, Some(bot)) {
+                        info!("Found worn armor '{}' in equipment slot #{armor_slot}! Unequipping via QuickMove...", info.kind);
+                        let packet = ServerboundContainerClick {
+                            container_id: 0,
+                            state_id: 0,
+                            slot_num: armor_slot,
+                            button_num: 0,
+                            click_type: ClickType::QuickMove,
+                            changed_slots: Default::default(),
+                            carried_item: HashedStack(None),
+                        };
+                        bot.write_packet(packet);
+                        bot.wait_ticks(10).await;
+                    }
+                }
+            }
+        }
+    }
+
     /// Automated enchanting loop: combines armor pieces with their required books in the open Anvil,
     /// dynamically throwing only the exact required XP bottles when level deficit is detected.
     pub async fn process_anvil_combines(&mut self, bot: &Client) -> bool {
@@ -469,10 +618,16 @@ impl EnchanterManager {
         let task = match self.find_next_combine_task(bot) {
             Some(t) => t,
             None => {
-                info!("All 4 diamond armor pieces (Helmet, Chestplate, Leggings, Boots) are fully enchanted!");
-                self.enchanting_complete = true;
-                self.close_anvil(bot, container_id);
-                return true;
+                let (all_done, summary) = self.check_all_armor_enchanted(bot);
+                if all_done {
+                    info!("All 4 diamond armor pieces confirmed fully enchanted! ({summary})");
+                    self.enchanting_complete = true;
+                    self.close_anvil(bot, container_id);
+                    return true;
+                } else {
+                    info!("Combine task not ready yet ({summary}). Waiting for inventory synchronization...");
+                    return false;
+                }
             }
         };
 
@@ -486,13 +641,18 @@ impl EnchanterManager {
                 task.armor_desc, task.enchant_name, task.required_level, cur_lvl, cur_xp, bottles_to_throw
             );
             self.close_anvil(bot, container_id);
-            bot.wait_ticks(15).await;
+            bot.wait_ticks(20).await;
 
             self.throw_exact_xp_bottles(bot, task.required_level).await;
+            bot.wait_ticks(20).await;
 
-            bot.wait_ticks(15).await;
+            // Ensure no armor was accidentally equipped
+            Self::ensure_no_worn_armor(bot, &self.player_inventory).await;
+            bot.wait_ticks(10).await;
+
             info!("Re-opening Anvil to combine {} with {}...", task.armor_desc, task.enchant_name);
             self.open_anvil(bot).await;
+            bot.wait_ticks(30).await;
             return false;
         }
 
@@ -529,8 +689,18 @@ impl EnchanterManager {
         bot.wait_ticks(25).await; // Wait for server to calculate recipe and update slot 2
 
         let server_cost = self.server_anvil_cost.load(Ordering::SeqCst);
+        let cur_lvl = self.current_level.load(Ordering::SeqCst);
         if server_cost > 0 {
-            info!("Server Anvil Cost confirmed: {server_cost} levels");
+            info!("Server Anvil Cost confirmed: {server_cost} levels (Current Level: {cur_lvl})");
+        }
+
+        if server_cost > cur_lvl {
+            info!("Server cost ({server_cost}) exceeds current level ({cur_lvl})! Taking items back to throw more XP...");
+            self.click_anvil(bot, container_id, 0, ClickType::QuickMove);
+            bot.wait_ticks(10).await;
+            self.click_anvil(bot, container_id, 1, ClickType::QuickMove);
+            bot.wait_ticks(10).await;
+            return;
         }
 
         // Collect result from Slot 2
@@ -538,7 +708,6 @@ impl EnchanterManager {
         self.click_anvil(bot, container_id, 2, ClickType::QuickMove);
         bot.wait_ticks(25).await;
 
-        self.anvil_slots.remove(&item_inventory_slot);
         self.anvil_slots.remove(&book_inventory_slot);
         self.anvil_slots.remove(&0);
         self.anvil_slots.remove(&1);
@@ -562,9 +731,10 @@ impl EnchanterManager {
     }
 
     /// Close the anvil container.
-    pub fn close_anvil(&self, bot: &Client, container_id: i32) {
-        info!("Closing Anvil GUI...");
+    pub fn close_anvil(&mut self, bot: &Client, container_id: i32) {
+        info!("Closing Anvil GUI (container #{container_id})...");
         bot.write_packet(ServerboundContainerClose { container_id });
+        self.anvil_container_id = None;
     }
 
     fn swap_to_hotbar(bot: &Client, inv_slot: i16, hotbar_idx: u8) {
@@ -662,5 +832,45 @@ mod tests {
         assert!(!leggings.has_enchantment("mending", 1));
         leggings.enchantments.insert("mending".to_string(), 1);
         assert!(leggings.has_enchantment("mending", 1));
+    }
+
+    #[test]
+    fn test_check_all_armor_enchanted_detection() {
+        let manager = EnchanterManager::new();
+
+        // Initially empty
+        let (all_done, summary) = manager.check_all_armor_enchanted_from_info(&[]);
+        assert!(!all_done);
+        assert!(summary.contains("INCOMPLETE"));
+
+        let mut helm = ItemInfo { kind: "DiamondHelmet".to_string(), count: 1, ..Default::default() };
+        helm.enchantments.insert("protection".to_string(), 4);
+        helm.enchantments.insert("unbreaking".to_string(), 3);
+        helm.enchantments.insert("mending".to_string(), 1);
+
+        let mut chest = ItemInfo { kind: "DiamondChestplate".to_string(), count: 1, ..Default::default() };
+        chest.enchantments.insert("protection".to_string(), 4);
+        // Chest only has prot 4 (missing unb 3 and mending)
+        let (all_done, summary) = manager.check_all_armor_enchanted_from_info(&[helm.clone(), chest.clone()]);
+        assert!(!all_done);
+        assert!(summary.contains("Helmet: MAXED"));
+        assert!(summary.contains("Chestplate: INCOMPLETE"));
+
+        chest.enchantments.insert("unbreaking".to_string(), 3);
+        chest.enchantments.insert("mending".to_string(), 1);
+
+        let mut legs = ItemInfo { kind: "DiamondLeggings".to_string(), count: 1, ..Default::default() };
+        legs.enchantments.insert("blast_protection".to_string(), 4);
+        legs.enchantments.insert("unbreaking".to_string(), 3);
+        legs.enchantments.insert("mending".to_string(), 1);
+
+        let mut boots = ItemInfo { kind: "DiamondBoots".to_string(), count: 1, ..Default::default() };
+        boots.enchantments.insert("blast_protection".to_string(), 4);
+        boots.enchantments.insert("unbreaking".to_string(), 3);
+        boots.enchantments.insert("mending".to_string(), 1);
+
+        let (all_done, summary) = manager.check_all_armor_enchanted_from_info(&[helm, chest, legs, boots]);
+        assert!(all_done);
+        assert_eq!(summary, "Helmet: MAXED, Chestplate: MAXED, Leggings: MAXED, Boots: MAXED");
     }
 }

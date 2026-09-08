@@ -252,29 +252,6 @@ async fn handle_packet(bot: &Client, packet: &Arc<ClientboundGamePacket>, state:
             let mut ench = state.enchanter.lock().await;
             if ench.anvil_container_id == Some(p.container_id) {
                 ench.on_set_content(p.container_id, p.state_id, &p.items);
-                drop(ench);
-
-                let bot_clone = bot.clone();
-                let state_clone = state.clone();
-
-                tokio::spawn(async move {
-                    bot_clone.wait_ticks(15).await;
-                    loop {
-                        let inv = {
-                            let g = state_clone.gui.lock().await;
-                            g.player_inventory.clone()
-                        };
-                        let mut e = state_clone.enchanter.lock().await;
-                        e.player_inventory = inv;
-                        let finished = e.process_anvil_combines(&bot_clone).await;
-                        if finished {
-                            info!("*** COMPLETE LOOP FINISHED: All orders withdrawn, anvil placed, and all 4 armor pieces enchanted according to user spec! ***");
-                            break;
-                        }
-                        drop(e);
-                        bot_clone.wait_ticks(30).await;
-                    }
-                });
             } else {
                 drop(ench);
                 let mut gui = state.gui.lock().await;
@@ -341,6 +318,12 @@ async fn handle_packet(bot: &Client, packet: &Arc<ClientboundGamePacket>, state:
                 if ench.anvil_container_id == Some(p.container_id) {
                     ench.anvil_state_id.store(p.state_id, std::sync::atomic::Ordering::SeqCst);
                     ench.anvil_slots.insert(p.slot as i16, p.item_stack.clone());
+                    if p.slot >= 3 && p.slot <= 38 {
+                        let inv_slot = (p.slot - 3 + 9) as i16;
+                        ench.player_inventory.insert(inv_slot, p.item_stack.clone());
+                    }
+                } else if p.container_id == 0 {
+                    ench.player_inventory.insert(p.slot as i16, p.item_stack.clone());
                 }
             }
         }
@@ -365,7 +348,7 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
         return;
     }
     ench.is_enchanting = true;
-    info!("Withdrawal complete! Starting enchanting routine...");
+    info!("Withdrawal complete! Starting autonomous enchanting routine...");
 
     let bot_ench = bot.clone();
     let state_clone = state.clone();
@@ -379,7 +362,11 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
             gui.player_inventory.clone()
         };
 
-        // 1. Ensure Anvil is placed
+        // 1. Ensure any worn armor is unequipped
+        EnchanterManager::ensure_no_worn_armor(&bot_ench, &player_inv).await;
+        bot_ench.wait_ticks(15).await;
+
+        // 2. Ensure Anvil is placed
         {
             let mut ench = state_clone.enchanter.lock().await;
             ench.place_anvil(&bot_ench, &player_inv).await;
@@ -387,20 +374,60 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
 
         bot_ench.wait_ticks(25).await;
 
-        // 2. Open Anvil (combines & dynamic XP throwing will proceed automatically inside process_anvil_combines)
+        // 3. Open Anvil
         {
             let ench = state_clone.enchanter.lock().await;
             ench.open_anvil_with_inv(&bot_ench, &player_inv).await;
         }
 
-        // 3. Retry opening anvil if not opened after 40 ticks
-        bot_ench.wait_ticks(40).await;
-        {
-            let ench = state_clone.enchanter.lock().await;
-            if ench.anvil_container_id.is_none() {
-                info!("Anvil screen not opened yet, retrying block interact...");
-                ench.open_anvil_with_inv(&bot_ench, &player_inv).await;
+        bot_ench.wait_ticks(30).await;
+
+        // 4. Single master loop for anvil combines
+        loop {
+            // Check if all 4 pieces are confirmed fully enchanted
+            {
+                let ench = state_clone.enchanter.lock().await;
+                let (all_done, summary) = ench.check_all_armor_enchanted(&bot_ench);
+                if all_done {
+                    info!("*** COMPLETE LOOP FINISHED: All orders withdrawn, anvil placed, and all 4 armor pieces confirmed fully enchanted! ***");
+                    info!("Final Armor Status: {summary}");
+                    break;
+                }
             }
+
+            // Check if anvil is open; if not, open it
+            let is_open = {
+                let ench = state_clone.enchanter.lock().await;
+                ench.anvil_container_id.is_some()
+            };
+
+            if !is_open {
+                info!("Anvil screen not open; re-opening anvil...");
+                let current_inv = {
+                    let ench = state_clone.enchanter.lock().await;
+                    ench.player_inventory.clone()
+                };
+                {
+                    let ench = state_clone.enchanter.lock().await;
+                    ench.open_anvil_with_inv(&bot_ench, &current_inv).await;
+                }
+                bot_ench.wait_ticks(30).await;
+                continue;
+            }
+
+            let mut ench = state_clone.enchanter.lock().await;
+            let finished = ench.process_anvil_combines(&bot_ench).await;
+            if finished {
+                let (all_done, summary) = ench.check_all_armor_enchanted(&bot_ench);
+                if all_done {
+                    info!("*** COMPLETE LOOP FINISHED: All orders withdrawn, anvil placed, and all 4 armor pieces confirmed fully enchanted! ***");
+                    info!("Final Armor Status: {summary}");
+                    break;
+                }
+            }
+            drop(ench);
+
+            bot_ench.wait_ticks(25).await;
         }
     });
 }

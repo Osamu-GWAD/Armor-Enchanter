@@ -414,7 +414,7 @@ impl GuiManager {
         );
 
         let dir = bot.direction();
-        bot.set_direction(dir.y_rot(), 90.0);
+        crate::enchanter::smooth_look(bot, dir.y_rot(), 90.0).await;
         bot.wait_ticks(5).await;
 
         for (slot, count) in bottle_slots {
@@ -434,15 +434,16 @@ impl GuiManager {
             bot.wait_ticks(5).await;
 
             let throw_count = excess_to_throw.min(count);
-            info!("Splashing {throw_count} excess XP bottles at feet...");
+            info!("Splashing {throw_count} excess XP bottles at feet with human arm swings...");
             for _ in 0..throw_count {
                 bot.write_packet(azalea::protocol::packets::game::s_use_item::ServerboundUseItem {
-                    hand: Default::default(),
+                    hand: azalea::protocol::packets::game::s_interact::InteractionHand::MainHand,
                     seq: 0,
                     y_rot: dir.y_rot(),
                     x_rot: 90.0,
                 });
-                bot.wait_ticks(2).await;
+                crate::enchanter::swing_arm(bot);
+                bot.wait_ticks(3).await;
             }
             excess_to_throw -= throw_count;
             bot.wait_ticks(10).await;
