@@ -1085,19 +1085,6 @@ impl GuiManager {
             return true;
         }
 
-        // Priority 0: Check if a direct confirmation/deliver button (non-armor) is already open on screen
-        for (&slot, item) in &self.current_slots {
-            if let Some(info) = inspect_item_with_bot(item, Some(bot)) {
-                if !is_diamond_armor(&info) && is_confirm_button(&info) {
-                    let name = info.custom_name.as_deref().unwrap_or("").to_lowercase();
-                    info!("Direct confirm/deliver button found at slot #{slot} ('{name}', kind: {})! Clicking...", info.kind);
-                    self.click_slot(bot, slot, ClickType::Pickup);
-                    bot.wait_ticks(6).await;
-                    return true;
-                }
-            }
-        }
-
         // Scan slots 0..=44 for target player's buy orders
         for slot in 0..=44 {
             if let Some(item) = self.current_slots.get(&slot) {
@@ -1129,7 +1116,6 @@ impl GuiManager {
                             info.kind, info.custom_name, info.lore
                         );
                         self.click_slot(bot, slot, ClickType::Pickup);
-                        bot.wait_ticks(6).await;
                         return true;
                     }
                 }
@@ -1142,7 +1128,6 @@ impl GuiManager {
                 if info53.kind.to_lowercase().contains("arrow") {
                     info!("Checking next page in orders (clicking slot #53)...");
                     self.click_slot(bot, 53, ClickType::Pickup);
-                    bot.wait_ticks(6).await;
                     return true;
                 }
             }
@@ -1161,26 +1146,37 @@ impl GuiManager {
     pub async fn confirm_target_order_fulfill(&mut self, bot: &Client) -> bool {
         info!("Scanning confirmation screen for confirm/deliver button...");
         for (&slot, item) in &self.current_slots {
+            if slot >= self.open_container_size && self.open_container_size > 0 {
+                continue;
+            }
             if let Some(info) = inspect_item_with_bot(item, Some(bot)) {
                 let name = info.custom_name.as_deref().unwrap_or("").to_lowercase();
                 let lore = info.lore.join(" ").to_lowercase();
                 let kind = info.kind.to_lowercase();
 
+                // Never click navigation items
+                if kind.contains("book") || kind.contains("hopper") || kind.contains("sign") || kind.contains("shard") || kind.contains("chest") {
+                    continue;
+                }
+                if name.contains("orders") || name.contains("filter") || name.contains("search") || name.contains("shop") {
+                    continue;
+                }
+
                 if is_confirm_button(&info)
+                    || kind.contains("lime_stained_glass_pane")
+                    || kind.contains("emerald")
+                    || kind.contains("lime_wool")
+                    || kind.contains("green_wool")
                     || name.contains("confirm")
                     || name.contains("deliver")
                     || name.contains("fulfill")
-                    || name.contains("sell")
                     || name.contains("yes")
-                    || lore.contains("confirm")
-                    || lore.contains("deliver")
-                    || lore.contains("click to fulfill")
+                    || lore.contains("click to confirm")
                     || lore.contains("click to deliver")
-                    || lore.contains("click to sell")
+                    || lore.contains("click to fulfill")
                 {
                     info!("Found confirmation/deliver button at slot #{slot} ('{name}', kind: {kind})! Clicking to complete delivery...");
                     self.click_slot(bot, slot, ClickType::Pickup);
-                    bot.wait_ticks(6).await;
                     self.state = OrderWorkflowState::FillingTargetOrders;
                     return true;
                 }

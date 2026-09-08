@@ -234,6 +234,19 @@ async fn handle(bot: Client, event: Event, state: BotState) -> Result<(), anyhow
         }
         Event::Disconnect(reason) => {
             warn!("Disconnected from server: {:?}", reason);
+            *state.spawned.lock().await = false;
+            *state.order_sent.lock().await = false;
+            {
+                let mut ench = state.enchanter.lock().await;
+                ench.is_enchanting = false;
+                ench.anvil_container_id = None;
+            }
+            {
+                let mut gui = state.gui.lock().await;
+                gui.state = OrderWorkflowState::Spawned;
+                gui.current_container_id = 0;
+                gui.action_in_progress = false;
+            }
         }
         _ => {}
     }
@@ -525,14 +538,6 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
                     }
                     bot_ench.chat(&format!("/order {target_name}"));
                 }
-            } else if current_state == OrderWorkflowState::FillingTargetOrders {
-                // If container is open in FillingTargetOrders, trigger process_gui_actions if not busy
-                let bot_c = bot_ench.clone();
-                let state_c = state_clone.clone();
-                tokio::spawn(async move {
-                    let mut g = state_c.gui.lock().await;
-                    g.process_gui_actions(&bot_c).await;
-                });
             }
 
             if wait_ticks_count >= 600 {

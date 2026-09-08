@@ -486,32 +486,67 @@ pub fn is_your_orders_button(info: &ItemInfo) -> bool {
 
 /// Check if a GUI slot button corresponds to the "Collect" / "Confirm" button.
 pub fn is_confirm_button(info: &ItemInfo) -> bool {
-    let check = |s: &str| {
+    let k = info.kind.to_lowercase();
+    // Directly recognized confirmation items (lime stained glass pane, emerald, lime wool, green wool)
+    if k.contains("lime_stained_glass_pane")
+        || k.contains("emerald")
+        || k.contains("lime_wool")
+        || k.contains("green_wool")
+    {
+        return true;
+    }
+
+    // Never consider standard navigation items as confirm buttons
+    if k.contains("book") || k.contains("hopper") || k.contains("sign") || k.contains("shard") {
+        return false;
+    }
+
+    let check_strict = |s: &str| {
         let sl = normalize_small_caps(&s.to_lowercase());
-        sl.contains("collect")
-            || sl.contains("claim")
+        sl.contains("collect item")
+            || sl.contains("claim item")
+            || sl.contains("confirm deliver")
+            || sl.contains("confirm order")
             || sl.contains("confirm")
+            || sl.contains("deliver item")
+            || sl.contains("fulfill order")
             || sl.contains("accept")
-            || sl.contains("retrieve")
-            || sl.contains("deliver")
-            || sl.contains("fulfill")
-            || sl.contains("sell")
+            || sl.contains("retrieve item")
     };
 
     if let Some(ref name) = info.custom_name {
-        if check(name) {
+        let nl = normalize_small_caps(&name.to_lowercase());
+        // Explicitly exclude navigation buttons
+        if nl.contains("orders") || nl.contains("filter") || nl.contains("search") || nl.contains("shop") {
+            return false;
+        }
+        if check_strict(&nl) || nl == "deliver" || nl == "fulfill" || nl == "collect" || nl == "claim" {
             return true;
         }
+    }
+
+    // For chests (used in /order -> order submenu as "Collect Items"), only match if name indicates collect/claim
+    if k.contains("chest") {
+        if let Some(ref name) = info.custom_name {
+            let nl = normalize_small_caps(&name.to_lowercase());
+            return nl.contains("collect") || nl.contains("claim") || nl.contains("retrieve");
+        }
+        return false;
     }
 
     for line in &info.lore {
-        if check(line) {
+        let ll = normalize_small_caps(&line.to_lowercase());
+        if ll.contains("click to confirm")
+            || ll.contains("click to deliver")
+            || ll.contains("click to fulfill")
+            || ll.contains("click to collect")
+            || ll.contains("click to claim")
+        {
             return true;
         }
     }
 
-    let k = info.kind.to_lowercase();
-    k.contains("chest") || k.contains("lime_stained_glass_pane") || k.contains("emerald")
+    false
 }
 
 #[cfg(test)]
