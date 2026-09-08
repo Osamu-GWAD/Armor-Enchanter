@@ -12,20 +12,40 @@ An autonomous, high-performance Minecraft enchanting bot built in Rust with [Aza
     - 1× Diamond Helmet, 1× Diamond Chestplate, 1× Diamond Leggings, 1× Diamond Boots
     - 4× Unbreaking III, 4× Mending, 2× Blast Protection IV, 2× Protection IV enchanted books
     - 1× Anvil and exactly 3 stacks (192) of Bottles o' Enchanting
-- **Dynamic XP Calculation & Consumption**:
-  - Computes exact XP required for anvil combines using official Minecraft level formulas:
-    - Level $0 \to 16$: $\text{XP} = L^2 + 6L$
-    - Level $17 \to 31$: $\text{XP} = 2.5L^2 - 40.5L + 360$
-    - Level $32+$: $\text{XP} = 4.5L^2 - 162.5L + 2220$
-  - Calculates the exact number of XP bottles required ($\lceil \Delta \text{XP} / 7.0 \rceil$), throws only what is needed, and verifies level progression via server `SetExperience` packets before combining.
+
+- **Exact Level-to-Level XP Calculation & Rapid Throwing**:
+  - Computes exact XP required for anvil combines using official Minecraft Java level formulas:
+    - Points to next level: $\text{xp\_to\_next}(L) = \begin{cases} 2L + 7 & 0 \le L \le 15 \\ 5L - 38 & 16 \le L \le 30 \\ 9L - 158 & L \ge 31 \end{cases}$
+    - Total level XP: $\text{TotalXP}(L) = \begin{cases} L^2 + 6L & 0 \le L \le 16 \\ 2.5L^2 - 40.5L + 360 & 17 \le L \le 31 \\ 4.5L^2 - 162.5L + 2220 & L \ge 32 \end{cases}$
+    - Exact deficit from Level $X$ (with progress) to Level $Y$: $\Delta\text{XP} = \text{TotalXP}(Y) - \text{true\_current\_xp}$
+    - Bottles needed: $\lceil \Delta\text{XP} / 6.8 \rceil$ (average 7.0 XP per bottle with variance safety margin)
+  - Throws bottles in rapid, authentic streams (1 tick per throw) with `ServerboundSwing` arm animations, reaching required levels in under 1 second.
+
 - **Optimal Anvil Sequencing ([iamcal/enchant-order](https://github.com/iamcal/enchant-order))**:
   - Sequences combines to minimize prior work penalties and cumulative level costs:
-    - **Helmet**: Protection IV $\to$ Unbreaking III $\to$ Mending
-    - **Chestplate**: Protection IV $\to$ Unbreaking III $\to$ Mending
-    - **Leggings**: Blast Protection IV $\to$ Unbreaking III $\to$ Mending
-    - **Boots**: Blast Protection IV $\to$ Unbreaking III $\to$ Mending
-- **Safe & Anti-Cheat Resilient**:
-  - Realistic interaction delays, authentic window click protocols, atomic concurrency, and safe lock management to prevent packet freezing and avoid anti-cheat flags.
+    - **Helmet**: Protection IV (4 lvl) $\to$ Unbreaking III (4 lvl) $\to$ Mending (5 lvl)
+    - **Chestplate**: Protection IV (4 lvl) $\to$ Unbreaking III (4 lvl) $\to$ Mending (5 lvl)
+    - **Leggings**: Blast Protection IV (8 lvl) $\to$ Unbreaking III (4 lvl) $\to$ Mending (5 lvl)
+    - **Boots**: Blast Protection IV (8 lvl) $\to$ Unbreaking III (4 lvl) $\to$ Mending (5 lvl)
+
+- **Anti-Cheat Resilient & Humanized Interactions**:
+  - **Smooth View Interpolation**: Mimics human mouse rotation using a cosine ease-in-out curve ($\alpha = \frac{1 - \cos(\pi t)}{2}$) over 5–15 ticks, eliminating abrupt aim snapping.
+  - **Arm Swing Animations**: Sends `ServerboundSwing` packet on every bottle thrown, anvil placement, and anvil block interaction.
+  - **Armor Equip Prevention**: Automatically selects safe hotbar slots (holding books or empty hands) when clicking blocks, and actively unequips armor if accidentally worn.
+  - **Strict 4-Piece Verification**: Ensures all 4 pieces (Helmet, Chestplate, Leggings, Boots) are present and verified to have all 3 required enchantments before concluding.
+
+---
+
+## Level-to-Level XP Reference
+
+| Transition | $\Delta\text{XP}$ Deficit | Bottles Required | Expected XP Output | First-Throw Attainment |
+| :--- | :---: | :---: | :---: | :---: |
+| **Level 0 $\to$ Level 4** | 40 XP | **6 bottles** | 42 XP | 100% |
+| **Level 0 $\to$ Level 5** | 55 XP | **9 bottles** | 63 XP | 100% |
+| **Level 0 $\to$ Level 8** | 112 XP | **17 bottles** | 119 XP | 100% |
+| **Level 4 $\to$ Level 8** | 72 XP | **11 bottles** | 77 XP | 100% |
+| **Level 8 $\to$ Level 13** | 135 XP | **20 bottles** | 140 XP | 100% |
+| **Level 0 $\to$ Level 13** | 247 XP | **37 bottles** | 259 XP | 100% |
 
 ---
 
@@ -62,8 +82,8 @@ cargo test
 
 ## Architecture
 
-- `src/main.rs`: Entry point, Azalea client lifecycle, server event loop, and `/order` retrieval flow.
-- `src/enchanter.rs`: Core anvil state machine, exact XP math, dynamic bottle thrower, and combine scheduler.
-- `src/gui.rs`: Container window tracking and slot click packet interactions.
+- `src/main.rs`: Entry point, Azalea client lifecycle, server event loop, and single-task enchanting workflow.
+- `src/enchanter.rs`: Core anvil state machine, level-to-level XP math, rapid bottle thrower, arm animations, smooth rotation, and combine scheduler.
+- `src/gui.rs`: Container window tracking, order item inspection, and slot click packet interactions.
 - `src/nbt.rs`: NBT parsing utilities for item identification and enchantment verification.
 - `src/auth.rs`: Minecraft session authentication and token resolution.
