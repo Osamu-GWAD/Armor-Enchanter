@@ -439,6 +439,10 @@ pub fn is_diamond_armor(info: &ItemInfo) -> bool {
 pub fn is_xp_bottle(info: &ItemInfo) -> bool {
     let k = info.kind.to_lowercase();
     let name = info.custom_name.as_deref().unwrap_or("").to_lowercase();
+    let in_lore = info.lore.iter().any(|l| {
+        let ll = l.to_lowercase();
+        ll.contains("bottle") || ll.contains("experience") || ll.contains("enchanting")
+    });
     k.contains("experiencebottle")
         || k.contains("experience_bottle")
         || k.contains("expbottle")
@@ -446,6 +450,7 @@ pub fn is_xp_bottle(info: &ItemInfo) -> bool {
         || name.contains("bottle")
         || name.contains("enchanting")
         || name.contains("experience")
+        || in_lore
 }
 
 pub fn is_anvil(info: &ItemInfo) -> bool {

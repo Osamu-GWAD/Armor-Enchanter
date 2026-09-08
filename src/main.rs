@@ -58,7 +58,7 @@ struct Args {
     blast_prot4: u32,
 
     /// Number of XP bottle stacks (up to 64 each) to withdraw
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = 2)]
     xp_stacks: u32,
 
     /// Number of anvils to withdraw
@@ -155,7 +155,7 @@ async fn handle(bot: Client, event: Event, state: BotState) -> Result<(), anyhow
                     let current_pos = bot_clone.position();
                     info!("Position after /home 1: {:?}", current_pos);
 
-                    // If inventory has excess XP bottles beyond quota (3 stacks = 192 bottles), splash them at feet to gain levels & free up space
+                    // If inventory has excess XP bottles beyond quota (2 stacks = 128 bottles), splash them at feet to gain levels & free up space
                     {
                         let mut gui = state_clone.gui.lock().await;
                         gui.reset_and_sync_inventory(Some(&bot_clone));

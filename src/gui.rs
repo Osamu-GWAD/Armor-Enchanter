@@ -36,7 +36,7 @@ impl Default for WithdrawalQuota {
             unbreaking_3_needed: 4,
             protection_4_needed: 2,
             blast_protection_4_needed: 2,
-            xp_stacks_needed: 3,
+            xp_stacks_needed: 2,
             diamond_helmets_needed: 1,
             diamond_chestplates_needed: 1,
             diamond_leggings_needed: 1,
@@ -63,12 +63,16 @@ pub struct CollectedItems {
 
 impl CollectedItems {
     pub fn is_fulfilled(&self, quota: &WithdrawalQuota) -> bool {
+        let xp_met = self.xp_bottles >= quota.xp_stacks_needed * 64
+            || self.xp_stacks >= quota.xp_stacks_needed
+            || (quota.xp_stacks_needed <= 2 && self.xp_bottles >= 106 && self.xp_stacks >= 2);
+
         self.anvils >= quota.anvils_needed
             && self.mending >= quota.mending_needed
             && self.unbreaking_3 >= quota.unbreaking_3_needed
             && self.protection_4 >= quota.protection_4_needed
             && self.blast_protection_4 >= quota.blast_protection_4_needed
-            && (self.xp_bottles >= quota.xp_stacks_needed * 64 || self.xp_stacks >= quota.xp_stacks_needed)
+            && xp_met
             && self.diamond_helmets >= quota.diamond_helmets_needed
             && self.diamond_chestplates >= quota.diamond_chestplates_needed
             && self.diamond_leggings >= quota.diamond_leggings_needed
@@ -110,6 +114,7 @@ pub struct GuiManager {
     pub phase: WithdrawalPhase,
     pub current_container_id: i32,
     pub current_state_id: u32,
+    pub open_container_size: i16,
     pub current_slots: HashMap<i16, ItemStack>,
     pub player_inventory: HashMap<i16, ItemStack>,
     pub quota: WithdrawalQuota,
@@ -126,6 +131,7 @@ impl GuiManager {
             phase: WithdrawalPhase::AnvilPlacement,
             current_container_id: 0,
             current_state_id: 0,
+            open_container_size: 0,
             current_slots: HashMap::new(),
             player_inventory: HashMap::new(),
             quota: WithdrawalQuota::default(),
@@ -175,7 +181,10 @@ impl GuiManager {
                     }
                 } else if is_xp_bottle(info) {
                     let max_xp = self.quota.xp_stacks_needed * 64;
-                    if self.collected.xp_bottles < max_xp && self.collected.xp_stacks < self.quota.xp_stacks_needed {
+                    let has_enough = self.collected.xp_stacks >= self.quota.xp_stacks_needed
+                        || self.collected.xp_bottles >= max_xp
+                        || (self.quota.xp_stacks_needed <= 2 && self.collected.xp_bottles >= 106 && self.collected.xp_stacks >= 2);
+                    if !has_enough {
                         (true, "Experience Bottles")
                     } else {
                         (false, "")
@@ -218,7 +227,7 @@ impl GuiManager {
             self.collected.anvils += info.count as u32;
         } else if is_xp_bottle(info) {
             self.collected.xp_bottles += info.count as u32;
-            self.collected.xp_stacks = self.collected.xp_bottles / 64;
+            self.collected.xp_stacks = self.collected.xp_stacks.max((self.collected.xp_bottles + 63) / 64);
         } else if is_mending(info) {
             self.collected.mending += info.count as u32;
         } else if is_unbreaking_3(info) {
@@ -246,6 +255,7 @@ impl GuiManager {
         let mut prot4 = 0;
         let mut blast_prot4 = 0;
         let mut xp_count = 0;
+        let mut xp_stack_slots = 0;
         let mut helmets = 0;
         let mut chestplates = 0;
         let mut leggings = 0;
@@ -257,6 +267,9 @@ impl GuiManager {
                     anvils += info.count as u32;
                 } else if is_xp_bottle(&info) {
                     xp_count += info.count as u32;
+                    if info.count > 0 {
+                        xp_stack_slots += 1;
+                    }
                 } else if is_mending(&info) {
                     mending += info.count as u32;
                 } else if is_unbreaking_3(&info) {
@@ -283,21 +296,21 @@ impl GuiManager {
         self.collected.protection_4 = prot4;
         self.collected.blast_protection_4 = blast_prot4;
         self.collected.xp_bottles = xp_count;
-        self.collected.xp_stacks = xp_count / 64;
+        self.collected.xp_stacks = xp_stack_slots.max((xp_count + 63) / 64);
         self.collected.diamond_helmets = helmets;
         self.collected.diamond_chestplates = chestplates;
         self.collected.diamond_leggings = leggings;
         self.collected.diamond_boots = boots;
 
         info!(
-            "Inventory Initial Sync [Phase {:?}]: Anvils: {}/{}, Mending: {}/{}, Unb3: {}/{}, Prot4: {}/{}, BlastProt4: {}/{}, XP: {}/{} ({} bottles), Armor (H: {}/{}, C: {}/{}, L: {}/{}, B: {}/{})",
+            "Inventory Initial Sync [Phase {:?}]: Anvils: {}/{}, Mending: {}/{}, Unb3: {}/{}, Prot4: {}/{}, BlastProt4: {}/{}, XP: {}/{} ({} bottles, {} stack slots), Armor (H: {}/{}, C: {}/{}, L: {}/{}, B: {}/{})",
             self.phase,
             self.collected.anvils, self.quota.anvils_needed,
             self.collected.mending, self.quota.mending_needed,
             self.collected.unbreaking_3, self.quota.unbreaking_3_needed,
             self.collected.protection_4, self.quota.protection_4_needed,
             self.collected.blast_protection_4, self.quota.blast_protection_4_needed,
-            self.collected.xp_stacks, self.quota.xp_stacks_needed, self.collected.xp_bottles,
+            self.collected.xp_stacks, self.quota.xp_stacks_needed, self.collected.xp_bottles, xp_stack_slots,
             self.collected.diamond_helmets, self.quota.diamond_helmets_needed,
             self.collected.diamond_chestplates, self.quota.diamond_chestplates_needed,
             self.collected.diamond_leggings, self.quota.diamond_leggings_needed,
@@ -314,6 +327,7 @@ impl GuiManager {
         let mut prot4 = 0;
         let mut blast_prot4 = 0;
         let mut xp_count = 0;
+        let mut xp_stack_slots = 0;
         let mut helmets = 0;
         let mut chestplates = 0;
         let mut leggings = 0;
@@ -325,6 +339,9 @@ impl GuiManager {
                     anvils += info.count as u32;
                 } else if is_xp_bottle(&info) {
                     xp_count += info.count as u32;
+                    if info.count > 0 {
+                        xp_stack_slots += 1;
+                    }
                 } else if is_mending(&info) {
                     mending += info.count as u32;
                 } else if is_unbreaking_3(&info) {
@@ -351,21 +368,21 @@ impl GuiManager {
         self.collected.protection_4 = self.collected.protection_4.max(prot4);
         self.collected.blast_protection_4 = self.collected.blast_protection_4.max(blast_prot4);
         self.collected.xp_bottles = self.collected.xp_bottles.max(xp_count);
-        self.collected.xp_stacks = self.collected.xp_bottles / 64;
+        self.collected.xp_stacks = self.collected.xp_stacks.max(xp_stack_slots).max((self.collected.xp_bottles + 63) / 64);
         self.collected.diamond_helmets = self.collected.diamond_helmets.max(helmets);
         self.collected.diamond_chestplates = self.collected.diamond_chestplates.max(chestplates);
         self.collected.diamond_leggings = self.collected.diamond_leggings.max(leggings);
         self.collected.diamond_boots = self.collected.diamond_boots.max(boots);
 
         info!(
-            "Inventory Synced [Phase {:?}]: Anvils: {}/{}, Mending: {}/{}, Unb3: {}/{}, Prot4: {}/{}, BlastProt4: {}/{}, XP: {}/{} ({} bottles), Armor (H: {}/{}, C: {}/{}, L: {}/{}, B: {}/{})",
+            "Inventory Synced [Phase {:?}]: Anvils: {}/{}, Mending: {}/{}, Unb3: {}/{}, Prot4: {}/{}, BlastProt4: {}/{}, XP: {}/{} ({} bottles, {} stack slots), Armor (H: {}/{}, C: {}/{}, L: {}/{}, B: {}/{})",
             self.phase,
             self.collected.anvils, self.quota.anvils_needed,
             self.collected.mending, self.quota.mending_needed,
             self.collected.unbreaking_3, self.quota.unbreaking_3_needed,
             self.collected.protection_4, self.quota.protection_4_needed,
             self.collected.blast_protection_4, self.quota.blast_protection_4_needed,
-            self.collected.xp_stacks, self.quota.xp_stacks_needed, self.collected.xp_bottles,
+            self.collected.xp_stacks, self.quota.xp_stacks_needed, self.collected.xp_bottles, xp_stack_slots,
             self.collected.diamond_helmets, self.quota.diamond_helmets_needed,
             self.collected.diamond_chestplates, self.quota.diamond_chestplates_needed,
             self.collected.diamond_leggings, self.quota.diamond_leggings_needed,
@@ -450,7 +467,7 @@ impl GuiManager {
         }
 
         bot.wait_ticks(20).await;
-        self.sync_collected_from_inventory(Some(bot));
+        self.reset_and_sync_inventory(Some(bot));
         info!(
             "Finished splashing excess XP! Free inventory slots now: {}",
             self.count_free_inventory_slots()
@@ -476,6 +493,7 @@ impl GuiManager {
         self.current_container_id = container_id;
         self.current_slots.clear();
         self.current_state_id = 0;
+        self.open_container_size = 0;
 
         if self.state == OrderWorkflowState::WithdrawalComplete {
             info!("Ignoring GUI open transition because WithdrawalComplete is already reached.");
@@ -521,6 +539,8 @@ impl GuiManager {
 
         // In open containers (chests, anvils), the trailing 36 slots correspond to player inventory slots
         if items.len() >= 36 {
+            let container_size = (items.len() - 36) as i16;
+            self.open_container_size = container_size;
             let inv_start = items.len() - 36;
             for i in 0..36 {
                 self.player_inventory.insert((9 + i) as i16, items[inv_start + i].clone());
@@ -543,14 +563,18 @@ impl GuiManager {
             self.current_state_id = state_id;
             self.current_slots.insert(slot, item.clone());
 
-            let total_slots = self.current_slots.len();
-            if total_slots >= 36 {
-                let container_size = (total_slots - 36) as i16;
-                if slot >= container_size {
-                    let inv_slot = 9 + (slot - container_size);
-                    self.player_inventory.insert(inv_slot, item.clone());
-                    self.sync_collected_from_inventory(bot);
-                }
+            let container_size = if self.open_container_size > 0 {
+                self.open_container_size
+            } else if self.current_slots.len() >= 36 {
+                (self.current_slots.len() - 36) as i16
+            } else {
+                -1
+            };
+
+            if container_size > 0 && slot >= container_size {
+                let inv_slot = 9 + (slot - container_size);
+                self.player_inventory.insert(inv_slot, item.clone());
+                self.sync_collected_from_inventory(bot);
             }
 
             if let Some(info) = inspect_item_with_bot(item, bot) {
@@ -1039,7 +1063,46 @@ mod tests {
     }
 
     #[test]
+    fn test_xp_bottles_already_enough_skips_orders() {
+        let mut gui = GuiManager::new();
+        gui.phase = WithdrawalPhase::ItemsRetrieval;
+        gui.quota.xp_stacks_needed = 2;
+
+        let xp_info = ItemInfo {
+            kind: "ExperienceBottle".to_string(),
+            count: 64,
+            ..Default::default()
+        };
+
+        // When inventory has 0 bottles, it IS needed
+        gui.collected.xp_bottles = 0;
+        gui.collected.xp_stacks = 0;
+        let (needed, name) = gui.is_order_needed(&xp_info);
+        assert!(needed);
+        assert_eq!(name, "Experience Bottles");
+
+        // When inventory has 1 stack (64 bottles), it IS needed
+        gui.collected.xp_bottles = 64;
+        gui.collected.xp_stacks = 1;
+        let (needed, _) = gui.is_order_needed(&xp_info);
+        assert!(needed);
+
+        // When inventory has 2 stacks (128 bottles), it is NOT needed!
+        gui.collected.xp_bottles = 128;
+        gui.collected.xp_stacks = 2;
+        let (needed, _) = gui.is_order_needed(&xp_info);
+        assert!(!needed, "Should not need XP bottles when 2 stacks (128 bottles) are collected");
+
+        // When inventory has 2 stacks but slightly less than 128 (e.g. 114 bottles across 2 slots), it is NOT needed!
+        gui.collected.xp_bottles = 114;
+        gui.collected.xp_stacks = 2;
+        let (needed, _) = gui.is_order_needed(&xp_info);
+        assert!(!needed, "Should not need XP bottles when 2 stacks (>=106 bottles) already collected");
+    }
+
+    #[test]
     fn test_click_type_swap() {
         let _ = ClickType::Swap;
     }
 }
+

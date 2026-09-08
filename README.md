@@ -11,7 +11,7 @@ An autonomous, high-performance Minecraft enchanting bot built in Rust with [Aza
   - Withdraws the exact required item set without surplus:
     - 1× Diamond Helmet, 1× Diamond Chestplate, 1× Diamond Leggings, 1× Diamond Boots
     - 4× Unbreaking III, 4× Mending, 2× Blast Protection IV, 2× Protection IV enchanted books
-    - 1× Anvil and exactly 3 stacks (192) of Bottles o' Enchanting
+    - 1× Anvil and exactly 2 stacks (128) of Bottles o' Enchanting (sufficient for all combines with 22+ bottles margin)
 
 - **Exact Level-to-Level XP Calculation & Rapid Throwing**:
   - Computes exact XP required for anvil combines using official Minecraft Java level formulas:
