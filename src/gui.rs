@@ -1,3 +1,4 @@
+use crate::stock::{OrderListing, StockAudit};
 use crate::nbt::{
     inspect_item, inspect_item_with_bot, is_anvil, is_blast_protection_4, is_confirm_button,
     is_diamond_armor, is_diamond_boots, is_diamond_chestplate, is_diamond_helmet,
@@ -8,10 +9,10 @@ use crate::nbt::{
 use azalea::inventory::operations::ClickType;
 use azalea::inventory::ItemStack;
 use azalea::protocol::packets::game::s_container_click::{HashedStack, ServerboundContainerClick};
-use azalea::protocol::packets::game::ServerboundContainerClose;
+use azalea::protocol::packets::game::{ServerboundChatCommand, ServerboundContainerClose};
 use azalea::Client;
 use std::collections::HashMap;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Quota of items to retrieve from the `/order` delivery menu.
 #[derive(Debug, Clone)]
@@ -32,21 +33,21 @@ impl Default for WithdrawalQuota {
     fn default() -> Self {
         Self {
             anvils_needed: 1,
-            mending_needed: 4,
-            unbreaking_3_needed: 4,
-            protection_4_needed: 2,
-            blast_protection_4_needed: 2,
-            xp_stacks_needed: 2,
-            diamond_helmets_needed: 1,
-            diamond_chestplates_needed: 1,
-            diamond_leggings_needed: 1,
-            diamond_boots_needed: 1,
+            mending_needed: 8,
+            unbreaking_3_needed: 8,
+            protection_4_needed: 4,
+            blast_protection_4_needed: 4,
+            xp_stacks_needed: 4,
+            diamond_helmets_needed: 2,
+            diamond_chestplates_needed: 2,
+            diamond_leggings_needed: 2,
+            diamond_boots_needed: 2,
         }
     }
 }
 
 /// Tracks the items collected so far into inventory.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CollectedItems {
     pub anvils: u32,
     pub mending: u32,
@@ -62,10 +63,12 @@ pub struct CollectedItems {
 }
 
 impl CollectedItems {
+    fn has_required_xp(&self, quota: &WithdrawalQuota) -> bool {
+        self.xp_bottles >= quota.xp_stacks_needed.saturating_mul(64)
+    }
+
     pub fn is_fulfilled(&self, quota: &WithdrawalQuota) -> bool {
-        let xp_met = self.xp_bottles >= quota.xp_stacks_needed * 64
-            || self.xp_stacks >= quota.xp_stacks_needed
-            || (quota.xp_stacks_needed <= 2 && self.xp_bottles >= 106 && self.xp_stacks >= 2);
+        let xp_met = self.has_required_xp(quota);
 
         self.anvils >= quota.anvils_needed
             && self.mending >= quota.mending_needed
@@ -86,7 +89,7 @@ impl CollectedItems {
 
 /// Execution phase of withdrawal:
 /// 1. AnvilPlacement: withdraw ONLY 1 Anvil from orders, then close GUI and place it.
-/// 2. ItemsRetrieval: after anvil is placed, withdraw books, XP bottles, and 1 piece of each armor type.
+/// 2. ItemsRetrieval: after anvil is placed, withdraw books, XP bottles, and 2 pieces of each armor type.
 /// 3. Done: all required items collected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WithdrawalPhase {
@@ -105,10 +108,29 @@ pub enum OrderWorkflowState {
     OpenedYourOrdersMenu,
     InOrderSubmenu,
     InCollectDeliveryMenu,
-    WaitingForNextOrder,
     WithdrawalComplete,
+    WaitingForNextOrder,
     FillingTargetOrders,
+    DepositingTargetItems,
     ConfirmingFulfill,
+    SellingInventory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetArmorType {
+    Helmet,
+    Chestplate,
+    Leggings,
+    Boots,
+}
+
+#[derive(Debug, Clone)]
+struct PendingDelivery {
+    armor: TargetArmorType,
+    inventory_count_before: usize,
+    source_slot: i16,
+    deposit_observed: bool,
+    confirm_sent: bool,
 }
 
 pub struct GuiManager {
@@ -122,9 +144,68 @@ pub struct GuiManager {
     pub quota: WithdrawalQuota,
     pub collected: CollectedItems,
     pub target_order_type: Option<String>,
+    pub last_collecting_order_name: Option<String>,
+    pub current_order_slot: Option<i16>,
+    pub exhausted_orders: Vec<String>,
+    stock_audit: StockAudit,
+    order_page: usize,
+    page_turn_pending: bool,
+    pub collect_clicked_in_submenu: bool,
+    pub last_exhausted_check: Option<std::time::Instant>,
+    pub target_delivering_armor: Option<TargetArmorType>,
     pub action_in_progress: bool,
     pub current_menu_skipped_slots: Vec<i16>,
     pub order_target: String,
+    pub is_fulfilling_target: bool,
+    pub last_target_order_click: Option<std::time::Instant>,
+    pub gui_action_epoch: u64,
+    pub is_waiting_for_restock: bool,
+    pub restock_wait_until: Option<std::time::Instant>,
+    pub last_action_time: Option<std::time::Instant>,
+    pub action_retry_count: u32,
+    navigation_retry_count: u32,
+    pub last_clicked_slot: Option<i16>,
+    pub last_click_type: Option<ClickType>,
+    pub last_command_sent: Option<String>,
+    pub awaiting_response: bool,
+    pub target_sets_to_deliver: usize,
+    pub next_drop: usize,
+    pub pending_drop: Option<(usize, usize)>,
+    pub player_state_id: u32,
+    pub placed_anvil_available: bool,
+    inventory_info_cache: HashMap<i16, (ItemStack, Option<ItemInfo>, bool)>,
+    pub target_delivered_helmets: usize,
+    pub target_delivered_chestplates: usize,
+    pub target_delivered_leggings: usize,
+    pub target_delivered_boots: usize,
+    pending_delivery: Option<PendingDelivery>,
+    transfer_before: Option<(ItemStack, HashMap<i16, ItemStack>)>,
+    last_progress_time: std::time::Instant,
+    scheduled_command: Option<(std::time::Instant, String)>,
+}
+
+/// Sends a command to the server using the plain, unsigned ServerboundChatCommand packet.
+/// As documented in GUI_COMMAND_FIX.md, sending plugin commands (/order, /ah, /bal, /balance, /home)
+/// through signed chat sessions silently fails on Minecraft proxies (like DonutSMP/Velocity)
+/// even while connection and keepalives remain active.
+/// Using the plain unsigned command packet bypasses chat session signatures and executes reliably.
+pub fn send_command(bot: &Client, cmd: &str) {
+    let clean_cmd = cmd.strip_prefix('/').unwrap_or(cmd);
+    if clean_cmd.split_whitespace().next().is_some_and(|name| name.eq_ignore_ascii_case("sell")) {
+        warn!("Ignored sell command: automatic selling is disabled.");
+        return;
+    }
+    bot.write_packet(ServerboundChatCommand {
+        command: clean_cmd.to_string(),
+    });
+}
+
+/// Sends an unsigned chat message or command. All chats and commands sent by the bot are unsigned.
+pub fn send_chat(bot: &Client, message: &str) {
+    let clean = message.strip_prefix('/').unwrap_or(message);
+    bot.write_packet(ServerboundChatCommand {
+        command: clean.to_string(),
+    });
 }
 
 impl GuiManager {
@@ -140,10 +221,244 @@ impl GuiManager {
             quota: WithdrawalQuota::default(),
             collected: CollectedItems::default(),
             target_order_type: None,
+            last_collecting_order_name: None,
+            current_order_slot: None,
+            exhausted_orders: Vec::new(),
+            stock_audit: StockAudit::default(),
+            order_page: 0,
+            page_turn_pending: false,
+            collect_clicked_in_submenu: false,
+            last_exhausted_check: None,
+            target_delivering_armor: None,
             action_in_progress: false,
             current_menu_skipped_slots: Vec::new(),
             order_target: "zn6h".to_string(),
+            is_fulfilling_target: false,
+            last_target_order_click: None,
+            gui_action_epoch: 0,
+            is_waiting_for_restock: false,
+            restock_wait_until: None,
+            last_action_time: None,
+            action_retry_count: 0,
+            navigation_retry_count: 0,
+            last_clicked_slot: None,
+            last_click_type: None,
+            last_command_sent: None,
+            awaiting_response: false,
+            target_sets_to_deliver: 0,
+            next_drop: 0,
+            pending_drop: None,
+            player_state_id: 0,
+            placed_anvil_available: false,
+            inventory_info_cache: HashMap::new(),
+            target_delivered_helmets: 0,
+            target_delivered_chestplates: 0,
+            target_delivered_leggings: 0,
+            target_delivered_boots: 0,
+            pending_delivery: None,
+            transfer_before: None,
+            last_progress_time: std::time::Instant::now(),
+            scheduled_command: None,
         }
+    }
+
+    /// Reset watchdog tracking fields.
+    pub fn clear_watchdog(&mut self) {
+        self.last_action_time = None;
+        self.action_retry_count = 0;
+        self.last_clicked_slot = None;
+        self.last_click_type = None;
+        self.last_command_sent = None;
+        self.awaiting_response = false;
+        self.transfer_before = None;
+    }
+
+    /// Record that a container click action has been dispatched and watchdog should await response.
+    pub fn record_action_sent(&mut self, slot: Option<i16>, click_type: Option<ClickType>) {
+        self.last_action_time = Some(std::time::Instant::now());
+        self.last_progress_time = std::time::Instant::now();
+        self.last_clicked_slot = slot;
+        self.last_click_type = click_type;
+        self.last_command_sent = None;
+        self.action_retry_count = 0;
+        self.awaiting_response = true;
+    }
+
+    /// Record that a chat command opening a GUI has been sent and watchdog should await response.
+    pub fn record_command_sent(&mut self, cmd: &str) {
+        if cmd.trim() == "/order" {
+            self.order_page = 0;
+            self.page_turn_pending = false;
+            self.stock_audit.start_scan();
+        }
+        self.scheduled_command = None;
+        self.last_action_time = Some(std::time::Instant::now());
+        self.last_progress_time = std::time::Instant::now();
+        self.last_clicked_slot = None;
+        self.last_click_type = None;
+        self.last_command_sent = Some(cmd.to_string());
+        self.action_retry_count = 0;
+        self.awaiting_response = true;
+        self.current_container_id = 0;
+        self.current_slots.clear();
+    }
+
+    /// Sends a command to the server using the plain, unsigned ServerboundChatCommand packet.
+    pub fn send_command(bot: &Client, cmd: &str) {
+        send_command(bot, cmd);
+    }
+
+    /// Prepare to send a command by closing any lingering container and setting watchdog tracking before sending.
+    pub fn prepare_to_send_command(&mut self, bot: &Client, cmd: &str) {
+        if self.current_container_id > 0 {
+            info!("Closing lingering container #{} before sending command '{cmd}'...", self.current_container_id);
+            bot.write_packet(ServerboundContainerClose {
+                container_id: self.current_container_id,
+            });
+        }
+        self.record_command_sent(cmd);
+        send_command(bot, cmd);
+    }
+
+    fn schedule_command(&mut self, command: String, delay: std::time::Duration) {
+        self.clear_watchdog();
+        self.scheduled_command = Some((std::time::Instant::now() + delay, command));
+    }
+
+    /// Identify the friendly name of an order item regardless of quota fulfillment state.
+    pub fn identify_order_item_name(&self, info: &ItemInfo) -> &'static str {
+        if is_anvil(info) {
+            "Anvil"
+        } else if is_mending(info) {
+            "Mending Book"
+        } else if is_unbreaking_3(info) {
+            "Unbreaking III Book"
+        } else if is_blast_protection_4(info) {
+            "Blast Protection IV Book"
+        } else if is_protection_4(info) {
+            "Protection IV Book"
+        } else if is_xp_bottle(info) {
+            "Experience Bottles"
+        } else if is_diamond_helmet(info) {
+            "Diamond Helmet"
+        } else if is_diamond_chestplate(info) {
+            "Diamond Chestplate"
+        } else if is_diamond_leggings(info) {
+            "Diamond Leggings"
+        } else if is_diamond_boots(info) {
+            "Diamond Boots"
+        } else {
+            ""
+        }
+    }
+
+    /// Returns a descriptive name for an item stack based on custom name, detected enchantment, or kind.
+    pub fn get_item_name(&self, info: &ItemInfo) -> String {
+        let identified = self.identify_order_item_name(info);
+        if !identified.is_empty() {
+            identified.to_string()
+        } else if let Some(ref name) = info.custom_name {
+            name.clone()
+        } else {
+            info.kind.clone()
+        }
+    }
+
+    /// Generate a readable summary of items that are still missing to fulfill quota.
+    pub fn get_missing_quota_summary(&self) -> String {
+        let mut missing = Vec::new();
+        if self.phase == WithdrawalPhase::AnvilPlacement {
+            if self.collected.anvils < self.quota.anvils_needed {
+                missing.push(format!("Anvil ({}/{})", self.collected.anvils, self.quota.anvils_needed));
+            }
+        } else {
+            if self.collected.mending < self.quota.mending_needed {
+                missing.push(format!("Mending Book ({}/{})", self.collected.mending, self.quota.mending_needed));
+            }
+            if self.collected.unbreaking_3 < self.quota.unbreaking_3_needed {
+                missing.push(format!("Unbreaking III Book ({}/{})", self.collected.unbreaking_3, self.quota.unbreaking_3_needed));
+            }
+            if self.collected.protection_4 < self.quota.protection_4_needed {
+                missing.push(format!("Protection IV Book ({}/{})", self.collected.protection_4, self.quota.protection_4_needed));
+            }
+            if self.collected.blast_protection_4 < self.quota.blast_protection_4_needed {
+                missing.push(format!("Blast Protection IV Book ({}/{})", self.collected.blast_protection_4, self.quota.blast_protection_4_needed));
+            }
+            let xp_met = self.collected.has_required_xp(&self.quota);
+            if !xp_met {
+                missing.push(format!("XP Bottles ({}/{} stacks, {} bottles)", self.collected.xp_stacks, self.quota.xp_stacks_needed, self.collected.xp_bottles));
+            }
+            if self.collected.diamond_helmets < self.quota.diamond_helmets_needed {
+                missing.push(format!("Diamond Helmet ({}/{})", self.collected.diamond_helmets, self.quota.diamond_helmets_needed));
+            }
+            if self.collected.diamond_chestplates < self.quota.diamond_chestplates_needed {
+                missing.push(format!("Diamond Chestplate ({}/{})", self.collected.diamond_chestplates, self.quota.diamond_chestplates_needed));
+            }
+            if self.collected.diamond_leggings < self.quota.diamond_leggings_needed {
+                missing.push(format!("Diamond Leggings ({}/{})", self.collected.diamond_leggings, self.quota.diamond_leggings_needed));
+            }
+            if self.collected.diamond_boots < self.quota.diamond_boots_needed {
+                missing.push(format!("Diamond Boots ({}/{})", self.collected.diamond_boots, self.quota.diamond_boots_needed));
+            }
+        }
+
+        if missing.is_empty() {
+            "None (All quota items collected!)".to_string()
+        } else {
+            missing.join(", ")
+        }
+    }
+
+    /// Records that an order has 0 items to collect upon receiving server chat notification,
+    /// logs prominent out-of-stock messages detailing which items are affected,
+    /// closes the current GUI container, and returns the affected item name.
+    pub fn record_no_items_to_collect(&mut self, bot: &Client) -> Option<String> {
+        let item_name = self.stock_audit.confirm_empty()?;
+        if !self.exhausted_orders.contains(&item_name) {
+            self.exhausted_orders.push(item_name.clone());
+        }
+        info!("The selected order for '{item_name}' is empty. Checking other orders and inventory before alerting.");
+        self.close_current_gui(bot);
+        self.target_order_type = None;
+        self.collect_clicked_in_submenu = false;
+        self.state = OrderWorkflowState::WaitingForNextOrder;
+        Some(item_name)
+    }
+
+    fn verified_stock_alerts(&self) -> Vec<&'static str> {
+        let candidates = if self.phase == WithdrawalPhase::AnvilPlacement {
+            vec![("Anvil", self.collected.anvils, self.quota.anvils_needed)]
+        } else if self.phase == WithdrawalPhase::ItemsRetrieval {
+            vec![
+                ("Experience Bottles", self.collected.xp_bottles, self.quota.xp_stacks_needed),
+                ("Mending Book", self.collected.mending, self.quota.mending_needed),
+                ("Unbreaking III Book", self.collected.unbreaking_3, self.quota.unbreaking_3_needed),
+                ("Protection IV Book", self.collected.protection_4, self.quota.protection_4_needed),
+                ("Blast Protection IV Book", self.collected.blast_protection_4, self.quota.blast_protection_4_needed),
+                ("Diamond Helmet", self.collected.diamond_helmets, self.quota.diamond_helmets_needed),
+                ("Diamond Chestplate", self.collected.diamond_chestplates, self.quota.diamond_chestplates_needed),
+                ("Diamond Leggings", self.collected.diamond_leggings, self.quota.diamond_leggings_needed),
+                ("Diamond Boots", self.collected.diamond_boots, self.quota.diamond_boots_needed),
+            ]
+        } else { vec![] };
+        candidates.into_iter().filter_map(|(name, count, required)| {
+            (required > 0 && self.stock_audit.confirmed_unavailable(name, count)).then_some(name)
+        }).collect()
+    }
+
+    fn order_listing(&self, slot: i16, bot: Option<&Client>) -> Option<OrderListing> {
+        let icon = self.current_slots.get(&slot)?;
+        let info = inspect_item_with_bot(icon, bot)?;
+        let name = self.identify_order_item_name(&info);
+        if name.is_empty() { return None; }
+        Some(OrderListing { slot, name: name.to_string(), icon: icon.clone() })
+    }
+
+    fn has_next_order_page(&self, bot: Option<&Client>) -> bool {
+        let Some(info) = self.current_slots.get(&53).and_then(|item| inspect_item_with_bot(item, bot)) else { return false; };
+        let text = normalize_small_caps(&format!("{} {}", info.custom_name.unwrap_or_default(), info.lore.join(" ")).to_lowercase());
+        info.kind.to_lowercase().contains("arrow")
+            && !["no next", "last page", "disabled"].iter().any(|label| text.contains(label))
     }
 
     /// Check if an order item is needed in the current phase and quota.
@@ -184,10 +499,7 @@ impl GuiManager {
                         (false, "")
                     }
                 } else if is_xp_bottle(info) {
-                    let max_xp = self.quota.xp_stacks_needed * 64;
-                    let has_enough = self.collected.xp_stacks >= self.quota.xp_stacks_needed
-                        || self.collected.xp_bottles >= max_xp
-                        || (self.quota.xp_stacks_needed <= 2 && self.collected.xp_bottles >= 106 && self.collected.xp_stacks >= 2);
+                    let has_enough = self.collected.has_required_xp(&self.quota);
                     if !has_enough {
                         (true, "Experience Bottles")
                     } else {
@@ -200,19 +512,25 @@ impl GuiManager {
                         (false, "")
                     }
                 } else if is_diamond_chestplate(info) {
-                    if self.collected.diamond_chestplates < self.quota.diamond_chestplates_needed {
+                    if self.collected.diamond_helmets >= self.quota.diamond_helmets_needed
+                        && self.collected.diamond_chestplates < self.quota.diamond_chestplates_needed {
                         (true, "Diamond Chestplate")
                     } else {
                         (false, "")
                     }
                 } else if is_diamond_leggings(info) {
-                    if self.collected.diamond_leggings < self.quota.diamond_leggings_needed {
+                    if self.collected.diamond_helmets >= self.quota.diamond_helmets_needed
+                        && self.collected.diamond_chestplates >= self.quota.diamond_chestplates_needed
+                        && self.collected.diamond_leggings < self.quota.diamond_leggings_needed {
                         (true, "Diamond Leggings")
                     } else {
                         (false, "")
                     }
                 } else if is_diamond_boots(info) {
-                    if self.collected.diamond_boots < self.quota.diamond_boots_needed {
+                    if self.collected.diamond_helmets >= self.quota.diamond_helmets_needed
+                        && self.collected.diamond_chestplates >= self.quota.diamond_chestplates_needed
+                        && self.collected.diamond_leggings >= self.quota.diamond_leggings_needed
+                        && self.collected.diamond_boots < self.quota.diamond_boots_needed {
                         (true, "Diamond Boots")
                     } else {
                         (false, "")
@@ -253,77 +571,18 @@ impl GuiManager {
 
     /// Performs an exact inventory count and resets collected state from the current inventory.
     pub fn reset_and_sync_inventory(&mut self, bot: Option<&Client>) {
-        let mut anvils = 0;
-        let mut mending = 0;
-        let mut unb3 = 0;
-        let mut prot4 = 0;
-        let mut blast_prot4 = 0;
-        let mut xp_count = 0;
-        let mut xp_stack_slots = 0;
-        let mut helmets = 0;
-        let mut chestplates = 0;
-        let mut leggings = 0;
-        let mut boots = 0;
-
-        for item in self.player_inventory.values() {
-            if let Some(info) = inspect_item_with_bot(item, bot) {
-                if is_anvil(&info) {
-                    anvils += info.count as u32;
-                } else if is_xp_bottle(&info) {
-                    xp_count += info.count as u32;
-                    if info.count > 0 {
-                        xp_stack_slots += 1;
-                    }
-                } else if is_mending(&info) {
-                    mending += info.count as u32;
-                } else if is_unbreaking_3(&info) {
-                    unb3 += info.count as u32;
-                } else if is_blast_protection_4(&info) {
-                    blast_prot4 += info.count as u32;
-                } else if is_protection_4(&info) {
-                    prot4 += info.count as u32;
-                } else if is_diamond_helmet(&info) {
-                    helmets += info.count as u32;
-                } else if is_diamond_chestplate(&info) {
-                    chestplates += info.count as u32;
-                } else if is_diamond_leggings(&info) {
-                    leggings += info.count as u32;
-                } else if is_diamond_boots(&info) {
-                    boots += info.count as u32;
-                }
-            }
-        }
-
-        self.collected.anvils = anvils;
-        self.collected.mending = mending;
-        self.collected.unbreaking_3 = unb3;
-        self.collected.protection_4 = prot4;
-        self.collected.blast_protection_4 = blast_prot4;
-        self.collected.xp_bottles = xp_count;
-        self.collected.xp_stacks = xp_stack_slots.max((xp_count + 63) / 64);
-        self.collected.diamond_helmets = helmets;
-        self.collected.diamond_chestplates = chestplates;
-        self.collected.diamond_leggings = leggings;
-        self.collected.diamond_boots = boots;
-
-        info!(
-            "Inventory Initial Sync [Phase {:?}]: Anvils: {}/{}, Mending: {}/{}, Unb3: {}/{}, Prot4: {}/{}, BlastProt4: {}/{}, XP: {}/{} ({} bottles, {} stack slots), Armor (H: {}/{}, C: {}/{}, L: {}/{}, B: {}/{})",
-            self.phase,
-            self.collected.anvils, self.quota.anvils_needed,
-            self.collected.mending, self.quota.mending_needed,
-            self.collected.unbreaking_3, self.quota.unbreaking_3_needed,
-            self.collected.protection_4, self.quota.protection_4_needed,
-            self.collected.blast_protection_4, self.quota.blast_protection_4_needed,
-            self.collected.xp_stacks, self.quota.xp_stacks_needed, self.collected.xp_bottles, xp_stack_slots,
-            self.collected.diamond_helmets, self.quota.diamond_helmets_needed,
-            self.collected.diamond_chestplates, self.quota.diamond_chestplates_needed,
-            self.collected.diamond_leggings, self.quota.diamond_leggings_needed,
-            self.collected.diamond_boots, self.quota.diamond_boots_needed,
-        );
+        self.navigation_retry_count = 0;
+        self.inventory_info_cache.clear();
+        self.stock_audit = StockAudit::default();
+        self.order_page = 0;
+        self.page_turn_pending = false;
+        self.sync_collected_from_inventory(bot);
+        self.is_waiting_for_restock = false;
+        self.restock_wait_until = None;
     }
 
     /// Synchronize collected item counts with actual items residing in the player's inventory,
-    /// ensuring that item counts never decrease during container transitions.
+    /// replacing historical counts with the latest server inventory snapshot.
     pub fn sync_collected_from_inventory(&mut self, bot: Option<&Client>) {
         let mut anvils = 0;
         let mut mending = 0;
@@ -337,8 +596,14 @@ impl GuiManager {
         let mut leggings = 0;
         let mut boots = 0;
 
-        for item in self.player_inventory.values() {
-            if let Some(info) = inspect_item_with_bot(item, bot) {
+        for (&slot, item) in &self.player_inventory {
+            if !(9..=44).contains(&slot) { continue; }
+            let cached = self.inventory_info_cache.entry(slot).or_insert_with(||
+                (item.clone(), inspect_item_with_bot(item, bot), bot.is_some()));
+            if cached.0 != *item || (bot.is_some() && !cached.2) {
+                *cached = (item.clone(), inspect_item_with_bot(item, bot), bot.is_some());
+            }
+            if let Some(info) = &cached.1 {
                 if is_anvil(&info) {
                     anvils += info.count as u32;
                 } else if is_xp_bottle(&info) {
@@ -366,32 +631,36 @@ impl GuiManager {
             }
         }
 
-        self.collected.anvils = self.collected.anvils.max(anvils);
-        self.collected.mending = self.collected.mending.max(mending);
-        self.collected.unbreaking_3 = self.collected.unbreaking_3.max(unb3);
-        self.collected.protection_4 = self.collected.protection_4.max(prot4);
-        self.collected.blast_protection_4 = self.collected.blast_protection_4.max(blast_prot4);
-        self.collected.xp_bottles = self.collected.xp_bottles.max(xp_count);
-        self.collected.xp_stacks = self.collected.xp_stacks.max(xp_stack_slots).max((self.collected.xp_bottles + 63) / 64);
-        self.collected.diamond_helmets = self.collected.diamond_helmets.max(helmets);
-        self.collected.diamond_chestplates = self.collected.diamond_chestplates.max(chestplates);
-        self.collected.diamond_leggings = self.collected.diamond_leggings.max(leggings);
-        self.collected.diamond_boots = self.collected.diamond_boots.max(boots);
+        let prev = self.collected.clone();
 
-        info!(
-            "Inventory Synced [Phase {:?}]: Anvils: {}/{}, Mending: {}/{}, Unb3: {}/{}, Prot4: {}/{}, BlastProt4: {}/{}, XP: {}/{} ({} bottles, {} stack slots), Armor (H: {}/{}, C: {}/{}, L: {}/{}, B: {}/{})",
-            self.phase,
-            self.collected.anvils, self.quota.anvils_needed,
-            self.collected.mending, self.quota.mending_needed,
-            self.collected.unbreaking_3, self.quota.unbreaking_3_needed,
-            self.collected.protection_4, self.quota.protection_4_needed,
-            self.collected.blast_protection_4, self.quota.blast_protection_4_needed,
-            self.collected.xp_stacks, self.quota.xp_stacks_needed, self.collected.xp_bottles, xp_stack_slots,
-            self.collected.diamond_helmets, self.quota.diamond_helmets_needed,
-            self.collected.diamond_chestplates, self.quota.diamond_chestplates_needed,
-            self.collected.diamond_leggings, self.quota.diamond_leggings_needed,
-            self.collected.diamond_boots, self.quota.diamond_boots_needed,
-        );
+        self.collected.anvils = anvils + u32::from(self.placed_anvil_available);
+        self.collected.mending = mending;
+        self.collected.unbreaking_3 = unb3;
+        self.collected.protection_4 = prot4;
+        self.collected.blast_protection_4 = blast_prot4;
+        self.collected.xp_bottles = xp_count;
+        self.collected.xp_stacks = xp_stack_slots;
+        self.collected.diamond_helmets = helmets;
+        self.collected.diamond_chestplates = chestplates;
+        self.collected.diamond_leggings = leggings;
+        self.collected.diamond_boots = boots;
+
+        if prev != self.collected {
+            debug!(
+                "Inventory Progress [Phase {:?}]: Anvils: {}/{}, Mending: {}/{}, Unb3: {}/{}, Prot4: {}/{}, BlastProt4: {}/{}, XP: {}/{} ({} bottles, {} stack slots), Armor (H: {}/{}, C: {}/{}, L: {}/{}, B: {}/{})",
+                self.phase,
+                self.collected.anvils, self.quota.anvils_needed,
+                self.collected.mending, self.quota.mending_needed,
+                self.collected.unbreaking_3, self.quota.unbreaking_3_needed,
+                self.collected.protection_4, self.quota.protection_4_needed,
+                self.collected.blast_protection_4, self.quota.blast_protection_4_needed,
+                self.collected.xp_stacks, self.quota.xp_stacks_needed, self.collected.xp_bottles, xp_stack_slots,
+                self.collected.diamond_helmets, self.quota.diamond_helmets_needed,
+                self.collected.diamond_chestplates, self.quota.diamond_chestplates_needed,
+                self.collected.diamond_leggings, self.quota.diamond_leggings_needed,
+                self.collected.diamond_boots, self.quota.diamond_boots_needed,
+            );
+        }
     }
 
     /// Count how many empty slots exist in the player's 36-slot inventory (slots 9..=44).
@@ -407,113 +676,193 @@ impl GuiManager {
         free
     }
 
-    /// If inventory is filled with excess XP bottles beyond quota (3 stacks = 192 bottles),
-    /// splash them down at the bot's feet to gain levels and free up inventory space.
-    pub async fn free_space_by_splashing_excess_xp(&mut self, bot: &Client) {
-        let max_bottles_to_keep = (self.quota.xp_stacks_needed * 64) as i32;
-        let mut total_xp_bottles = 0;
-        let mut bottle_slots: Vec<(i16, i32)> = Vec::new();
+    pub fn find_unneeded_inventory_slots(&self, bot: Option<&Client>) -> Vec<(i16, String)> {
+        let mut unneeded = Vec::new();
 
-        for (&slot, item) in &self.player_inventory {
-            if slot >= 9 && slot <= 44 {
-                if let Some(info) = inspect_item_with_bot(item, Some(bot)) {
-                    if is_xp_bottle(&info) {
-                        total_xp_bottles += info.count;
-                        bottle_slots.push((slot, info.count));
+        let mut kept_anvils = 0;
+        let mut kept_mending = 0;
+        let mut kept_unb3 = 0;
+        let mut kept_prot4 = 0;
+        let mut kept_blast_prot4 = 0;
+        let mut kept_xp_stacks = 0;
+        let mut kept_helmets = 0;
+        let mut kept_chestplates = 0;
+        let mut kept_leggings = 0;
+        let mut kept_boots = 0;
+
+        for slot in 9..=44i16 {
+            let item = match self.player_inventory.get(&slot) {
+                Some(it) if !matches!(it, ItemStack::Empty) => it,
+                _ => continue,
+            };
+
+            let info = match inspect_item_with_bot(item, bot) {
+                Some(inf) => inf,
+                None => continue,
+            };
+
+            // 1. Max-enchanted or partially enchanted diamond armor MUST be preserved!
+            if is_diamond_armor(&info) {
+                let is_prot_piece = is_diamond_helmet(&info) || is_diamond_chestplate(&info);
+                let is_blast_piece = is_diamond_leggings(&info) || is_diamond_boots(&info);
+
+                let is_maxed = (is_diamond_helmet(&info) && info.has_enchantment("protection", 4) && info.has_enchantment("unbreaking", 3) && info.has_enchantment("mending", 1))
+                    || (is_diamond_chestplate(&info) && info.has_enchantment("protection", 4) && info.has_enchantment("unbreaking", 3) && info.has_enchantment("mending", 1))
+                    || (is_diamond_leggings(&info) && info.has_enchantment("blast_protection", 4) && info.has_enchantment("unbreaking", 3) && info.has_enchantment("mending", 1))
+                    || (is_diamond_boots(&info) && info.has_enchantment("blast_protection", 4) && info.has_enchantment("unbreaking", 3) && info.has_enchantment("mending", 1));
+
+                let has_intermediate_ench = (is_prot_piece && (info.has_enchantment("protection", 4) || info.has_enchantment("unbreaking", 3) || info.has_enchantment("mending", 1)))
+                    || (is_blast_piece && (info.has_enchantment("blast_protection", 4) || info.has_enchantment("unbreaking", 3) || info.has_enchantment("mending", 1)));
+
+                if is_maxed || has_intermediate_ench {
+                    // This armor piece is either finished God armor or in progress of being enchanted. Keep it!
+                    continue;
+                }
+
+                // Unenchanted diamond armor piece: check against quota
+                if is_diamond_helmet(&info) {
+                    if kept_helmets < self.quota.diamond_helmets_needed {
+                        kept_helmets += 1;
+                    } else {
+                        unneeded.push((slot, format!("Surplus Diamond Helmet (slot #{slot})")));
                     }
+                    continue;
+                } else if is_diamond_chestplate(&info) {
+                    if kept_chestplates < self.quota.diamond_chestplates_needed {
+                        kept_chestplates += 1;
+                    } else {
+                        unneeded.push((slot, format!("Surplus Diamond Chestplate (slot #{slot})")));
+                    }
+                    continue;
+                } else if is_diamond_leggings(&info) {
+                    if kept_leggings < self.quota.diamond_leggings_needed {
+                        kept_leggings += 1;
+                    } else {
+                        unneeded.push((slot, format!("Surplus Diamond Leggings (slot #{slot})")));
+                    }
+                    continue;
+                } else if is_diamond_boots(&info) {
+                    if kept_boots < self.quota.diamond_boots_needed {
+                        kept_boots += 1;
+                    } else {
+                        unneeded.push((slot, format!("Surplus Diamond Boots (slot #{slot})")));
+                    }
+                    continue;
                 }
             }
-        }
 
-        if total_xp_bottles <= max_bottles_to_keep {
-            return;
-        }
-
-        let mut excess_to_throw = total_xp_bottles - max_bottles_to_keep;
-        info!(
-            "Inventory has {total_xp_bottles} XP bottles (quota needs {max_bottles_to_keep}). Freeing space by splashing {excess_to_throw} excess bottles..."
-        );
-
-        let dir = bot.direction();
-        crate::enchanter::smooth_look(bot, dir.y_rot(), 90.0).await;
-        bot.wait_ticks(2).await;
-
-        for (slot, count) in bottle_slots {
-            if excess_to_throw <= 0 {
-                break;
+            // 2. Anvil
+            if is_anvil(&info) {
+                let anvils_to_keep = if self.phase == WithdrawalPhase::AnvilPlacement {
+                    self.quota.anvils_needed
+                } else {
+                    0 // In Phase 2 (ItemsRetrieval) or Done, anvil is placed on ground; 0 anvils needed in inventory!
+                };
+                if kept_anvils < anvils_to_keep {
+                    kept_anvils += 1;
+                } else {
+                    unneeded.push((slot, format!("Surplus Anvil (slot #{slot})")));
+                }
+                continue;
             }
 
-            if slot < 36 || slot > 44 {
-                Self::swap_to_hotbar_static(bot, slot, 0);
-                bot.wait_ticks(2).await;
-            } else {
-                let h = (slot - 36) as u8;
-                bot.set_selected_hotbar_slot(h);
-                bot.wait_ticks(1).await;
+            // 3. Books
+            if is_mending(&info) {
+                if kept_mending < self.quota.mending_needed {
+                    kept_mending += 1;
+                } else {
+                    unneeded.push((slot, format!("Surplus Mending Book (slot #{slot})")));
+                }
+                continue;
+            } else if is_unbreaking_3(&info) {
+                if kept_unb3 < self.quota.unbreaking_3_needed {
+                    kept_unb3 += 1;
+                } else {
+                    unneeded.push((slot, format!("Surplus Unbreaking III Book (slot #{slot})")));
+                }
+                continue;
+            } else if is_protection_4(&info) {
+                if kept_prot4 < self.quota.protection_4_needed {
+                    kept_prot4 += 1;
+                } else {
+                    unneeded.push((slot, format!("Surplus Protection IV Book (slot #{slot})")));
+                }
+                continue;
+            } else if is_blast_protection_4(&info) {
+                if kept_blast_prot4 < self.quota.blast_protection_4_needed {
+                    kept_blast_prot4 += 1;
+                } else {
+                    unneeded.push((slot, format!("Surplus Blast Protection IV Book (slot #{slot})")));
+                }
+                continue;
             }
-            bot.set_selected_hotbar_slot(0);
-            bot.wait_ticks(1).await;
 
-            let throw_count = excess_to_throw.min(count);
-            info!("Splashing {throw_count} excess XP bottles at feet with human arm swings...");
-            for _ in 0..throw_count {
-                bot.write_packet(azalea::protocol::packets::game::s_use_item::ServerboundUseItem {
-                    hand: azalea::protocol::packets::game::s_interact::InteractionHand::MainHand,
-                    seq: 0,
-                    y_rot: dir.y_rot(),
-                    x_rot: 90.0,
-                });
-                crate::enchanter::swing_arm(bot);
-                bot.wait_ticks(1).await;
+            // 4. XP Bottles
+            if is_xp_bottle(&info) {
+                if kept_xp_stacks < self.quota.xp_stacks_needed {
+                    kept_xp_stacks += 1;
+                } else {
+                    unneeded.push((slot, format!("Surplus XP Bottles (slot #{slot})")));
+                }
+                continue;
             }
-            excess_to_throw -= throw_count;
-            bot.wait_ticks(2).await;
+
+            // 5. Any other item (foreign items, cobble, junk books, weapons, tools, etc.) -> Sell!
+            let name = self.get_item_name(&info);
+            unneeded.push((slot, format!("Foreign item: '{name}' ({} x{}, slot #{slot})", info.kind, info.count)));
         }
 
-        bot.wait_ticks(5).await;
-        self.reset_and_sync_inventory(Some(bot));
-        info!(
-            "Finished splashing excess XP! Free inventory slots now: {}",
-            self.count_free_inventory_slots()
-        );
+        unneeded
     }
 
-    fn swap_to_hotbar_static(bot: &Client, inv_slot: i16, hotbar_idx: u8) {
-        let packet = ServerboundContainerClick {
-            container_id: 0,
-            state_id: 0,
-            slot_num: inv_slot,
-            button_num: hotbar_idx,
-            click_type: ClickType::Swap,
-            changed_slots: Default::default(),
-            carried_item: HashedStack(None),
-        };
-        bot.write_packet(packet);
+    /// Never transfer items into an unexpected sell screen.
+    pub async fn process_sell_inventory(&mut self, bot: &Client) -> bool {
+        warn!("Selling is disabled. Closing unexpected sell screen with inventory preserved.");
+        self.close_current_gui(bot);
+        self.state = OrderWorkflowState::WaitingForNextOrder;
+        self.schedule_command("/order".to_string(), std::time::Duration::from_secs(3));
+        true
     }
 
     /// Reset slot tracking and transition state when a new container is opened.
     pub fn on_open_screen(&mut self, container_id: i32, title: &str) {
         info!("GUI opened: container_id={container_id}, title='{title}'");
+        let retries = self.action_retry_count;
+        self.clear_watchdog();
+        self.gui_action_epoch += 1;
         self.current_container_id = container_id;
+        // OpenScreen does not guarantee that the server will send the contents.
+        self.record_action_sent(None, None);
+        self.action_retry_count = retries;
         self.current_slots.clear();
         self.current_state_id = 0;
         self.open_container_size = 0;
+        self.collect_clicked_in_submenu = false;
 
-        if self.state == OrderWorkflowState::WithdrawalComplete {
+        if !self.is_fulfilling_target && self.state == OrderWorkflowState::WithdrawalComplete {
             info!("Ignoring GUI open transition because WithdrawalComplete is already reached.");
             return;
         }
 
         let clean_title = normalize_small_caps(&strip_color_and_normalize(title)).to_lowercase();
 
-        if self.state == OrderWorkflowState::FillingTargetOrders || self.state == OrderWorkflowState::ConfirmingFulfill {
-            if clean_title.contains("confirm")
-                || clean_title.contains("deliver")
-                || clean_title.contains("fulfill")
-                || clean_title.contains("sell")
-            {
+        if clean_title.contains("sell") {
+            info!("Transitioned to SellingInventory ('{clean_title}')");
+            self.state = OrderWorkflowState::SellingInventory;
+            return;
+        }
+
+        if self.is_fulfilling_target
+            || self.state == OrderWorkflowState::FillingTargetOrders
+            || self.state == OrderWorkflowState::DepositingTargetItems
+            || self.state == OrderWorkflowState::ConfirmingFulfill
+        {
+            if clean_title.contains("confirm") || clean_title.contains("payout") {
                 info!("Transitioned to ConfirmingFulfill ('{clean_title}')");
                 self.state = OrderWorkflowState::ConfirmingFulfill;
+            } else if clean_title.contains("deliver") {
+                info!("Transitioned to DepositingTargetItems ('{clean_title}')");
+                self.state = OrderWorkflowState::DepositingTargetItems;
             } else {
                 info!("Target player orders screen opened ('{clean_title}'). State: FillingTargetOrders");
                 self.state = OrderWorkflowState::FillingTargetOrders;
@@ -521,25 +870,49 @@ impl GuiManager {
             return;
         }
 
+        if self.is_waiting_for_restock {
+            if let Some(until) = self.restock_wait_until {
+                if std::time::Instant::now() < until {
+                    let secs_left = until.saturating_duration_since(std::time::Instant::now()).as_secs();
+                    info!("GUI opened ('{clean_title}') while waiting for restock cooldown ({secs_left}s left). Maintaining WaitingForNextOrder state.");
+                    self.state = OrderWorkflowState::WaitingForNextOrder;
+                    return;
+                } else {
+                    self.is_waiting_for_restock = false;
+                }
+            }
+        }
+
         if clean_title.contains("collect item") || clean_title.contains("collect items") {
             info!("Transitioned to InCollectDeliveryMenu ('{clean_title}')");
             self.state = OrderWorkflowState::InCollectDeliveryMenu;
         } else if clean_title.contains("edit order") || clean_title.contains("view order") {
             info!("Transitioned to InOrderSubmenu ('{clean_title}')");
+            self.collect_clicked_in_submenu = false;
             self.state = OrderWorkflowState::InOrderSubmenu;
         } else if clean_title.contains("your order") || clean_title.contains("my order") {
             info!("Transitioned to OpenedYourOrdersMenu ('{clean_title}')");
             self.current_menu_skipped_slots.clear();
             self.state = OrderWorkflowState::OpenedYourOrdersMenu;
-        } else if clean_title.contains("order") {
+            self.navigation_retry_count = 0;
+        } else if clean_title.contains("confirm") || clean_title.contains("payout") {
+            info!("Confirm/Payout screen opened ('{clean_title}'). State: ConfirmingFulfill");
+            self.state = OrderWorkflowState::ConfirmingFulfill;
+        } else if clean_title.contains("deliver") {
+            info!("Deliver screen opened ('{clean_title}'). State: DepositingTargetItems");
+            self.state = OrderWorkflowState::DepositingTargetItems;
+        } else if clean_title == "orders" || (clean_title.contains("order") && !clean_title.contains("->")) {
             info!("Transitioned to OpenedOrderMainMenu ('{clean_title}')");
             self.state = OrderWorkflowState::OpenedOrderMainMenu;
+        } else {
+            info!("Other/Submenu GUI screen opened ('{clean_title}').");
         }
     }
 
     /// Update all slots when ClientboundContainerSetContent is received.
     pub fn on_set_content(&mut self, container_id: i32, state_id: u32, items: &[ItemStack], bot: Option<&Client>) {
         if container_id == 0 {
+            self.player_state_id = state_id;
             for (i, item) in items.iter().enumerate() {
                 self.player_inventory.insert(i as i16, item.clone());
             }
@@ -548,9 +921,15 @@ impl GuiManager {
         }
 
         if self.current_container_id != container_id {
-            self.current_container_id = container_id;
+            // Late packets from a closed screen must not resurrect it.
+            return;
         }
+        if self.last_clicked_slot.is_none() {
+            self.clear_watchdog();
+        }
+        self.gui_action_epoch += 1;
         self.current_state_id = state_id;
+        self.current_slots.clear();
 
         info!("Container #{container_id} content received ({} slots)", items.len());
         for (i, item) in items.iter().enumerate() {
@@ -567,13 +946,28 @@ impl GuiManager {
             }
             self.sync_collected_from_inventory(bot);
         }
-
-        self.log_all_slot_nbt(bot);
+        if self.page_turn_pending && self.state == OrderWorkflowState::OpenedYourOrdersMenu {
+            self.page_turn_pending = false;
+            self.current_menu_skipped_slots.clear();
+            self.clear_watchdog();
+        }
+        self.acknowledge_transfer();
+        if self.state == OrderWorkflowState::FillingTargetOrders {
+            self.reconcile_delivery(bot);
+        }
     }
 
     /// Update an individual slot when ClientboundContainerSetSlot is received.
     pub fn on_set_slot(&mut self, container_id: i32, state_id: u32, slot: i16, item: &ItemStack, bot: Option<&Client>) {
+        if container_id == -2 {
+            if let Some(slot) = crate::armor::player_menu_slot(slot as u32) {
+                self.player_inventory.insert(slot, item.clone());
+                self.sync_collected_from_inventory(bot);
+            }
+            return;
+        }
         if container_id == 0 {
+            self.player_state_id = state_id;
             self.player_inventory.insert(slot, item.clone());
             self.sync_collected_from_inventory(bot);
             return;
@@ -597,15 +991,29 @@ impl GuiManager {
                 self.sync_collected_from_inventory(bot);
             }
 
+            self.acknowledge_transfer();
+
             if let Some(info) = inspect_item_with_bot(item, bot) {
-                info!("Slot #{slot} updated -> {} x{}", info.kind, info.count);
+                debug!("Slot #{slot} updated -> {} x{}", info.kind, info.count);
             }
         }
     }
 
-    /// Print detailed NBT/components for all present items in the GUI.
+    fn acknowledge_transfer(&mut self) {
+        if let (Some(slot), Some((source, inventory))) = (self.last_clicked_slot, &self.transfer_before) {
+            if self.current_slots.get(&slot).is_some_and(|item| item != source)
+                && &self.player_inventory != inventory
+            {
+                self.clear_watchdog();
+                self.last_progress_time = std::time::Instant::now();
+            }
+        }
+    }
+
+    /// Print detailed NBT/components for all present items in the GUI (at debug level or when diagnosing).
     pub fn log_all_slot_nbt(&self, bot: Option<&Client>) {
-        info!("=== Current GUI Item & NBT Audit ===");
+        if !tracing::enabled!(tracing::Level::DEBUG) { return; }
+        debug!("=== Current GUI Item & NBT Audit ===");
         let mut sorted_slots: Vec<(&i16, &ItemStack)> = self.current_slots.iter().collect();
         sorted_slots.sort_by_key(|&(k, _)| *k);
 
@@ -620,7 +1028,7 @@ impl GuiManager {
                     ench_str.push_str(&format!(" (Ench: {:?})", info.enchantments));
                 }
 
-                info!(
+                debug!(
                     "Slot #{slot:02}: '{name}' x{} [kind: {}]{ench_str}",
                     info.count, info.kind
                 );
@@ -628,22 +1036,24 @@ impl GuiManager {
                 if let Some(ref comp) = info.raw_components {
                     let comp_json = serde_json::to_string(comp).unwrap_or_default();
                     if comp_json.len() > 200 {
-                        info!("  NBT/Components: {}...", &comp_json[..200]);
+                        debug!("  NBT/Components: {}...", comp_json.chars().take(200).collect::<String>());
                     } else if !comp_json.is_empty() && comp_json != "{}" {
-                        info!("  NBT/Components: {}", comp_json);
+                        debug!("  NBT/Components: {}", comp_json);
                     }
                 }
             }
         }
-        info!("====================================");
+        debug!("====================================");
     }
 
     /// Perform the next automated action in the current GUI.
     pub async fn process_gui_actions(&mut self, bot: &Client) -> bool {
-        if self.state == OrderWorkflowState::WithdrawalComplete
+        if !self.is_fulfilling_target && (self.state == OrderWorkflowState::WithdrawalComplete
             || (self.phase == WithdrawalPhase::Done
+                && self.state != OrderWorkflowState::SellingInventory
                 && self.state != OrderWorkflowState::FillingTargetOrders
-                && self.state != OrderWorkflowState::ConfirmingFulfill)
+                && self.state != OrderWorkflowState::DepositingTargetItems
+                && self.state != OrderWorkflowState::ConfirmingFulfill))
         {
             if self.current_container_id > 0 {
                 self.close_current_gui(bot);
@@ -651,10 +1061,31 @@ impl GuiManager {
             return true;
         }
 
-        if self.action_in_progress {
+        if self.is_waiting_for_restock {
+            if let Some(until) = self.restock_wait_until {
+                if std::time::Instant::now() < until {
+                    let secs_left = until.saturating_duration_since(std::time::Instant::now()).as_secs();
+                    info!("GUI open while waiting for restock ({}s left). Closing container #{}...", secs_left, self.current_container_id);
+                    if self.current_container_id > 0 {
+                        self.close_current_gui(bot);
+                    }
+                    return true;
+                } else {
+                    self.is_waiting_for_restock = false;
+                }
+            }
+        }
+
+        if self.action_in_progress || self.awaiting_response || self.current_slots.is_empty() {
             return false;
         }
         self.action_in_progress = true;
+
+        if self.state == OrderWorkflowState::SellingInventory {
+            let res = self.process_sell_inventory(bot).await;
+            self.action_in_progress = false;
+            return res;
+        }
 
         if self.state == OrderWorkflowState::FillingTargetOrders {
             let res = self.process_fill_target_order(bot).await;
@@ -662,7 +1093,21 @@ impl GuiManager {
             return res;
         }
 
+        if self.state == OrderWorkflowState::DepositingTargetItems {
+            let res = self.process_deposit_target_items(bot).await;
+            self.action_in_progress = false;
+            return res;
+        }
+
         if self.state == OrderWorkflowState::ConfirmingFulfill {
+            if !self.is_fulfilling_target {
+                warn!("Unexpected confirm screen opened while not fulfilling target orders (container #{})! Closing all GUI and retrying /order in 10 ticks...", self.current_container_id);
+                self.close_current_gui(bot);
+                self.state = OrderWorkflowState::WaitingForNextOrder;
+                self.schedule_command("/order".to_string(), std::time::Duration::from_millis(500));
+                self.action_in_progress = false;
+                return true;
+            }
             let res = self.confirm_target_order_fulfill(bot).await;
             self.action_in_progress = false;
             return res;
@@ -676,7 +1121,7 @@ impl GuiManager {
             WithdrawalPhase::Done => true,
         };
 
-        if phase_fulfilled {
+        if !self.is_fulfilling_target && phase_fulfilled {
             info!("Current withdrawal phase {:?} is fulfilled in inventory! Closing GUI.", self.phase);
             self.close_current_gui(bot);
             if self.phase == WithdrawalPhase::AnvilPlacement {
@@ -695,12 +1140,14 @@ impl GuiManager {
                     info!("Clicking 'Your Orders' button at slot #{slot}...");
                     self.state = OrderWorkflowState::NavigatingToYourOrders;
                     self.click_slot(bot, slot, ClickType::Pickup);
-                    bot.wait_ticks(5).await;
+
                     true
                 } else {
-                    warn!("Could not find 'Your Orders' button in /order main menu! Available slots:");
-                    self.log_all_slot_nbt(Some(bot));
-                    false
+                    warn!("Could not find 'Your Orders' button in /order main menu! Closing all GUI and retrying /order in 10 ticks...");
+                    self.close_current_gui(bot);
+                    self.state = OrderWorkflowState::WaitingForNextOrder;
+                    self.schedule_command("/order".to_string(), std::time::Duration::from_millis(500));
+                    true
                 }
             }
             OrderWorkflowState::NavigatingToYourOrders => {
@@ -716,7 +1163,26 @@ impl GuiManager {
             OrderWorkflowState::InCollectDeliveryMenu => {
                 self.transfer_delivery_items(bot).await
             }
-            _ => false,
+            OrderWorkflowState::WaitingForNextOrder => {
+                if self.current_container_id > 0 {
+                    info!("In WaitingForNextOrder state with container #{} open; closing...", self.current_container_id);
+                    self.close_current_gui(bot);
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => {
+                if !self.is_fulfilling_target && self.current_container_id > 0 {
+                    warn!("Unexpected container #{} open in state {:?}! Closing all GUI and retrying /order in 10 ticks...", self.current_container_id, self.state);
+                    self.close_current_gui(bot);
+                    self.state = OrderWorkflowState::WaitingForNextOrder;
+                    self.schedule_command("/order".to_string(), std::time::Duration::from_millis(500));
+                    true
+                } else {
+                    false
+                }
+            }
         };
 
         self.action_in_progress = false;
@@ -748,6 +1214,19 @@ impl GuiManager {
 
     /// Select an order slot in 'Orders -> Your Orders' (slots 0..=44) that matches our quota needs.
     async fn select_order_to_claim(&mut self, bot: &Client) -> bool {
+        // Periodically refresh exhausted orders cache (every 45s) so new deliveries can be picked up
+        if let Some(last_check) = self.last_exhausted_check {
+            if last_check.elapsed() > std::time::Duration::from_secs(45) {
+                if !self.exhausted_orders.is_empty() {
+                    info!("Refreshing exhausted orders cache after 45s: {:?}", self.exhausted_orders);
+                    self.exhausted_orders.clear();
+                }
+                self.last_exhausted_check = Some(std::time::Instant::now());
+            }
+        } else {
+            self.last_exhausted_check = Some(std::time::Instant::now());
+        }
+
         info!("Checking orders in 'Your Orders' against quota (Phase: {:?})...", self.phase);
         info!(
             "Current Status: Anvils: {}/{}, Mending: {}/{}, Unb3: {}/{}, Prot4: {}/{}, BlastProt4: {}/{}, XP: {}/{} ({} bottles), Armor (H: {}/{}, C: {}/{}, L: {}/{}, B: {}/{})",
@@ -762,6 +1241,13 @@ impl GuiManager {
             self.collected.diamond_leggings, self.quota.diamond_leggings_needed,
             self.collected.diamond_boots, self.quota.diamond_boots_needed,
         );
+
+        if self.open_container_size < 54 || self.current_slots.len() < (self.open_container_size + 36) as usize {
+            return false;
+        }
+        let listings: Vec<_> = (0..=44).filter_map(|slot| self.order_listing(slot, Some(bot))).collect();
+        let has_next_page = self.has_next_order_page(Some(bot));
+        self.stock_audit.observe_page(self.order_page, listings, has_next_page);
 
         // Check slots 0 through 44 (leaving bottom row 45..53 for pagination/navigation)
         for slot in 0..=44 {
@@ -781,10 +1267,25 @@ impl GuiManager {
                     let (is_needed, order_name) = self.is_order_needed(&info);
 
                     if is_needed {
+                        let Some(listing) = self.order_listing(slot, Some(bot)) else { continue; };
+                        if self.stock_audit.is_empty(self.order_page, &listing) {
+                            self.current_menu_skipped_slots.push(slot);
+                            continue;
+                        }
+
+                        if self.count_free_inventory_slots() == 0 && !is_xp_bottle(&info) {
+                            info!("Player inventory has 0 free slots; cannot collect unstackable '{order_name}' at slot #{slot}.");
+                            self.current_menu_skipped_slots.push(slot);
+                            continue;
+                        }
+
                         info!("Found needed order '{order_name}' at slot #{slot} (Phase: {:?})! Left-clicking to open Edit/Claim submenu...", self.phase);
                         self.target_order_type = Some(order_name.to_string());
+                        self.last_collecting_order_name = Some(order_name.to_string());
+                        self.current_order_slot = Some(slot);
+                        self.stock_audit.select(self.order_page, listing);
                         self.click_slot(bot, slot, ClickType::Pickup);
-                        bot.wait_ticks(5).await;
+
                         return true;
                     } else {
                         // Mark this slot as not needed for this menu session
@@ -794,22 +1295,55 @@ impl GuiManager {
             }
         }
 
-        info!("No unfulfilled orders matching phase {:?} found in slots 0-44 of 'Your Orders'.", self.phase);
-
-        if self.phase == WithdrawalPhase::AnvilPlacement {
-            info!("Anvil phase order check done. Closing GUI.");
-            self.close_current_gui(bot);
+        if has_next_page && self.order_page < 20 {
+            info!("Checking the next page of Your Orders before declaring supplies unavailable...");
+            self.order_page += 1;
+            self.page_turn_pending = true;
+            self.current_menu_skipped_slots.clear();
+            self.click_slot(bot, 53, ClickType::Pickup);
             return true;
         }
 
-        let available_armor_orders = self.count_available_armor_orders(bot);
-        let current_diamond_armor = self.collected.total_diamond_armor();
-        if self.phase == WithdrawalPhase::ItemsRetrieval && available_armor_orders == 0 && current_diamond_armor == 0 {
-            info!("*** OUT OF ARMORS: No diamond armor orders remain in Your Orders (and 0 in inventory). Routine complete! ***");
-            self.close_current_gui(bot);
-            self.phase = WithdrawalPhase::Done;
-            self.state = OrderWorkflowState::WithdrawalComplete;
-            return true;
+        let missing = self.get_missing_quota_summary();
+        info!("No unfulfilled orders matching phase {:?} found in slots 0-44 of 'Your Orders'.", self.phase);
+
+        if !self.exhausted_orders.is_empty() {
+            warn!("============================================================");
+            warn!("*** [OUT OF ITEMS] The following buy orders are currently OUT OF ITEMS on server: {:?} ***", self.exhausted_orders);
+            warn!("*** Missing quota items still needed: {} ***", missing);
+            warn!("============================================================");
+        }
+
+        let available_armor_orders = self.count_available_armor_orders(Some(bot));
+        // Missing the first armor type must wait for restock, even if later
+        // types are listed. It does not mean all work is complete.
+
+        // If remaining orders cannot fulfill full quota, but we have craftable sets in inventory:
+        if self.phase == WithdrawalPhase::ItemsRetrieval {
+            let complete_sets = self.count_craftable_god_sets(Some(bot));
+            let free_slots = self.count_free_inventory_slots();
+            let has_exhausted = !self.exhausted_orders.is_empty();
+
+            if complete_sets > 0 && (free_slots == 0 || has_exhausted || available_armor_orders == 0) {
+                info!(
+                    "Cannot collect all remaining quota items (free slots: {}, exhausted orders: {:?}, available armor orders: {}), but inventory has materials for {} COMPLETE God-armor set(s)! Proceeding to enchant...",
+                    free_slots, self.exhausted_orders, available_armor_orders, complete_sets
+                );
+                self.close_current_gui(bot);
+                self.phase = WithdrawalPhase::Done;
+                self.state = OrderWorkflowState::WithdrawalComplete;
+                return true;
+            }
+
+            if free_slots == 0 && complete_sets == 0 {
+                warn!("Inventory is full and cannot finish a set. Keeping all items; retrying orders in 45 seconds. Free inventory space if this persists.");
+                self.close_current_gui(bot);
+                self.state = OrderWorkflowState::WaitingForNextOrder;
+                self.is_waiting_for_restock = true;
+                self.restock_wait_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(45));
+                self.schedule_command("/order".to_string(), std::time::Duration::from_secs(45));
+                return true;
+            }
         }
 
         if self.collected.is_fulfilled(&self.quota) {
@@ -817,6 +1351,41 @@ impl GuiManager {
             self.close_current_gui(bot);
             self.phase = WithdrawalPhase::Done;
             self.state = OrderWorkflowState::WithdrawalComplete;
+            return true;
+        }
+
+        // If needed orders are out of stock or missing and we cannot enchant with current inventory, close GUI and wait for restock
+        if !self.exhausted_orders.is_empty() || !self.collected.is_fulfilled(&self.quota) {
+            let missing = self.get_missing_quota_summary();
+            warn!("============================================================");
+            for item in self.verified_stock_alerts() {
+                crate::webhook::send_verified_out_of_item_alert(item, Some(
+                    "Inventory has zero of this item. Checked all pages of Your Orders: no matching order exists, or every matching order confirmed no items to collect."
+                ));
+            }
+            warn!("*** Missing items needed to proceed: {} ***", missing);
+            warn!("*** Current inventory: Anvils: {}/{}, Mending: {}/{}, Unb3: {}/{}, Prot4: {}/{}, BlastProt4: {}/{}, XP: {}/{} ({} bottles), Armor (H: {}/{}, C: {}/{}, L: {}/{}, B: {}/{}) ***",
+                self.collected.anvils, self.quota.anvils_needed,
+                self.collected.mending, self.quota.mending_needed,
+                self.collected.unbreaking_3, self.quota.unbreaking_3_needed,
+                self.collected.protection_4, self.quota.protection_4_needed,
+                self.collected.blast_protection_4, self.quota.blast_protection_4_needed,
+                self.collected.xp_stacks, self.quota.xp_stacks_needed, self.collected.xp_bottles,
+                self.collected.diamond_helmets, self.quota.diamond_helmets_needed,
+                self.collected.diamond_chestplates, self.quota.diamond_chestplates_needed,
+                self.collected.diamond_leggings, self.quota.diamond_leggings_needed,
+                self.collected.diamond_boots, self.quota.diamond_boots_needed,
+            );
+            warn!("*** Pausing for 45 seconds before checking /order for restocks... ***");
+            warn!("============================================================");
+
+            self.close_current_gui(bot);
+            self.state = OrderWorkflowState::WaitingForNextOrder;
+            self.is_waiting_for_restock = true;
+            self.restock_wait_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(45));
+
+            self.schedule_command("/order".to_string(), std::time::Duration::from_millis(45000));
+
             return true;
         }
 
@@ -832,7 +1401,7 @@ impl GuiManager {
                     || info.custom_name.as_deref().unwrap_or("").to_lowercase().contains("collect")
                     || is_confirm_button(&info)
                 {
-                    info!("Identified slot #15 as 'Collect' button ({})", info.kind);
+                    info!("Identified slot #15 as 'Collect' button ({}, Name: {:?}, Lore: {:?})", info.kind, info.custom_name, info.lore);
                     return Some(15);
                 }
             }
@@ -844,7 +1413,7 @@ impl GuiManager {
                 let name = info.custom_name.as_deref().unwrap_or("").to_lowercase();
                 if !name.contains("cancel") && !info.kind.to_lowercase().contains("terracotta") {
                     if info.kind.to_lowercase().contains("chest") || is_confirm_button(&info) {
-                        info!("Identified slot #13 as 'Collect' button ({})", info.kind);
+                        info!("Identified slot #13 as 'Collect' button ({}, Name: {:?}, Lore: {:?})", info.kind, info.custom_name, info.lore);
                         return Some(13);
                     }
                 }
@@ -861,7 +1430,7 @@ impl GuiManager {
                 if let Some(info) = inspect_item(item) {
                     let name = info.custom_name.as_deref().unwrap_or("").to_lowercase();
                     if name.contains("collect") || info.kind.to_lowercase().contains("chest") || is_confirm_button(&info) {
-                        info!("Identified slot #{slot} as 'Collect' button via name/kind ({})", info.kind);
+                        info!("Identified slot #{slot} as 'Collect' button via name/kind ({}, Name: {:?}, Lore: {:?})", info.kind, info.custom_name, info.lore);
                         return Some(slot);
                     }
                 }
@@ -873,34 +1442,52 @@ impl GuiManager {
 
     /// Claim the current order inside 'Orders -> Edit Order'.
     async fn claim_current_order(&mut self, bot: &Client) -> bool {
+        let mut item_name = self.target_order_type.clone()
+            .or_else(|| self.last_collecting_order_name.clone())
+            .unwrap_or_else(|| "Unknown Item".to_string());
+
         // Check slot 10 in Edit Order to learn the exact item type being claimed
         if let Some(item_slot_10) = self.current_slots.get(&10) {
             if let Some(info) = inspect_item_with_bot(item_slot_10, Some(bot)) {
+                let detected = self.get_item_name(&info);
+                if !detected.is_empty() && detected != "Unknown Item" {
+                    item_name = detected;
+                }
+                self.target_order_type = Some(item_name.clone());
+                self.last_collecting_order_name = Some(item_name.clone());
+
                 info!(
-                    "Order details in slot #10: {} x{} (Name: {:?}, Lore: {:?}, StoredEnch: {:?})",
-                    info.kind, info.count, info.custom_name, info.lore, info.stored_enchantments
+                    "Order details in slot #10: {} x{} (Item: '{}', Name: {:?}, Lore: {:?}, StoredEnch: {:?})",
+                    info.kind, info.count, item_name, info.custom_name, info.lore, info.stored_enchantments
                 );
-                let (needed, name) = self.is_order_needed(&info);
+
+                let (needed, _) = self.is_order_needed(&info);
                 if !needed {
                     warn!(
-                        "Order in slot #10 is NOT needed in current phase ({:?}) or quota already met! Closing GUI.",
-                        self.phase
+                        "Order for '{}' in slot #10 is NOT needed in current phase ({:?}) or quota already met! Closing GUI.",
+                        item_name, self.phase
                     );
                     self.close_current_gui(bot);
-                    bot.wait_ticks(5).await;
+
                     return true;
                 }
-                self.target_order_type = Some(name.to_string());
             }
         }
 
+        if self.collect_clicked_in_submenu {
+            // Already clicked collect in this Edit Order submenu; await server response or chat packet
+            return false;
+        }
+
         if let Some(collect_slot) = self.find_collect_button_slot() {
-            info!("Clicking 'Collect' button at slot #{collect_slot}...");
+            info!("Clicking 'Collect' button at slot #{collect_slot} for order '{item_name}'...");
+            self.collect_clicked_in_submenu = true;
+            self.stock_audit.collect_requested();
             self.click_slot(bot, collect_slot, ClickType::Pickup);
-            bot.wait_ticks(5).await;
+
             return true;
         } else {
-            warn!("Could not find Collect button in Edit Order window! Logging slots:");
+            warn!("Could not find Collect button in Edit Order window for '{item_name}'! Logging slots:");
             self.log_all_slot_nbt(Some(bot));
         }
 
@@ -913,10 +1500,9 @@ impl GuiManager {
         let mut sorted_slots: Vec<i16> = self.current_slots.keys().copied().collect();
         sorted_slots.sort();
 
-        let mut transferred_any = false;
         for slot in sorted_slots {
-            // Only transfer from top delivery container (slots 0..=26)
-            if slot > 26 {
+            // Collection menus can contain either 27 or 54 delivery slots.
+            if slot < 0 || slot >= self.open_container_size {
                 continue;
             }
 
@@ -940,8 +1526,8 @@ impl GuiManager {
                             "Skipping delivery item in slot #{slot}: {} x{} (quota already met or not needed in Phase {:?})",
                             info.kind, info.count, self.phase
                         );
-                        // Stop withdrawing from this delivery window if this order's items are no longer needed
-                        break;
+                        // Other slots may still contain required supplies.
+                        continue;
                     }
 
                     info!(
@@ -949,49 +1535,29 @@ impl GuiManager {
                         info.kind, info.count
                     );
                     self.click_slot(bot, slot, ClickType::QuickMove);
-                    transferred_any = true;
-
-                    // Immediately record the item in memory so subsequent slots in this loop respect quota!
-                    self.record_item_collected(&info);
-                    info!(
-                        "Progress after slot #{slot}: Anvils: {}/{}, Mending: {}/{}, Unb3: {}/{}, Prot4: {}/{}, BlastProt4: {}/{}, XP: {}/{} ({} bottles), Helm: {}/{}, Chest: {}/{}, Legs: {}/{}, Boots: {}/{}",
-                        self.collected.anvils, self.quota.anvils_needed,
-                        self.collected.mending, self.quota.mending_needed,
-                        self.collected.unbreaking_3, self.quota.unbreaking_3_needed,
-                        self.collected.protection_4, self.quota.protection_4_needed,
-                        self.collected.blast_protection_4, self.quota.blast_protection_4_needed,
-                        self.collected.xp_stacks, self.quota.xp_stacks_needed, self.collected.xp_bottles,
-                        self.collected.diamond_helmets, self.quota.diamond_helmets_needed,
-                        self.collected.diamond_chestplates, self.quota.diamond_chestplates_needed,
-                        self.collected.diamond_leggings, self.quota.diamond_leggings_needed,
-                        self.collected.diamond_boots, self.quota.diamond_boots_needed,
-                    );
-
-                    bot.wait_ticks(3).await; // 150ms anticheat safe quickmove delay
-
-                    // If quota for this item type is now met, stop withdrawing from this order
-                    let (still_needed, _) = self.is_order_needed(&info);
-                    if !still_needed {
-                        info!("Quota for {} has been fulfilled! Leaving any surplus items in delivery.", name);
-                        break;
-                    }
+                    self.current_menu_skipped_slots.clear();
+                    // Wait for both source and player inventory updates before deciding quota.
+                    return false;
                 }
             }
         }
 
-        // Reset skipped slots since claimed order causes remaining orders to shift
-        if transferred_any {
-            self.current_menu_skipped_slots.clear();
-        }
-
         if let Some(ref order_type) = self.target_order_type {
             info!("Finished claiming delivery items for order '{order_type}'!");
+            let has_remaining = (0..self.open_container_size).any(|slot| {
+                self.order_listing(slot, Some(bot)).is_some_and(|entry| &entry.name == order_type)
+            });
+            self.stock_audit.collection_finished(!has_remaining);
+            if has_remaining {
+                self.exhausted_orders.retain(|x| x != order_type);
+            } else if !self.exhausted_orders.contains(order_type) {
+                self.exhausted_orders.push(order_type.clone());
+            }
         }
         self.target_order_type = None;
 
         info!("Closing delivery container...");
         self.close_current_gui(bot);
-        bot.wait_ticks(6).await;
 
         let phase_done = match self.phase {
             WithdrawalPhase::AnvilPlacement => self.collected.anvils >= self.quota.anvils_needed,
@@ -1008,24 +1574,41 @@ impl GuiManager {
                 self.state = OrderWorkflowState::WithdrawalComplete;
             }
             return true;
-        } else {
-            info!("Phase {:?} not yet fulfilled. Waiting 8 ticks before opening /order again...", self.phase);
-            self.state = OrderWorkflowState::WaitingForNextOrder;
-            bot.wait_ticks(8).await;
-            info!("Sending /order for next item...");
-            bot.chat("/order");
-            return true;
         }
+
+        // If inventory is full (0 free slots) and craftable sets exist, proceed to enchant!
+        if self.phase == WithdrawalPhase::ItemsRetrieval && self.count_free_inventory_slots() == 0 {
+            let craftable_sets = self.count_craftable_god_sets(Some(bot));
+            if craftable_sets > 0 {
+                info!(
+                    "Player inventory is full (0 free slots), but contains materials for {} COMPLETE God-armor set(s)! Proceeding to enchant to free up inventory space...",
+                    craftable_sets
+                );
+                self.phase = WithdrawalPhase::Done;
+                self.state = OrderWorkflowState::WithdrawalComplete;
+                return true;
+            }
+        }
+
+        info!("Phase {:?} not yet fulfilled; opening the next order.", self.phase);
+        self.state = OrderWorkflowState::WaitingForNextOrder;
+        info!("Sending /order for next item...");
+        self.record_command_sent("/order");
+        Self::send_command(bot, "/order");
+        return true;
     }
 
-    /// Counts how many diamond armor orders are available in the open Your Orders container.
-    pub fn count_available_armor_orders(&self, bot: &Client) -> u32 {
+    /// Counts how many needed diamond armor orders are available in the open Your Orders container (excluding exhausted and already-fulfilled ones).
+    pub fn count_available_armor_orders(&self, bot: Option<&Client>) -> u32 {
         let mut count = 0;
         for slot in 0..=44 {
             if let Some(item) = self.current_slots.get(&slot) {
-                if let Some(info) = inspect_item_with_bot(item, Some(bot)) {
+                if let Some(info) = inspect_item_with_bot(item, bot) {
                     if is_diamond_armor(&info) {
-                        count += 1;
+                        let (needed, name) = self.is_order_needed(&info);
+                        if needed && !self.exhausted_orders.contains(&name.to_string()) {
+                            count += 1;
+                        }
                     }
                 }
             }
@@ -1033,8 +1616,178 @@ impl GuiManager {
         count
     }
 
+    /// Checks whether the bot has enough materials (armor, matching books, anvils, and XP)
+    /// in inventory to fully enchant at least one COMPLETE 4-piece God-armor set
+    /// (1× Diamond Helmet, 1× Diamond Chestplate, 1× Diamond Leggings, 1× Diamond Boots).
+    pub fn can_craft_god_armor(&self, bot: Option<&Client>) -> bool {
+        self.count_craftable_god_sets(bot) > 0
+    }
+
+    /// Computes how many complete 4-piece God-armor sets can be crafted from available inventory.
+    pub fn count_craftable_god_sets(&self, bot: Option<&Client>) -> usize {
+        // Need at least one anvil
+        if self.collected.anvils == 0 {
+            return 0;
+        }
+
+        // Need sufficient XP to complete anvil combines:
+        // At least ~20 bottles or 1 stack, or existing player level >= 8
+        let has_sufficient_xp = self.collected.xp_bottles >= 20
+            || self.collected.xp_stacks > 0
+            || bot.map_or(false, |b| b.experience().level >= 8);
+
+        if !has_sufficient_xp {
+            return 0;
+        }
+
+        // All 4 armor types must be present to form complete sets
+        let armor_sets = (self.collected.diamond_helmets as usize)
+            .min(self.collected.diamond_chestplates as usize)
+            .min(self.collected.diamond_leggings as usize)
+            .min(self.collected.diamond_boots as usize);
+
+        if armor_sets == 0 {
+            return 0;
+        }
+
+        // Check required books for full set(s):
+        // Each set requires: 1 Prot 4 (helm) + 1 Prot 4 (chest) = 2 Prot 4
+        let prot_sets = (self.collected.protection_4 / 2) as usize;
+        // Each set requires: 1 Blast Prot 4 (legs) + 1 Blast Prot 4 (boots) = 2 Blast Prot 4
+        let blast_sets = (self.collected.blast_protection_4 / 2) as usize;
+        // Each set requires: 4 Unbreaking 3
+        let unb_sets = (self.collected.unbreaking_3 / 4) as usize;
+        // Each set requires: 4 Mending
+        let mending_sets = (self.collected.mending / 4) as usize;
+
+        let full_sets = armor_sets.min(prot_sets).min(blast_sets).min(unb_sets).min(mending_sets);
+        // A partly enchanted set needs only its missing enchants. This lets a full
+        // inventory finish the logged three-maxed-pieces + unfinished-boots case.
+        let items: Vec<_> = self.player_inventory.iter()
+            .filter(|(slot, _)| (9..=44).contains(*slot))
+            .filter_map(|(&slot, item)| inspect_item_with_bot(item, bot).map(|info| (slot, info)))
+            .collect();
+        let available = [self.collected.mending, self.collected.unbreaking_3,
+            self.collected.protection_4, self.collected.blast_protection_4];
+        let can_finish = crate::armor::books_to_finish_set(&items)
+            .is_some_and(|needed| needed.iter().zip(available).all(|(n, have)| *n <= have));
+        full_sets.max(usize::from(can_finish))
+    }
+
+    /// Counts how many completed, 4-piece max-enchanted god armor sets (1 Helm, 1 Chest, 1 Legs, 1 Boots)
+    /// exist in player inventory.
+    pub fn count_completed_max_sets(&self, bot: Option<&Client>) -> usize {
+        let mut helms = 0;
+        let mut chests = 0;
+        let mut legs = 0;
+        let mut boots = 0;
+
+        for (_, item) in self.player_inventory.iter().filter(|(slot, _)| (9..=44).contains(*slot)) {
+            if let Some(info) = inspect_item_with_bot(item, bot) {
+                if is_diamond_helmet(&info)
+                    && info.has_enchantment("protection", 4)
+                    && info.has_enchantment("unbreaking", 3)
+                    && info.has_enchantment("mending", 1)
+                {
+                    helms += 1;
+                } else if is_diamond_chestplate(&info)
+                    && info.has_enchantment("protection", 4)
+                    && info.has_enchantment("unbreaking", 3)
+                    && info.has_enchantment("mending", 1)
+                {
+                    chests += 1;
+                } else if is_diamond_leggings(&info)
+                    && info.has_enchantment("blast_protection", 4)
+                    && info.has_enchantment("unbreaking", 3)
+                    && info.has_enchantment("mending", 1)
+                {
+                    legs += 1;
+                } else if is_diamond_boots(&info)
+                    && info.has_enchantment("blast_protection", 4)
+                    && info.has_enchantment("unbreaking", 3)
+                    && info.has_enchantment("mending", 1)
+                {
+                    boots += 1;
+                }
+            }
+        }
+
+        helms.min(chests).min(legs).min(boots)
+    }
+
+    /// Returns true if all authorized full sets have been delivered to the buyer.
+    pub fn is_target_delivery_completed(&self) -> bool {
+        if self.target_sets_to_deliver == 0 {
+            return false;
+        }
+        self.target_delivered_helmets >= self.target_sets_to_deliver
+            && self.target_delivered_chestplates >= self.target_sets_to_deliver
+            && self.target_delivered_leggings >= self.target_sets_to_deliver
+            && self.target_delivered_boots >= self.target_sets_to_deliver
+    }
+
+    fn armor_matches(info: &ItemInfo, armor: TargetArmorType) -> bool {
+        let (kind_matches, protection) = match armor {
+            TargetArmorType::Helmet => (is_diamond_helmet(info), "protection"),
+            TargetArmorType::Chestplate => (is_diamond_chestplate(info), "protection"),
+            TargetArmorType::Leggings => (is_diamond_leggings(info), "blast_protection"),
+            TargetArmorType::Boots => (is_diamond_boots(info), "blast_protection"),
+        };
+        kind_matches && info.has_enchantment(protection, 4)
+            && info.has_enchantment("unbreaking", 3) && info.has_enchantment("mending", 1)
+    }
+
+    fn armor_count(&self, armor: TargetArmorType, bot: Option<&Client>) -> usize {
+        self.player_inventory.iter().filter(|(slot, item)| {
+            (9..=44).contains(*slot) && inspect_item_with_bot(item, bot)
+                .is_some_and(|info| Self::armor_matches(&info, armor))
+        }).count()
+    }
+
+    // Only a fresh order-menu snapshot after closing the transaction can settle it.
+    // The inventory loss in the deposit/confirmation screen is merely escrow.
+    fn reconcile_delivery(&mut self, bot: Option<&Client>) {
+        let Some(pending) = self.pending_delivery.clone() else { return; };
+        let remaining = self.armor_count(pending.armor, bot);
+        self.reconcile_delivery_count(remaining);
+    }
+
+    fn reconcile_delivery_count(&mut self, remaining: usize) {
+        let Some(pending) = self.pending_delivery.clone() else { return; };
+        if pending.confirm_sent && remaining.checked_add(1) == Some(pending.inventory_count_before) {
+            match pending.armor {
+                TargetArmorType::Helmet => self.target_delivered_helmets += 1,
+                TargetArmorType::Chestplate => self.target_delivered_chestplates += 1,
+                TargetArmorType::Leggings => self.target_delivered_leggings += 1,
+                TargetArmorType::Boots => self.target_delivered_boots += 1,
+            }
+            info!("Verified {:?} delivery from post-confirmation inventory", pending.armor);
+        } else if remaining != pending.inventory_count_before {
+            error!("Ambiguous {:?} delivery inventory: before {}, now {}. Holding batch for reconciliation.",
+                pending.armor, pending.inventory_count_before, remaining);
+            return;
+        } else {
+            warn!("Delivery was not accepted; item is back in inventory and can be retried.");
+        }
+        self.pending_delivery = None;
+        self.target_delivering_armor = None;
+        self.clear_watchdog();
+    }
+
     /// Automatically fulfills buyer orders in the target player's /order {player} GUI.
     pub async fn process_fill_target_order(&mut self, bot: &Client) -> bool {
+        if self.pending_delivery.is_some() {
+            return false;
+        }
+        self.target_delivering_armor = None;
+        if let Some(last_click) = self.last_target_order_click {
+            let elapsed = last_click.elapsed();
+            if elapsed < std::time::Duration::from_millis(1500) {
+                // Keep the command cooldown without blocking packet processing.
+                return false;
+            }
+        }
+
         self.sync_collected_from_inventory(Some(bot));
 
         // Audit player inventory to see which max-enchanted armor pieces are present
@@ -1078,15 +1831,50 @@ impl GuiManager {
             self.order_target
         );
 
-        if !has_helm && !has_chest && !has_legs && !has_boots {
-            info!("All max-enchanted armor pieces have been delivered to {}!", self.order_target);
+        // Scan slots for target player's buy orders (strictly upper order slots, never player inventory)
+        let max_order_slot = if self.open_container_size > 0 {
+            (self.open_container_size - 9).min(44)
+        } else {
+            44
+        };
+
+        // Audit all buy orders found in GUI
+        info!("=== Buy Orders Audit for '{}' ===", self.order_target);
+        for slot in 0..=max_order_slot {
+            if let Some(item) = self.current_slots.get(&slot) {
+                if let Some(info) = inspect_item_with_bot(item, Some(bot)) {
+                    if !info.kind.to_lowercase().contains("glasspane") && !info.kind.to_lowercase().contains("barrier") {
+                        let delivered = info.lore.iter()
+                            .find(|l| l.to_lowercase().contains("delivered"))
+                            .cloned()
+                            .unwrap_or_else(|| "N/A".to_string());
+                        info!("  Order Slot #{slot}: '{}' (Name: {:?}) -> Progress: [{delivered}]", info.kind, info.custom_name);
+                    }
+                }
+            }
+        }
+        info!("=============================================");
+
+        let next_set = self.target_delivered_helmets.min(self.target_delivered_chestplates)
+            .min(self.target_delivered_leggings).min(self.target_delivered_boots);
+        let can_deliver_helm = has_helm && self.target_delivered_helmets < self.target_sets_to_deliver && self.target_delivered_helmets == next_set;
+        let can_deliver_chest = has_chest && self.target_delivered_chestplates < self.target_sets_to_deliver && self.target_delivered_chestplates == next_set;
+        let can_deliver_legs = has_legs && self.target_delivered_leggings < self.target_sets_to_deliver && self.target_delivered_leggings == next_set;
+        let can_deliver_boots = has_boots && self.target_delivered_boots < self.target_sets_to_deliver && self.target_delivered_boots == next_set;
+
+        if !can_deliver_helm && !can_deliver_chest && !can_deliver_legs && !can_deliver_boots {
+            if !self.is_target_delivery_completed() {
+                warn!("Authorized set is incomplete; holding delivery instead of starting another batch.");
+                return false;
+            }
+            info!("All authorized full sets ({} set(s)) have been delivered to {}!", self.target_sets_to_deliver, self.order_target);
             self.close_current_gui(bot);
+            self.is_fulfilling_target = false;
             self.state = OrderWorkflowState::WaitingForNextOrder;
             return true;
         }
 
-        // Scan slots 0..=44 for target player's buy orders
-        for slot in 0..=44 {
+        for slot in 0..=max_order_slot {
             if let Some(item) = self.current_slots.get(&slot) {
                 if let Some(info) = inspect_item_with_bot(item, Some(bot)) {
                     if info.kind.to_lowercase().contains("glasspane")
@@ -1095,27 +1883,61 @@ impl GuiManager {
                         continue;
                     }
 
-                    let matches_helm = has_helm && (is_diamond_helmet(&info) || info.kind.contains("Helmet") || info.custom_name.as_deref().unwrap_or("").contains("Helmet"));
-                    let matches_chest = has_chest && (is_diamond_chestplate(&info) || info.kind.contains("Chestplate") || info.custom_name.as_deref().unwrap_or("").contains("Chestplate"));
-                    let matches_legs = has_legs && (is_diamond_leggings(&info) || info.kind.contains("Leggings") || info.custom_name.as_deref().unwrap_or("").contains("Leggings"));
-                    let matches_boots = has_boots && (is_diamond_boots(&info) || info.kind.contains("Boots") || info.custom_name.as_deref().unwrap_or("").contains("Boots"));
+                    let kind_lower = info.kind.to_lowercase();
+                    let name_lower = info.custom_name.as_deref().unwrap_or("").to_lowercase();
+                    let lore_has = |term: &str| info.lore.iter().any(|l| l.to_lowercase().contains(term));
 
-                    if matches_helm || matches_chest || matches_legs || matches_boots {
-                        let armor_name = if matches_helm {
-                            "Diamond Helmet"
-                        } else if matches_chest {
-                            "Diamond Chestplate"
-                        } else if matches_legs {
-                            "Diamond Leggings"
+                    let is_helm = can_deliver_helm
+                        && (is_diamond_helmet(&info)
+                            || kind_lower.contains("helmet")
+                            || name_lower.contains("helmet")
+                            || lore_has("helmet"));
+                    let is_chest = !is_helm
+                        && can_deliver_chest
+                        && (is_diamond_chestplate(&info)
+                            || kind_lower.contains("chestplate")
+                            || name_lower.contains("chestplate")
+                            || kind_lower.contains("chest")
+                            || name_lower.contains("chest")
+                            || lore_has("chestplate"));
+                    let is_legs = !is_helm
+                        && !is_chest
+                        && can_deliver_legs
+                        && (is_diamond_leggings(&info)
+                            || kind_lower.contains("leggings")
+                            || name_lower.contains("leggings")
+                            || kind_lower.contains("legs")
+                            || name_lower.contains("legs")
+                            || lore_has("leggings"));
+                    let is_boots = !is_helm
+                        && !is_chest
+                        && !is_legs
+                        && can_deliver_boots
+                        && (is_diamond_boots(&info)
+                            || kind_lower.contains("boots")
+                            || name_lower.contains("boots")
+                            || lore_has("boots"));
+
+                    if is_helm || is_chest || is_legs || is_boots {
+                        let (armor_name, armor_type) = if is_helm {
+                            ("Diamond Helmet", TargetArmorType::Helmet)
+                        } else if is_chest {
+                            ("Diamond Chestplate", TargetArmorType::Chestplate)
+                        } else if is_legs {
+                            ("Diamond Leggings", TargetArmorType::Leggings)
                         } else {
-                            "Diamond Boots"
+                            ("Diamond Boots", TargetArmorType::Boots)
                         };
 
                         info!(
                             "Found buy order for '{armor_name}' at slot #{slot} (Item: '{}', Name: {:?}, Lore: {:?})! Clicking to fulfill...",
                             info.kind, info.custom_name, info.lore
                         );
+                        self.target_delivering_armor = Some(armor_type);
+                        self.last_target_order_click = Some(std::time::Instant::now());
                         self.click_slot(bot, slot, ClickType::Pickup);
+                        // Remain in FillingTargetOrders until on_open_screen sees 'Orders -> Deliver Items'
+                        self.state = OrderWorkflowState::FillingTargetOrders;
                         return true;
                     }
                 }
@@ -1142,8 +1964,123 @@ impl GuiManager {
         true
     }
 
+    /// Deposits matching max-enchanted armor piece(s) into the 'Orders -> Deliver Items' chest GUI.
+    pub async fn process_deposit_target_items(&mut self, bot: &Client) -> bool {
+        if let Some(pending) = self.pending_delivery.as_mut() {
+            if pending.deposit_observed || pending.confirm_sent {
+                return false;
+            }
+            let source_empty = matches!(self.current_slots.get(&pending.source_slot), Some(ItemStack::Empty));
+            let in_chest = self.current_slots.iter().any(|(slot, item)| {
+                *slot < self.open_container_size && inspect_item_with_bot(item, Some(bot))
+                    .is_some_and(|info| Self::armor_matches(&info, pending.armor))
+            });
+            if source_empty && in_chest {
+                pending.deposit_observed = true;
+                self.close_current_gui(bot);
+                self.record_action_sent(None, None);
+            }
+            return false;
+        }
+        if self.target_delivering_armor.is_none() || self.open_container_size == 0 {
+            return false;
+        }
+        if self.open_container_size > 36 {
+            warn!(
+                "process_deposit_target_items invoked on non-delivery container #{} (size: {}). Ignoring.",
+                self.current_container_id, self.open_container_size
+            );
+            return false;
+        }
+
+        info!(
+            "In delivery deposit GUI (container #{}, open_size: {}). Scanning inventory slots for matching armor ({:?})...",
+            self.current_container_id, self.open_container_size, self.target_delivering_armor
+        );
+
+        let target_type = self.target_delivering_armor;
+        let mut matching_slots = Vec::new();
+
+        // Slots in the open container that belong to the player inventory (slot >= open_container_size)
+        let inv_start = if self.open_container_size > 0 {
+            self.open_container_size
+        } else {
+            36
+        };
+
+        for (&slot, item) in &self.current_slots {
+            if slot < inv_start {
+                continue;
+            }
+            if let Some(info) = inspect_item_with_bot(item, Some(bot)) {
+                let is_match = match target_type {
+                    Some(TargetArmorType::Helmet) => {
+                        is_diamond_helmet(&info)
+                            && info.has_enchantment("protection", 4)
+                            && info.has_enchantment("unbreaking", 3)
+                            && info.has_enchantment("mending", 1)
+                    }
+                    Some(TargetArmorType::Chestplate) => {
+                        is_diamond_chestplate(&info)
+                            && info.has_enchantment("protection", 4)
+                            && info.has_enchantment("unbreaking", 3)
+                            && info.has_enchantment("mending", 1)
+                    }
+                    Some(TargetArmorType::Leggings) => {
+                        is_diamond_leggings(&info)
+                            && info.has_enchantment("blast_protection", 4)
+                            && info.has_enchantment("unbreaking", 3)
+                            && info.has_enchantment("mending", 1)
+                    }
+                    Some(TargetArmorType::Boots) => {
+                        is_diamond_boots(&info)
+                            && info.has_enchantment("blast_protection", 4)
+                            && info.has_enchantment("unbreaking", 3)
+                            && info.has_enchantment("mending", 1)
+                    }
+                    None => {
+                        (is_diamond_helmet(&info) && info.has_enchantment("protection", 4) && info.has_enchantment("unbreaking", 3) && info.has_enchantment("mending", 1))
+                            || (is_diamond_chestplate(&info) && info.has_enchantment("protection", 4) && info.has_enchantment("unbreaking", 3) && info.has_enchantment("mending", 1))
+                            || (is_diamond_leggings(&info) && info.has_enchantment("blast_protection", 4) && info.has_enchantment("unbreaking", 3) && info.has_enchantment("mending", 1))
+                            || (is_diamond_boots(&info) && info.has_enchantment("blast_protection", 4) && info.has_enchantment("unbreaking", 3) && info.has_enchantment("mending", 1))
+                    }
+                };
+
+                if is_match {
+                    matching_slots.push((slot, info.kind.clone()));
+                }
+            }
+        }
+
+        if matching_slots.is_empty() {
+            warn!("No matching max-enchanted armor found in inventory to deposit! Closing GUI.");
+            self.target_delivering_armor = None;
+            self.close_current_gui(bot);
+            self.state = OrderWorkflowState::WaitingForNextOrder;
+            return true;
+        }
+
+        // Fulfill one armor type at a time: deposit exactly one matching piece
+        if let Some((slot, kind)) = matching_slots.into_iter().next() {
+            let armor = self.target_delivering_armor.unwrap();
+            self.pending_delivery = Some(PendingDelivery {
+                armor,
+                inventory_count_before: self.armor_count(armor, Some(bot)),
+                source_slot: slot,
+                deposit_observed: false,
+                confirm_sent: false,
+            });
+            info!("Depositing single '{kind}' from inventory slot #{slot} via QuickMove...");
+            self.click_slot(bot, slot, ClickType::QuickMove);
+        }
+        true
+    }
+
     /// Click confirm/deliver button if order fulfillment opens a confirmation screen.
     pub async fn confirm_target_order_fulfill(&mut self, bot: &Client) -> bool {
+        if !self.pending_delivery.as_ref().is_some_and(|p| p.deposit_observed && !p.confirm_sent) {
+            return false;
+        }
         info!("Scanning confirmation screen for confirm/deliver button...");
         for (&slot, item) in &self.current_slots {
             if slot >= self.open_container_size && self.open_container_size > 0 {
@@ -1154,7 +2091,10 @@ impl GuiManager {
                 let lore = info.lore.join(" ").to_lowercase();
                 let kind = info.kind.to_lowercase();
 
-                // Never click navigation items
+                // Never click cancel or navigation items
+                if kind.contains("red") || name.contains("cancel") || lore.contains("cancel") {
+                    continue;
+                }
                 if kind.contains("book") || kind.contains("hopper") || kind.contains("sign") || kind.contains("shard") || kind.contains("chest") {
                     continue;
                 }
@@ -1163,33 +2103,57 @@ impl GuiManager {
                 }
 
                 if is_confirm_button(&info)
-                    || kind.contains("lime_stained_glass_pane")
+                    || kind.contains("lime")
+                    || kind.contains("green")
                     || kind.contains("emerald")
-                    || kind.contains("lime_wool")
-                    || kind.contains("green_wool")
                     || name.contains("confirm")
                     || name.contains("deliver")
                     || name.contains("fulfill")
+                    || name.contains("accept")
                     || name.contains("yes")
                     || lore.contains("click to confirm")
                     || lore.contains("click to deliver")
                     || lore.contains("click to fulfill")
+                    || lore.contains("confirm delivery")
                 {
                     info!("Found confirmation/deliver button at slot #{slot} ('{name}', kind: {kind})! Clicking to complete delivery...");
                     self.click_slot(bot, slot, ClickType::Pickup);
-                    self.state = OrderWorkflowState::FillingTargetOrders;
+                    self.pending_delivery.as_mut().unwrap().confirm_sent = true;
+                    // Keep the armor and transaction until a fresh post-confirmation
+                    // order-menu inventory snapshot verifies acceptance or return.
                     return true;
                 }
             }
         }
 
-        warn!("Could not identify confirmation button. Logging all slots:");
+        warn!("Could not identify confirmation button in container #{}. Closing all GUI and retrying in 10 ticks...", self.current_container_id);
         self.log_all_slot_nbt(Some(bot));
+        self.close_current_gui(bot);
+        self.state = OrderWorkflowState::WaitingForNextOrder;
+        let target_name = self.order_target.clone();
+        self.schedule_command(format!("/order {target_name}"), std::time::Duration::from_millis(500));
         false
     }
 
-    /// Click a slot by sending a ServerboundContainerClick packet.
-    pub fn click_slot(&self, bot: &Client, slot: i16, click_type: ClickType) {
+    /// Counts how many max-enchanted armor pieces exist in player inventory.
+    pub fn count_max_enchanted_armors(&self, bot: Option<&Client>) -> usize {
+        let mut count = 0;
+        for item in self.player_inventory.values() {
+            if let Some(info) = inspect_item_with_bot(item, bot) {
+                if (is_diamond_helmet(&info) && info.has_enchantment("protection", 4) && info.has_enchantment("unbreaking", 3) && info.has_enchantment("mending", 1))
+                    || (is_diamond_chestplate(&info) && info.has_enchantment("protection", 4) && info.has_enchantment("unbreaking", 3) && info.has_enchantment("mending", 1))
+                    || (is_diamond_leggings(&info) && info.has_enchantment("blast_protection", 4) && info.has_enchantment("unbreaking", 3) && info.has_enchantment("mending", 1))
+                    || (is_diamond_boots(&info) && info.has_enchantment("blast_protection", 4) && info.has_enchantment("unbreaking", 3) && info.has_enchantment("mending", 1))
+                {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    /// Click a slot by sending a ServerboundContainerClick packet and recording watchdog timestamp.
+    pub fn click_slot(&mut self, bot: &Client, slot: i16, click_type: ClickType) {
         let packet = ServerboundContainerClick {
             container_id: self.current_container_id,
             state_id: self.current_state_id,
@@ -1200,19 +2164,356 @@ impl GuiManager {
             carried_item: HashedStack(None),
         };
         bot.write_packet(packet);
+        self.record_action_sent(Some(slot), Some(click_type));
+        if click_type == ClickType::QuickMove {
+            self.transfer_before = Some((self.current_slots.get(&slot).cloned().unwrap_or(ItemStack::Empty), self.player_inventory.clone()));
+        }
     }
 
     /// Close the currently opened GUI container.
-    pub fn close_current_gui(&self, bot: &Client) {
-        bot.write_packet(ServerboundContainerClose {
-            container_id: self.current_container_id,
-        });
+    pub fn close_current_gui(&mut self, bot: &Client) {
+        self.clear_watchdog();
+        if self.current_container_id > 0 {
+            bot.write_packet(ServerboundContainerClose {
+                container_id: self.current_container_id,
+            });
+            self.current_container_id = 0;
+            self.current_slots.clear();
+        }
     }
+
+    /// Wall-clock watchdog: refresh stale screens or instant rejoin when no GUI is available.
+    pub async fn check_and_handle_timeout(&mut self, bot: &Client) -> bool {
+        if let Some((due, command)) = self.scheduled_command.clone() {
+            if std::time::Instant::now() >= due {
+                self.is_waiting_for_restock = false;
+                self.scheduled_command = None;
+                self.prepare_to_send_command(bot, &command);
+                return true;
+            }
+            return false;
+        }
+
+        if self.is_waiting_for_restock {
+            if let Some(until) = self.restock_wait_until {
+                if std::time::Instant::now() >= until {
+                    self.is_waiting_for_restock = false;
+                    self.restock_wait_until = None;
+                } else {
+                    return false;
+                }
+            } else {
+                self.is_waiting_for_restock = false;
+            }
+        }
+
+        if self.is_waiting_for_restock {
+            return false;
+        }
+
+        // When NO GUI is available and the bot is awaiting a GUI response: INSTANT REJOIN!
+        if self.current_container_id == 0 {
+            if self.awaiting_response {
+                let elapsed = self.last_action_time.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+                if elapsed >= std::time::Duration::from_millis(2000) {
+                    error!("No GUI is available (container #0 after command in {:?})! Instant rejoining server...", self.state);
+                    self.clear_watchdog();
+                    bot.disconnect();
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        if !self.awaiting_response {
+            if self.last_progress_time.elapsed() < std::time::Duration::from_secs(3) {
+                return false;
+            }
+            self.awaiting_response = true;
+            self.last_action_time = Some(self.last_progress_time);
+        }
+
+        let Some(last) = self.last_action_time else { return false; };
+        let navigating = matches!(self.state, OrderWorkflowState::NavigatingToYourOrders
+            | OrderWorkflowState::OpenedOrderMainMenu);
+        let retry_count = self.action_retry_count.max(if navigating { self.navigation_retry_count } else { 0 });
+        let timeout = std::time::Duration::from_millis(2000 * (1 + retry_count as u64));
+        if last.elapsed() < timeout {
+            return false;
+        }
+        if retry_count >= 2 {
+            error!("GUI stalled after attempts; disconnecting for instant rejoin.");
+            self.clear_watchdog();
+            bot.disconnect();
+            return true;
+        }
+        let retries = retry_count + 1;
+        if navigating { self.navigation_retry_count = retries; }
+        let command = if self.is_fulfilling_target {
+            format!("/order {}", self.order_target)
+        } else {
+            self.last_command_sent.clone().unwrap_or_else(|| "/order".to_string())
+        };
+        warn!("GUI stalled in {:?}; refreshing with {} (attempt {}/2)", self.state, command, retries);
+        self.close_current_gui(bot);
+        self.action_in_progress = false;
+        self.state = if self.is_fulfilling_target {
+            OrderWorkflowState::FillingTargetOrders
+        } else {
+            OrderWorkflowState::WaitingForNextOrder
+        };
+        if self.pending_delivery.is_none() {
+            self.target_delivering_armor = None;
+        }
+        self.prepare_to_send_command(bot, &command);
+        self.action_retry_count = retries;
+        true
+    }
+
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anvil_counts_forget_consumed_inventory_and_require_confirmed_world_block() {
+        use azalea_registry::builtin::ItemKind;
+        let mut gui = GuiManager::new();
+        gui.phase = WithdrawalPhase::ItemsRetrieval;
+        gui.player_inventory.insert(37, ItemStack::new(ItemKind::Anvil, 53));
+        gui.sync_collected_from_inventory(None);
+        assert_eq!(gui.collected.anvils, 53);
+        gui.player_inventory.insert(37, ItemStack::Empty);
+        gui.sync_collected_from_inventory(None);
+        assert_eq!(gui.collected.anvils, 0);
+        gui.placed_anvil_available = true;
+        gui.sync_collected_from_inventory(None);
+        assert_eq!(gui.collected.anvils, 1);
+        gui.placed_anvil_available = false;
+        gui.phase = WithdrawalPhase::AnvilPlacement;
+        gui.reset_and_sync_inventory(None);
+        assert_eq!(gui.collected.anvils, 0);
+        let anvil = ItemInfo { kind: "Anvil".into(), count: 1, ..Default::default() };
+        assert!(gui.is_order_needed(&anvil).0);
+    }
+
+    #[test]
+    fn late_order_screen_is_not_mistaken_for_a_sell_screen() {
+        use azalea_registry::builtin::ItemKind;
+        let mut gui = GuiManager::new();
+        gui.player_inventory.insert(9, ItemStack::new(ItemKind::ExperienceBottle, 64));
+        let before = gui.player_inventory.clone();
+        gui.state = OrderWorkflowState::SellingInventory;
+        gui.on_open_screen(7, "Orders (Page 1)");
+        assert_eq!(gui.state, OrderWorkflowState::OpenedOrderMainMenu);
+        assert_eq!(gui.player_inventory, before);
+        gui.on_open_screen(8, "Sell");
+        assert_eq!(gui.state, OrderWorkflowState::SellingInventory);
+        assert_eq!(gui.player_inventory, before);
+    }
+
+    #[test]
+    fn navigation_refresh_budget_survives_reopening_main_menu() {
+        let mut gui = GuiManager::new();
+        gui.navigation_retry_count = 2;
+        gui.on_open_screen(7, "Orders (Page 1)");
+        gui.record_action_sent(Some(51), Some(ClickType::Pickup));
+        assert_eq!(gui.navigation_retry_count, 2);
+        gui.on_open_screen(8, "Orders -> Your Orders");
+        assert_eq!(gui.navigation_retry_count, 0);
+    }
+
+    #[test]
+    fn stock_alerts_require_fresh_orders_and_zero_actual_inventory() {
+        use azalea_registry::builtin::ItemKind;
+        let mut gui = GuiManager::new();
+        gui.phase = WithdrawalPhase::ItemsRetrieval;
+        assert!(gui.verified_stock_alerts().is_empty());
+        gui.on_open_screen(7, "Orders -> Your Orders");
+        let mut items = vec![ItemStack::Empty; 90];
+        items[54] = ItemStack::new(ItemKind::ExperienceBottle, 1);
+        gui.on_set_content(7, 1, &items, None);
+        gui.stock_audit.observe_page(0, vec![], false);
+        // One bottle is below the 256-bottle quota, but is not out of stock.
+        assert!(!gui.verified_stock_alerts().contains(&"Experience Bottles"));
+        gui.on_set_slot(0, 2, 9, &ItemStack::Empty, None);
+        assert!(gui.verified_stock_alerts().contains(&"Experience Bottles"));
+        gui.record_command_sent("/order");
+        assert!(gui.verified_stock_alerts().is_empty());
+    }
+
+    #[test]
+    fn same_container_page_contents_acknowledge_navigation() {
+        let mut gui = GuiManager::new();
+        gui.on_open_screen(7, "Orders -> Your Orders");
+        gui.on_set_content(7, 1, &vec![ItemStack::Empty; 90], None);
+        gui.record_action_sent(Some(53), Some(ClickType::Pickup));
+        gui.page_turn_pending = true;
+        gui.order_page = 1;
+        gui.current_menu_skipped_slots.push(1);
+        gui.on_set_content(7, 2, &vec![ItemStack::Empty; 90], None);
+        assert!(!gui.awaiting_response);
+        assert!(!gui.page_turn_pending);
+        assert!(gui.current_menu_skipped_slots.is_empty());
+        assert_eq!(gui.order_page, 1);
+    }
+
+    #[test]
+    fn default_withdrawal_is_two_sets_grouped_by_type() {
+        let mut gui = GuiManager::new();
+        gui.phase = WithdrawalPhase::ItemsRetrieval;
+        let pieces: Vec<_> = crate::armor::TYPES.iter().map(|kind| ItemInfo {
+            kind: format!("Diamond{kind}"), count: 1, ..Default::default()
+        }).collect();
+        for next in 0..4 {
+            for (kind, info) in pieces.iter().enumerate() {
+                assert_eq!(gui.is_order_needed(info).0, kind == next);
+            }
+            match next {
+                0 => gui.collected.diamond_helmets = 2,
+                1 => gui.collected.diamond_chestplates = 2,
+                2 => gui.collected.diamond_leggings = 2,
+                _ => gui.collected.diamond_boots = 2,
+            }
+        }
+        assert!(pieces.iter().all(|info| !gui.is_order_needed(info).0));
+        assert_eq!(gui.quota.mending_needed, 8);
+        assert_eq!(gui.quota.unbreaking_3_needed, 8);
+        assert_eq!(gui.quota.protection_4_needed, 4);
+        assert_eq!(gui.quota.blast_protection_4_needed, 4);
+    }
+
+    #[test]
+    fn direct_inventory_updates_use_player_slot_numbers() {
+        use azalea_registry::builtin::ItemKind;
+        let mut gui = GuiManager::new();
+        gui.on_set_slot(-2, 0, 0, &ItemStack::new(ItemKind::DiamondHelmet, 1), None);
+        assert_eq!(gui.collected.diamond_helmets, 1);
+        assert!(gui.player_inventory.contains_key(&36));
+        gui.on_set_slot(-2, 0, 0, &ItemStack::Empty, None);
+        assert_eq!(gui.collected.diamond_helmets, 0);
+    }
+
+    fn pending(armor: TargetArmorType, confirm_sent: bool) -> PendingDelivery {
+        PendingDelivery { armor, inventory_count_before: 1, source_slot: 27,
+            deposit_observed: true, confirm_sent }
+    }
+
+    #[test]
+    fn newer_commands_supersede_scheduled_retries() {
+        let mut gui = GuiManager::new();
+        gui.schedule_command("/order".to_string(), std::time::Duration::from_secs(45));
+        assert!(gui.scheduled_command.is_some());
+        gui.record_command_sent("/order buyer");
+        assert!(gui.scheduled_command.is_none());
+        assert_eq!(gui.last_command_sent.as_deref(), Some("/order buyer"));
+        assert!(gui.awaiting_response);
+    }
+
+    #[test]
+    fn delivery_requires_four_verified_types_and_counts_each_once() {
+        let mut gui = GuiManager::new();
+        assert!(!gui.is_target_delivery_completed());
+        gui.target_sets_to_deliver = 1;
+        for armor in [TargetArmorType::Helmet, TargetArmorType::Chestplate, TargetArmorType::Leggings] {
+            gui.pending_delivery = Some(pending(armor, true));
+            gui.reconcile_delivery_count(0);
+            gui.reconcile_delivery_count(0); // duplicate snapshot
+            assert!(!gui.is_target_delivery_completed());
+        }
+        gui.pending_delivery = Some(pending(TargetArmorType::Boots, true));
+        gui.reconcile_delivery_count(0);
+        assert!(gui.is_target_delivery_completed());
+        assert_eq!(gui.target_delivered_helmets, 1);
+    }
+
+    #[test]
+    fn escrow_and_rejected_confirmation_are_not_deliveries() {
+        let mut gui = GuiManager::new();
+        gui.pending_delivery = Some(pending(TargetArmorType::Boots, false));
+        gui.reconcile_delivery_count(0); // disappeared into escrow, never confirmed
+        assert!(gui.pending_delivery.is_some());
+        assert_eq!(gui.target_delivered_boots, 0);
+        gui.pending_delivery.as_mut().unwrap().confirm_sent = true;
+        gui.reconcile_delivery_count(1); // server returned rejected item
+        assert!(gui.pending_delivery.is_none());
+        assert_eq!(gui.target_delivered_boots, 0);
+    }
+
+    #[test]
+    fn missing_contents_keep_watchdog_armed_and_late_packets_are_ignored() {
+        let mut gui = GuiManager::new();
+        gui.record_command_sent("/order");
+        gui.action_retry_count = 2;
+        gui.on_open_screen(7, "Orders");
+        assert!(gui.awaiting_response);
+        assert_eq!(gui.action_retry_count, 2);
+        gui.on_set_content(6, 1, &vec![ItemStack::Empty; 63], None);
+        assert_eq!(gui.current_container_id, 7);
+        assert!(gui.current_slots.is_empty());
+        assert!(gui.awaiting_response);
+        gui.on_set_content(7, 1, &vec![ItemStack::Empty; 63], None);
+        assert!(!gui.awaiting_response);
+    }
+
+    #[test]
+    fn transfer_waits_for_source_and_inventory_packets_in_either_order() {
+        use azalea_registry::builtin::ItemKind;
+        for inventory_first in [false, true] {
+            let mut gui = GuiManager::new();
+            gui.on_open_screen(7, "Orders -> Collect Items");
+            let bottle = ItemStack::new(ItemKind::ExperienceBottle, 64);
+            let mut items = vec![ItemStack::Empty; 63];
+            items[0] = bottle.clone();
+            gui.on_set_content(7, 1, &items, None);
+            gui.record_action_sent(Some(0), Some(ClickType::QuickMove));
+            gui.transfer_before = Some((bottle.clone(), gui.player_inventory.clone()));
+            if inventory_first {
+                gui.on_set_slot(7, 2, 27, &bottle, None);
+            } else {
+                gui.on_set_slot(7, 2, 0, &ItemStack::Empty, None);
+            }
+            assert!(gui.awaiting_response);
+            if inventory_first {
+                gui.on_set_slot(7, 2, 0, &ItemStack::Empty, None);
+            } else {
+                gui.on_set_slot(7, 2, 27, &bottle, None);
+            }
+            assert!(!gui.awaiting_response);
+            assert_eq!(gui.collected.xp_bottles, 64);
+        }
+    }
+
+    #[test]
+    fn quota_tracks_consumption_and_uses_bottles_not_occupied_slots() {
+        let mut gui = GuiManager::new();
+        gui.collected.mending = 8;
+        gui.collected.diamond_boots = 2;
+        gui.sync_collected_from_inventory(None);
+        assert_eq!(gui.collected.mending, 0);
+        assert_eq!(gui.collected.diamond_boots, 0);
+        gui.collected.xp_stacks = 4;
+        gui.collected.xp_bottles = 4;
+        assert!(!gui.collected.has_required_xp(&gui.quota));
+    }
+
+    #[test]
+    fn fresh_order_snapshot_settles_confirmation_but_old_screen_does_not() {
+        let mut gui = GuiManager::new();
+        gui.is_fulfilling_target = true;
+        gui.target_delivering_armor = Some(TargetArmorType::Boots);
+        gui.pending_delivery = Some(pending(TargetArmorType::Boots, true));
+        gui.on_open_screen(8, "Orders -> Confirm delivery");
+        gui.on_set_content(8, 1, &vec![ItemStack::Empty; 63], None);
+        assert_eq!(gui.target_delivered_boots, 0);
+        gui.on_open_screen(9, "Orders");
+        gui.on_set_content(8, 2, &vec![ItemStack::Empty; 63], None);
+        assert_eq!(gui.target_delivered_boots, 0);
+        gui.on_set_content(9, 1, &vec![ItemStack::Empty; 63], None);
+        assert_eq!(gui.target_delivered_boots, 1);
+        assert!(gui.target_delivering_armor.is_none());
+    }
 
     #[test]
     fn test_quota_fulfillment() {
@@ -1238,6 +2539,7 @@ mod tests {
         collected.protection_4 = 2;
         collected.blast_protection_4 = 2;
         collected.xp_stacks = 3;
+        collected.xp_bottles = 192;
         assert!(!collected.is_fulfilled(&quota)); // Missing diamond armor pieces
 
         collected.diamond_helmets = 1;
@@ -1292,9 +2594,18 @@ mod tests {
         assert!(needed_helmet);
         assert_eq!(h_name, "Diamond Helmet");
 
-        gui.collected.diamond_helmets = 1;
+        gui.collected.diamond_helmets = gui.quota.diamond_helmets_needed;
         let (needed_helmet_again, _) = gui.is_order_needed(&helmet);
-        assert!(!needed_helmet_again); // Already collected 1 helmet
+        assert!(!needed_helmet_again); // Already collected quota of helmets
+    }
+
+    #[test]
+    fn test_find_unneeded_inventory_slots() {
+        let gui = GuiManager::new();
+        // Default quota: 8 Mending, 8 Unb3, 4 Prot4, 4 BlastProt4, 4 XP stacks, 2 of each armor, 1 anvil
+        let unneeded = gui.find_unneeded_inventory_slots(None);
+        // Initially empty inventory has 0 unneeded
+        assert_eq!(unneeded.len(), 0);
     }
 
     #[test]
@@ -1328,16 +2639,137 @@ mod tests {
         let (needed, _) = gui.is_order_needed(&xp_info);
         assert!(!needed, "Should not need XP bottles when 2 stacks (128 bottles) are collected");
 
-        // When inventory has 2 stacks but slightly less than 128 (e.g. 114 bottles across 2 slots), it is NOT needed!
+        // Partial stacks still need topping up to the 128-bottle quota.
         gui.collected.xp_bottles = 114;
         gui.collected.xp_stacks = 2;
         let (needed, _) = gui.is_order_needed(&xp_info);
-        assert!(!needed, "Should not need XP bottles when 2 stacks (>=106 bottles) already collected");
+        assert!(needed, "114 bottles do not meet the 128-bottle quota");
+
+        // Four occupied slots do not meet a 256-bottle quota with only 210 bottles.
+        gui.quota.xp_stacks_needed = 4;
+        gui.collected.xp_bottles = 210;
+        gui.collected.xp_stacks = 4;
+        let (needed, _) = gui.is_order_needed(&xp_info);
+        assert!(needed, "210 bottles do not meet the 256-bottle quota");
+    }
+
+    #[test]
+    fn test_surplus_anvils_in_items_retrieval_phase() {
+        let mut gui = GuiManager::new();
+        gui.phase = WithdrawalPhase::ItemsRetrieval;
+
+        // Put an anvil in slot 10
+        let anvil = ItemStack::Present(azalea::inventory::ItemStackData {
+            kind: azalea_registry::builtin::ItemKind::Anvil,
+            count: 1,
+            component_patch: Default::default(),
+        });
+        gui.player_inventory.insert(10, anvil);
+
+        let unneeded = gui.find_unneeded_inventory_slots(None);
+        assert_eq!(unneeded.len(), 1);
+        assert!(unneeded[0].1.contains("Surplus Anvil"));
     }
 
     #[test]
     fn test_click_type_swap() {
         let _ = ClickType::Swap;
     }
-}
 
+    #[test]
+    fn test_exhausted_order_handling_and_missing_summary() {
+        let mut gui = GuiManager::new();
+        gui.phase = WithdrawalPhase::ItemsRetrieval;
+
+        // Test item name identification
+        let helmet_info = ItemInfo {
+            kind: "DiamondHelmet".to_string(),
+            count: 1,
+            ..Default::default()
+        };
+        assert_eq!(gui.get_item_name(&helmet_info), "Diamond Helmet");
+
+        let custom_info = ItemInfo {
+            kind: "Paper".to_string(),
+            count: 1,
+            custom_name: Some("Custom Voucher".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(gui.get_item_name(&custom_info), "Custom Voucher");
+
+        // Test missing quota summary
+        let missing = gui.get_missing_quota_summary();
+        assert!(missing.contains("Diamond Helmet"));
+        assert!(missing.contains("Diamond Chestplate"));
+        assert!(missing.contains("Mending Book"));
+
+        // Mark Diamond Helmet as exhausted / out of items
+        gui.exhausted_orders.push("Diamond Helmet".to_string());
+        assert!(gui.exhausted_orders.contains(&"Diamond Helmet".to_string()));
+
+        // Check that diamond armor order counting excludes exhausted orders
+        gui.current_slots.insert(3, ItemStack::Empty); // simulated slot
+        assert_eq!(gui.count_available_armor_orders(None), 0);
+    }
+
+    #[test]
+    fn test_can_craft_god_armor() {
+        let mut gui = GuiManager::new();
+
+        // Initially 0 of everything
+        assert!(!gui.can_craft_god_armor(None));
+        assert_eq!(gui.count_craftable_god_sets(None), 0);
+
+        // Has anvil and complete set of armor pieces and books, but NO XP
+        gui.collected.anvils = 1;
+        gui.collected.diamond_helmets = 1;
+        gui.collected.diamond_chestplates = 1;
+        gui.collected.diamond_leggings = 1;
+        gui.collected.diamond_boots = 1;
+        gui.collected.mending = 4;
+        gui.collected.unbreaking_3 = 4;
+        gui.collected.protection_4 = 2;
+        gui.collected.blast_protection_4 = 2;
+        gui.collected.xp_bottles = 0;
+        gui.collected.xp_stacks = 0;
+        assert!(!gui.can_craft_god_armor(None), "Should fail without XP bottles");
+
+        // Now add XP bottles
+        gui.collected.xp_bottles = 32;
+        assert!(gui.can_craft_god_armor(None), "Should succeed with XP and all full set components");
+        assert_eq!(gui.count_craftable_god_sets(None), 1);
+
+        // Without leggings, CANNOT craft complete set!
+        gui.collected.diamond_leggings = 0;
+        assert!(!gui.can_craft_god_armor(None), "Should fail without Leggings for complete set");
+        assert_eq!(gui.count_craftable_god_sets(None), 0);
+    }
+
+    #[test]
+    fn test_count_completed_max_sets() {
+        let gui = GuiManager::new();
+        assert_eq!(gui.count_completed_max_sets(None), 0);
+    }
+
+    #[test]
+    fn test_watchdog_tracking_and_clear() {
+        let mut gui = GuiManager::new();
+        assert!(!gui.awaiting_response);
+        assert_eq!(gui.action_retry_count, 0);
+
+        gui.record_action_sent(Some(51), Some(ClickType::Pickup));
+        assert!(gui.awaiting_response);
+        assert_eq!(gui.last_clicked_slot, Some(51));
+        assert_eq!(gui.last_click_type, Some(ClickType::Pickup));
+        assert!(gui.last_action_time.is_some());
+
+        gui.clear_watchdog();
+        assert!(!gui.awaiting_response);
+        assert_eq!(gui.last_clicked_slot, None);
+        assert_eq!(gui.last_action_time, None);
+
+        gui.record_command_sent("/order");
+        assert!(gui.awaiting_response);
+        assert_eq!(gui.last_command_sent.as_deref(), Some("/order"));
+    }
+}

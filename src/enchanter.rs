@@ -108,12 +108,12 @@ pub async fn smooth_look(bot: &Client, target_yaw: f32, target_pitch: f32) {
         return;
     }
 
-    // Fast human rotation speed: approximately 20-35 degrees per tick (clamp between 2 and 6 ticks)
+    // Fast, crisp human rotation speed: approximately 45-60 degrees per tick (clamp between 1 and 3 ticks)
     if total_dist < 4.0 {
         bot.set_direction(target_yaw, target_pitch);
         return;
     }
-    let steps = ((total_dist / 18.0).round() as usize).clamp(2, 6);
+    let steps = ((total_dist / 45.0).ceil() as usize).clamp(1, 3);
 
     for i in 1..=steps {
         let t = (i as f32) / (steps as f32);
@@ -160,6 +160,13 @@ pub struct EnchanterManager {
     pub total_experience: Arc<AtomicU32>,
     pub server_anvil_cost: Arc<AtomicU32>,
     pub enchanting_complete: bool,
+    pub failed_combine_attempts: u32,
+    combine_clicks: std::collections::VecDeque<(i16, u8, ClickType)>,
+    pending_click: Option<(i16, ItemStack, std::time::Instant, HashMap<i16, ItemStack>, u32)>,
+    recipe_wait_since: Option<std::time::Instant>,
+    content_wait_since: Option<std::time::Instant>,
+    pub xp_target: Option<u32>,
+    pub restock_needed: bool,
 }
 
 impl EnchanterManager {
@@ -177,13 +184,27 @@ impl EnchanterManager {
             total_experience: Arc::new(AtomicU32::new(0)),
             server_anvil_cost: Arc::new(AtomicU32::new(0)),
             enchanting_complete: false,
+            failed_combine_attempts: 0,
+            combine_clicks: Default::default(),
+            pending_click: None,
+            recipe_wait_since: None,
+            content_wait_since: None,
+            xp_target: None,
+            restock_needed: false,
         }
     }
 
     /// Reset enchanting state so the bot can start the next batch of armor combining.
     pub fn reset_for_next_batch(&mut self) {
         self.enchanting_complete = false;
+        self.restock_needed = false;
+        self.xp_target = None;
         self.is_enchanting = false;
+        self.combine_clicks.clear();
+        self.pending_click = None;
+        self.recipe_wait_since = None;
+        self.content_wait_since = None;
+        self.failed_combine_attempts = 0;
         self.anvil_slots.clear();
         self.anvil_container_id = None;
         self.server_anvil_cost.store(0, Ordering::SeqCst);
@@ -223,6 +244,9 @@ impl EnchanterManager {
         smooth_look(bot, dir.y_rot(), 90.0).await;
         bot.wait_ticks(1).await;
 
+        let mut stall_count = 0;
+        let mut last_xp = calculate_current_xp(current_lvl, current_prog);
+
         while current_lvl < target_level && bottles_to_throw > 0 {
             // Find XP bottles in inventory
             let mut xp_slot = None;
@@ -249,6 +273,9 @@ impl EnchanterManager {
             } else {
                 info!("Swapping XP bottles from slot #{slot} to hotbar slot #0...");
                 Self::swap_to_hotbar(bot, slot, 0);
+                let bottles = self.player_inventory.remove(&slot).unwrap_or(ItemStack::Empty);
+                let old_hotbar = self.player_inventory.insert(36, bottles).unwrap_or(ItemStack::Empty);
+                self.player_inventory.insert(slot, old_hotbar);
                 bot.wait_ticks(2).await;
                 0
             };
@@ -269,8 +296,19 @@ impl EnchanterManager {
                 bot.wait_ticks(1).await;
             }
 
-            // Wait 5 ticks for experience orbs to be absorbed and SetExperience to arrive
-            bot.wait_ticks(5).await;
+            // Update local inventory count estimate for this slot
+            if let Some(item) = self.player_inventory.get_mut(&(36 + hotbar_idx as i16)) {
+                if let ItemStack::Present(data) = item {
+                    if (data.count as u32) <= batch {
+                        *item = ItemStack::Empty;
+                    } else {
+                        data.count -= batch as i32;
+                    }
+                }
+            }
+
+            // Wait 2 ticks for experience orbs at feet to be absorbed and SetExperience to arrive
+            bot.wait_ticks(2).await;
 
             let (new_lvl, new_prog) = self.get_level_and_progress();
             current_lvl = new_lvl;
@@ -280,6 +318,17 @@ impl EnchanterManager {
                 "XP Update: Current Level: {} ({:.1}% progress, True Current XP: {}) [Target: Level {}]",
                 current_lvl, current_prog * 100.0, current_xp, target_level
             );
+
+            if current_xp <= last_xp {
+                stall_count += 1;
+                if stall_count >= 3 {
+                    warn!("XP did not increase after 3 throw attempts (out of XP bottles or desync). Exiting XP routine.");
+                    break;
+                }
+            } else {
+                stall_count = 0;
+                last_xp = current_xp;
+            }
 
             if current_lvl >= target_level {
                 break;
@@ -294,41 +343,203 @@ impl EnchanterManager {
         info!("Finished XP consumption routine. Final level: {current_lvl} (target was {target_level}).");
     }
 
-    /// Raycasts to check if an anvil is already present at the expected location.
+/// Scans nearby blocks around the bot to find any placed anvil within reach.
+/// Prioritizes anvils that the bot is facing.
+pub fn find_nearby_anvil(bot: &Client) -> Option<BlockPos> {
+    let p = bot.position();
+    let bx = p.x.floor() as i32;
+    let ground_y = (p.y - 0.1).floor() as i32;
+    let bz = p.z.floor() as i32;
+
+    let eye_x = p.x;
+    let eye_y = p.y + 1.62;
+    let eye_z = p.z;
+
+    let dir = bot.direction();
+    let yaw_rad = (dir.y_rot() as f64).to_radians();
+    let pitch_rad = (dir.x_rot() as f64).to_radians();
+    let look_x = -yaw_rad.sin() * pitch_rad.cos();
+    let look_y = -pitch_rad.sin();
+    let look_z = yaw_rad.cos() * pitch_rad.cos();
+
+    let mut candidates: Vec<(f64, BlockPos)> = Vec::new();
+
+    // Query world block states synchronously without holding lock across awaits
+    {
+        let w = bot.world();
+        let world = w.read();
+
+        // Search horizontal radius +-3, vertical -1..=+2
+        for dx in -3..=3 {
+            for dz in -3..=3 {
+                for dy in -1..=2 {
+                    let pos = BlockPos::new(bx + dx, ground_y + dy, bz + dz);
+                    if let Some(state) = world.get_block_state(pos) {
+                        let s_str = format!("{state:?}").to_lowercase();
+                        if s_str.contains("anvil") {
+                            let cx = pos.x as f64 + 0.5;
+                            let cy = pos.y as f64 + 0.5;
+                            let cz = pos.z as f64 + 0.5;
+
+                            let to_x = cx - eye_x;
+                            let to_y = cy - eye_y;
+                            let to_z = cz - eye_z;
+                            let dist = (to_x * to_x + to_y * to_y + to_z * to_z).sqrt();
+
+                            if dist <= 4.5 && dist > 0.01 {
+                                let dot = (look_x * to_x + look_y * to_y + look_z * to_z) / dist;
+                                // Higher score for anvils in front of crosshair and closer
+                                let score = dot * 2.0 - (dist * 0.5);
+                                candidates.push((score, pos));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } // Read guard dropped here!
+
+    candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.first().map(|(_, pos)| *pos)
+}
+
+/// Scans nearby blocks around the bot to find the nearest hopper within 2 blocks of the bot.
+pub fn find_nearby_hopper(bot: &Client) -> Option<BlockPos> {
+    let p = bot.position();
+    let bx = p.x.floor() as i32;
+    let by = p.y.floor() as i32;
+    let bz = p.z.floor() as i32;
+
+    let mut candidates: Vec<(f64, BlockPos)> = Vec::new();
+
+    {
+        let w = bot.world();
+        let world = w.read();
+
+        // Search horizontal radius +-2, vertical -2..=2 (within 2 blocks of the bot)
+        for dx in -2..=2 {
+            for dz in -2..=2 {
+                for dy in -2..=2 {
+                    let pos = BlockPos::new(bx + dx, by + dy, bz + dz);
+                    if let Some(state) = world.get_block_state(pos) {
+                        let s_str = format!("{state:?}").to_lowercase();
+                        if s_str.contains("hopper") {
+                            let cx = pos.x as f64 + 0.5;
+                            let cy = pos.y as f64 + 0.5;
+                            let cz = pos.z as f64 + 0.5;
+
+                            let dist = ((cx - p.x).powi(2) + (cy - p.y).powi(2) + (cz - p.z).powi(2)).sqrt();
+                            if dist <= 2.85 {
+                                candidates.push((dist, pos));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.first().map(|(_, pos)| *pos)
+}
+
+/// Finds the best ground position and target anvil position to place a new anvil,
+/// oriented in front of the bot.
+pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
+    let p = bot.position();
+    let bx = p.x.floor() as i32;
+    let ground_y = (p.y - 0.1).floor() as i32;
+    let bz = p.z.floor() as i32;
+
+    let dir = bot.direction();
+    let yaw_rad = (dir.y_rot() as f64).to_radians();
+    let look_x = -yaw_rad.sin();
+    let look_z = yaw_rad.cos();
+
+    // Cardinals sorted by alignment with bot's horizontal look direction
+    let mut cardinals = [
+        (0, 1),   // South
+        (-1, 0),  // West
+        (0, -1),  // North
+        (1, 0),   // East
+    ];
+    cardinals.sort_by(|&(dx1, dz1), &(dx2, dz2)| {
+        let dot1 = look_x * dx1 as f64 + look_z * dz1 as f64;
+        let dot2 = look_x * dx2 as f64 + look_z * dz2 as f64;
+        dot2.partial_cmp(&dot1).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let w = bot.world();
+    let world = w.read();
+
+    for (dx, dz) in cardinals {
+        let target_anvil = BlockPos::new(bx + dx, ground_y + 1, bz + dz);
+        let ground = BlockPos::new(bx + dx, ground_y, bz + dz);
+
+        let target_is_clear = world.get_block_state(target_anvil)
+            .map(|s| {
+                let name = format!("{s:?}").to_lowercase();
+                name.contains("air")
+            })
+            .unwrap_or(true);
+
+        let ground_is_solid = world.get_block_state(ground)
+            .map(|s| {
+                let name = format!("{s:?}").to_lowercase();
+                !name.contains("air") && !name.contains("water") && !name.contains("lava")
+            })
+            .unwrap_or(true);
+
+        if target_is_clear && ground_is_solid {
+            drop(world);
+            return (ground, target_anvil);
+        }
+    }
+    drop(world);
+
+    // Fallback to directly in front
+    let (front_dx, front_dz) = cardinals[0];
+    (
+        BlockPos::new(bx + front_dx, ground_y, bz + front_dz),
+        BlockPos::new(bx + front_dx, ground_y + 1, bz + front_dz),
+    )
+}
+
+    /// Checks if an anvil is already present in the world nearby or at the known position.
     pub async fn check_if_anvil_placed(&mut self, bot: &Client) -> bool {
-        if self.anvil_placed && self.anvil_pos.is_some() {
-            return true;
+        // 1. If we already have a recorded anvil position, check if it is STILL an anvil in the world
+        if let Some(pos) = self.anvil_pos {
+            let is_still_anvil = {
+                let w = bot.world();
+                let world = w.read();
+                world.get_block_state(pos)
+                    .map(|s| format!("{s:?}").to_lowercase().contains("anvil"))
+                    .unwrap_or(false)
+            };
+            if is_still_anvil {
+                self.anvil_placed = true;
+                return true;
+            } else {
+                warn!("Recorded anvil at {:?} is no longer present or broke!", pos);
+                self.anvil_pos = None;
+                self.anvil_placed = false;
+            }
         }
 
-        let player_pos = bot.position();
-        let base_x = player_pos.x.floor() as i32;
-        let ground_y = (player_pos.y - 0.1).floor() as i32;
-        let base_z = player_pos.z.floor() as i32;
-        let target_anvil_pos = BlockPos::new(base_x + 1, ground_y + 1, base_z);
-
-        let dx_t = (target_anvil_pos.x as f64 + 0.5) - player_pos.x;
-        let dy_t = (target_anvil_pos.y as f64 + 0.5) - (player_pos.y + 1.62);
-        let dz_t = (target_anvil_pos.z as f64 + 0.5) - player_pos.z;
-        let h_dist_t = (dx_t * dx_t + dz_t * dz_t).sqrt();
-        let yaw_t = (-dx_t).atan2(dz_t).to_degrees() as f32;
-        let pitch_t = (-dy_t).atan2(h_dist_t).to_degrees() as f32;
-        smooth_look(bot, yaw_t, pitch_t).await;
-        bot.wait_ticks(2).await;
-
-        let hit_res = bot.hit_result();
-        let hit_debug = format!("{hit_res:?}");
-        let expected_pos_str = format!("x: {}, y: {}, z: {}", target_anvil_pos.x, target_anvil_pos.y, target_anvil_pos.z);
-        if hit_debug.contains("miss: false") && hit_debug.contains(&expected_pos_str) {
-            info!("Anvil block is already present at {:?}!", target_anvil_pos);
-            self.anvil_pos = Some(target_anvil_pos);
+        // 2. Scan nearby blocks in the world
+        if let Some(pos) = Self::find_nearby_anvil(bot) {
+            info!("Anvil block detected in world at {:?}! Using existing anvil.", pos);
+            self.anvil_pos = Some(pos);
             self.anvil_placed = true;
             return true;
         }
 
+        self.anvil_placed = false;
+        self.anvil_pos = None;
         false
     }
 
-    /// Place an anvil on the ground adjacent to the bot.
+    /// Place an anvil on the ground adjacent to or in front of the bot.
     pub async fn place_anvil(
         &mut self,
         bot: &Client,
@@ -362,26 +573,22 @@ impl EnchanterManager {
         if slot != 37 {
             info!("Swapping Anvil from slot #{slot} to hotbar slot #1...");
             Self::swap_to_hotbar(bot, slot, 1);
-            bot.wait_ticks(2).await;
+            bot.wait_ticks(1).await;
         }
 
         bot.set_selected_hotbar_slot(1);
         bot.wait_ticks(1).await;
 
-        let player_pos = bot.position();
-        let base_x = player_pos.x.floor() as i32;
-        let ground_y = (player_pos.y - 0.1).floor() as i32;
-        let base_z = player_pos.z.floor() as i32;
-
-        let ground_pos = BlockPos::new(base_x + 1, ground_y, base_z);
-        let target_anvil_pos = BlockPos::new(ground_pos.x, ground_pos.y + 1, ground_pos.z);
-
         if self.check_if_anvil_placed(bot).await {
-            info!("Anvil block is already present at {:?}! Skipping placement.", target_anvil_pos);
+            info!("Anvil block detected right before placement! Skipping placement.");
             return;
         }
 
+        // Determine ground block to place on (in front of bot)
+        let (ground_pos, target_anvil_pos) = Self::find_placement_pos(bot);
+
         // Aim smoothly at the top center of the ground block face
+        let player_pos = bot.position();
         let dx = (ground_pos.x as f64 + 0.5) - player_pos.x;
         let dy = (ground_pos.y as f64 + 1.0) - (player_pos.y + 1.62);
         let dz = (ground_pos.z as f64 + 0.5) - player_pos.z;
@@ -389,26 +596,40 @@ impl EnchanterManager {
         let yaw = (-dx).atan2(dz).to_degrees() as f32;
         let pitch = (-dy).atan2(horizontal_dist).to_degrees() as f32;
         smooth_look(bot, yaw, pitch).await;
-        bot.wait_ticks(2).await;
+        bot.wait_ticks(1).await;
 
-        info!("Crosshair before place: {:?}", bot.hit_result());
         info!("Placing Anvil on ground block at {:?} (aiming yaw: {yaw:.1}, pitch: {pitch:.1})...", ground_pos);
         bot.block_interact(ground_pos);
         swing_arm(bot);
-        bot.wait_ticks(5).await;
+        bot.wait_ticks(2).await;
 
-        self.anvil_pos = Some(BlockPos::new(ground_pos.x, ground_pos.y + 1, ground_pos.z));
-        self.anvil_placed = true;
-        info!("Anvil placed successfully at {:?}", self.anvil_pos);
+        self.anvil_pos = Some(target_anvil_pos);
+        self.anvil_placed = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if self.check_if_anvil_placed(bot).await {
+                info!("Confirmed placed anvil at {:?}", self.anvil_pos);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        warn!("Anvil placement was not confirmed by the server; preserving inventory for retry.");
     }
 
     /// Right-click the placed anvil to open the enchanting interface.
-    pub async fn open_anvil(&self, bot: &Client) {
-        self.open_anvil_with_inv(bot, &self.player_inventory).await;
+    pub async fn open_anvil(&mut self, bot: &Client) {
+        if !self.check_if_anvil_placed(bot).await {
+            info!("Anvil broke or missing! Placing new anvil before opening...");
+            let inv = self.player_inventory.clone();
+            self.place_anvil(bot, &inv).await;
+            bot.wait_ticks(2).await;
+        }
+        let inv = self.player_inventory.clone();
+        self.open_anvil_with_inv(bot, &inv).await;
     }
 
     /// Right-click the placed anvil with explicit inventory reference and safe hotbar slot selection.
-    pub async fn open_anvil_with_inv(&self, bot: &Client, player_inventory: &HashMap<i16, ItemStack>) {
+    pub async fn open_anvil_with_inv(&mut self, bot: &Client, player_inventory: &HashMap<i16, ItemStack>) {
         // Select a safe hotbar slot: prioritize empty slot, then book/bottle, NEVER armor or anvil!
         let mut safe_hotbar = None;
         for h in 0..9u8 {
@@ -435,15 +656,37 @@ impl EnchanterManager {
         bot.set_selected_hotbar_slot(target_hotbar);
         bot.wait_ticks(1).await;
 
-        let target_pos = self.anvil_pos.unwrap_or_else(|| {
-            let p = bot.position();
-            let gy = (p.y - 0.1).floor() as i32;
-            BlockPos::new(
-                p.x.floor() as i32 + 1,
-                gy + 1,
-                p.z.floor() as i32,
-            )
-        });
+        let valid_pos = if let Some(pos) = self.anvil_pos {
+            let is_anvil = {
+                let w = bot.world();
+                let world = w.read();
+                world.get_block_state(pos)
+                    .map(|s| format!("{s:?}").to_lowercase().contains("anvil"))
+                    .unwrap_or(false)
+            };
+            if is_anvil {
+                Some(pos)
+            } else {
+                warn!("Anvil at {:?} is no longer in world (broke or removed)!", pos);
+                Self::find_nearby_anvil(bot)
+            }
+        } else {
+            Self::find_nearby_anvil(bot)
+        };
+
+        let target_pos = match valid_pos {
+            Some(pos) => {
+                self.anvil_pos = Some(pos);
+                self.anvil_placed = true;
+                pos
+            }
+            None => {
+                warn!("Cannot open Anvil: no anvil block exists in world nearby!");
+                self.anvil_pos = None;
+                self.anvil_placed = false;
+                return;
+            }
+        };
 
         // Aim smoothly at the target anvil block
         let player_pos = bot.position();
@@ -454,12 +697,12 @@ impl EnchanterManager {
         let yaw = (-dx).atan2(dz).to_degrees() as f32;
         let pitch = (-dy).atan2(horizontal_dist).to_degrees() as f32;
         smooth_look(bot, yaw, pitch).await;
-        bot.wait_ticks(2).await;
+        bot.wait_ticks(1).await;
 
         info!("Interacting to open Anvil at {:?} with safe hotbar slot #{}...", target_pos, target_hotbar);
         bot.block_interact(target_pos);
         swing_arm(bot);
-        bot.wait_ticks(6).await;
+        // Release the manager lock immediately so OpenScreen/contents can be handled.
     }
 
     /// Handles Anvil GUI opening.
@@ -467,7 +710,10 @@ impl EnchanterManager {
         info!("Anvil Screen opened: container_id={container_id}, title='{title}'");
         self.anvil_container_id = Some(container_id);
         self.anvil_slots.clear();
-        self.anvil_state_id.store(0, Ordering::SeqCst);
+        self.combine_clicks.clear();
+        self.pending_click = None;
+        self.recipe_wait_since = None;
+        self.content_wait_since = Some(std::time::Instant::now());
         self.server_anvil_cost.store(0, Ordering::SeqCst);
     }
 
@@ -478,6 +724,9 @@ impl EnchanterManager {
         state_id: u32,
         items: &[ItemStack],
     ) {
+        if self.anvil_container_id != Some(container_id) { return; }
+        self.content_wait_since = None;
+        tracing::debug!("Anvil container #{container_id} content received ({} slots, state_id={state_id})", items.len());
         self.anvil_container_id = Some(container_id);
         self.anvil_state_id.store(state_id, Ordering::SeqCst);
         self.anvil_slots.clear();
@@ -502,7 +751,9 @@ impl EnchanterManager {
 
         // Player slots in Anvil GUI are slots 3 through 38
         for slot in 3..=38 {
-            if let Some(item) = self.anvil_slots.get(&slot) {
+            let item = self.anvil_slots.get(&slot)
+                .or_else(|| self.player_inventory.get(&(slot + 6)));
+            if let Some(item) = item {
                 if let Some(info) = inspect_item_with_bot(item, Some(bot)) {
                     if is_diamond_armor(&info) {
                         armor_slots.push((slot, info));
@@ -513,7 +764,7 @@ impl EnchanterManager {
             }
         }
 
-        for (armor_slot, armor_info) in &armor_slots {
+        if let Some((armor_slot, armor_info)) = crate::armor::next_armor(&armor_slots) {
             let is_prot_piece = is_diamond_helmet(armor_info) || is_diamond_chestplate(armor_info);
             let is_blast_piece = is_diamond_leggings(armor_info) || is_diamond_boots(armor_info);
 
@@ -538,16 +789,19 @@ impl EnchanterManager {
             }
 
             if let Some((ench_name, req_level, predicate)) = target {
-                for (b_slot, b_info) in &book_slots {
-                    if predicate(b_info) {
-                        return Some(CombineTask {
-                            armor_slot: *armor_slot,
-                            book_slot: *b_slot,
-                            armor_desc: armor_info.kind.clone(),
-                            enchant_name: ench_name,
-                            required_level: req_level,
-                        });
-                    }
+                let selected_book = book_slots.iter()
+                    .filter(|(s, b)| *s >= 30 && predicate(b))
+                    .chain(book_slots.iter().filter(|(s, b)| *s < 30 && predicate(b)))
+                    .next();
+
+                if let Some((b_slot, _b_info)) = selected_book {
+                    return Some(CombineTask {
+                        armor_slot: *armor_slot,
+                        book_slot: *b_slot,
+                        armor_desc: armor_info.kind.clone(),
+                        enchant_name: ench_name,
+                        required_level: req_level,
+                    });
                 }
             }
         }
@@ -557,24 +811,7 @@ impl EnchanterManager {
 
     /// Check if all 4 diamond armor pieces are present and fully enchanted according to user specifications.
     pub fn check_all_armor_enchanted(&self, bot: &Client) -> (bool, String) {
-        let mut items = Vec::new();
-
-        // Check Anvil container slots (player section 3..38)
-        for slot in 3..=38 {
-            if let Some(item) = self.anvil_slots.get(&slot) {
-                if let Some(info) = inspect_item_with_bot(item, Some(bot)) {
-                    items.push(info);
-                }
-            }
-        }
-
-        // Also check tracked player inventory
-        for item in self.player_inventory.values() {
-            if let Some(info) = inspect_item_with_bot(item, Some(bot)) {
-                items.push(info);
-            }
-        }
-
+        let items = self.armor_inventory_info(Some(bot));
         self.check_all_armor_enchanted_from_info(&items)
     }
 
@@ -625,6 +862,74 @@ impl EnchanterManager {
         (all_done, summary)
     }
 
+    /// Counts distinct max-enchanted armor pieces currently in player inventory / anvil slots.
+    pub fn count_max_enchanted_pieces(&self, bot: &Client) -> usize {
+        self.armor_inventory_info(Some(bot)).iter().filter(|info| crate::armor::is_complete(info)).count()
+    }
+
+    fn armor_inventory_info(&self, bot: Option<&Client>) -> Vec<ItemInfo> {
+        // An open anvil's player section is authoritative. Never merge the same
+        // inventory under two different slot-number systems.
+        if self.anvil_container_id.is_some() {
+            (3..=38).filter_map(|slot| self.anvil_slots.get(&slot))
+                .filter_map(|item| inspect_item_with_bot(item, bot)).collect()
+        } else {
+            (9..=44).filter_map(|slot| self.player_inventory.get(&slot))
+                .filter_map(|item| inspect_item_with_bot(item, bot)).collect()
+        }
+    }
+
+    /// Checks if there are any unenchanted or partially enchanted diamond armors waiting for combines.
+    pub fn has_unenchanted_armor_waiting(&self, bot: &Client) -> bool {
+        let check_item = |info: &ItemInfo| -> bool {
+            if is_diamond_armor(info) {
+                let is_prot = is_diamond_helmet(info) || is_diamond_chestplate(info);
+                let is_blast = is_diamond_leggings(info) || is_diamond_boots(info);
+                if is_prot {
+                    return !info.has_enchantment("protection", 4)
+                        || !info.has_enchantment("unbreaking", 3)
+                        || !info.has_enchantment("mending", 1);
+                } else if is_blast {
+                    return !info.has_enchantment("blast_protection", 4)
+                        || !info.has_enchantment("unbreaking", 3)
+                        || !info.has_enchantment("mending", 1);
+                }
+            }
+            false
+        };
+        for slot in 3..=38 {
+            let item = self.anvil_slots.get(&slot)
+                .or_else(|| self.player_inventory.get(&(slot + 6)));
+            if let Some(item) = item {
+                if let Some(info) = inspect_item_with_bot(item, Some(bot)) {
+                    if check_item(&info) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Checks if there are any applicable enchanted books in inventory to combine with armor.
+    pub fn has_any_matching_books_waiting(&self, bot: &Client) -> bool {
+        let mut books: Vec<ItemInfo> = Vec::new();
+        for slot in 3..=38 {
+            let item = self.anvil_slots.get(&slot)
+                .or_else(|| self.player_inventory.get(&(slot + 6)));
+            if let Some(item) = item {
+                if let Some(info) = inspect_item_with_bot(item, Some(bot)) {
+                    if info.kind.contains("Book") || info.kind.contains("EnchantedBook") {
+                        books.push(info);
+                    }
+                }
+            }
+        }
+        books.iter().any(|b| {
+            is_protection_4(b) || is_blast_protection_4(b) || is_unbreaking_3(b) || is_mending(b)
+        })
+    }
+
     /// Unequip any armor worn in equipment slots 5..=8 back into player inventory.
     pub async fn ensure_no_worn_armor(bot: &Client, player_inv: &HashMap<i16, ItemStack>) {
         for armor_slot in 5..=8i16 {
@@ -642,11 +947,18 @@ impl EnchanterManager {
                             carried_item: HashedStack(None),
                         };
                         bot.write_packet(packet);
-                        bot.wait_ticks(3).await;
+                        bot.wait_ticks(1).await;
                     }
                 }
             }
         }
+    }
+
+    pub fn has_pending_anvil_work(&self) -> bool {
+        self.content_wait_since.is_some() || self.pending_click.is_some()
+            || !self.combine_clicks.is_empty() || self.recipe_wait_since.is_some()
+            || (0..=2).any(|slot| self.anvil_slots.get(&slot)
+                .is_some_and(|item| !matches!(item, ItemStack::Empty)))
     }
 
     /// Automated enchanting loop: combines armor pieces with their required books in the open Anvil,
@@ -661,6 +973,46 @@ impl EnchanterManager {
             None => return false,
         };
 
+        if let Some(since) = self.content_wait_since {
+            if since.elapsed() >= std::time::Duration::from_secs(3) {
+                warn!("Anvil opened without contents; reopening for a fresh snapshot.");
+                self.failed_combine_attempts += 1;
+                if self.failed_combine_attempts >= 5 { bot.disconnect(); }
+                self.close_anvil(bot, container_id);
+            }
+            return false;
+        }
+        if let Some((slot, before, sent, inventory, sent_state_id)) = &self.pending_click {
+            let slot_changed = self.anvil_slots.get(slot).is_some_and(|item| item != before);
+            let inv_changed = &self.player_inventory != inventory;
+            let current_state_id = self.anvil_state_id.load(Ordering::SeqCst);
+            let _state_advanced = current_state_id > *sent_state_id;
+            let acknowledged = slot_changed && inv_changed;
+            if acknowledged {
+                let claimed_output = *slot == 2;
+                self.pending_click = None;
+                if claimed_output {
+                    self.failed_combine_attempts = 0;
+                }
+            } else {
+                if sent.elapsed() >= std::time::Duration::from_secs(3) {
+                    warn!("Anvil click not acknowledged (slot #{slot}); closing to recover inputs.");
+                    self.failed_combine_attempts += 1;
+                    if self.failed_combine_attempts >= 5 {
+                        warn!("Five anvil clicks failed; reconnecting after recovering inputs.");
+                    }
+                    self.close_anvil(bot, container_id);
+                }
+                return false;
+            }
+        }
+        if let Some((slot, button, click)) = self.next_combine_click() {
+            self.send_tracked_anvil_click(bot, container_id, slot, button, click);
+            if self.combine_clicks.is_empty() {
+                self.recipe_wait_since = Some(std::time::Instant::now());
+            }
+            return false;
+        }
         let cur_lvl = self.current_level.load(Ordering::SeqCst);
         let server_cost = self.server_anvil_cost.load(Ordering::SeqCst);
 
@@ -671,54 +1023,44 @@ impl EnchanterManager {
         // If inputs exist and server cost > current level, return inputs to inventory and throw XP
         if (has_input0 || has_input1) && server_cost > 0 && server_cost < 40 && server_cost > cur_lvl {
             info!("Anvil inputs present but server cost ({server_cost}) > current level ({cur_lvl})! Returning inputs to inventory to throw XP...");
-            if has_input0 {
-                self.click_anvil(bot, container_id, 0, ClickType::QuickMove);
-                bot.wait_ticks(3).await;
-            }
-            if has_input1 {
-                self.click_anvil(bot, container_id, 1, ClickType::QuickMove);
-                bot.wait_ticks(3).await;
-            }
-            self.anvil_slots.remove(&0);
-            self.anvil_slots.remove(&1);
-            self.anvil_slots.remove(&2);
-
             self.close_anvil(bot, container_id);
-            bot.wait_ticks(2).await;
-            self.throw_exact_xp_bottles(bot, server_cost).await;
-            bot.wait_ticks(2).await;
-            Self::ensure_no_worn_armor(bot, &self.player_inventory).await;
-            bot.wait_ticks(2).await;
-            self.open_anvil(bot).await;
-            bot.wait_ticks(5).await;
+            self.xp_target = Some(server_cost);
             return false;
         }
 
+        // Cost and result can arrive in either order. Never clear valid inputs
+        // just because the repair-cost packet has not arrived yet.
+        if has_output2 && server_cost == 0 {
+            self.recipe_wait_since.get_or_insert_with(std::time::Instant::now);
+        }
+
         // If output slot 2 has an item and level suffices, collect it via QuickMove
-        if has_output2 && (server_cost == 0 || (server_cost < 40 && cur_lvl >= server_cost)) {
+        if has_output2 && server_cost > 0 && server_cost < 40 && cur_lvl >= server_cost {
             info!("Output slot #2 has an item and level suffices (Level {cur_lvl} >= Cost {server_cost}); collecting via QuickMove...");
-            self.click_anvil(bot, container_id, 2, ClickType::QuickMove);
-            bot.wait_ticks(6).await;
-            self.anvil_slots.remove(&0);
-            self.anvil_slots.remove(&1);
-            self.anvil_slots.remove(&2);
-            self.server_anvil_cost.store(0, Ordering::SeqCst);
+            self.send_tracked_anvil_click(bot, container_id, 2, 0, ClickType::QuickMove);
+            self.recipe_wait_since = None;
+            return false;
+        }
+
+        if let Some(since) = self.recipe_wait_since {
+            if since.elapsed() >= std::time::Duration::from_secs(3) {
+                warn!("Anvil recipe stalled; reopening to recover input items.");
+                self.failed_combine_attempts += 1;
+                if self.failed_combine_attempts >= 5 { bot.disconnect(); }
+                self.close_anvil(bot, container_id);
+            }
             return false;
         }
 
         // Clear any leftover inputs
         if has_input0 {
             info!("Input slot #0 has a leftover item; clearing it via QuickMove...");
-            self.click_anvil(bot, container_id, 0, ClickType::QuickMove);
-            bot.wait_ticks(3).await;
-            self.anvil_slots.remove(&0);
+            self.send_tracked_anvil_click(bot, container_id, 0, 0, ClickType::QuickMove);
             return false;
         }
         if has_input1 {
             info!("Input slot #1 has a leftover item; clearing it via QuickMove...");
-            self.click_anvil(bot, container_id, 1, ClickType::QuickMove);
-            bot.wait_ticks(3).await;
-            self.anvil_slots.remove(&1);
+            self.send_tracked_anvil_click(bot, container_id, 1, 0, ClickType::QuickMove);
             return false;
         }
 
@@ -732,7 +1074,9 @@ impl EnchanterManager {
                     self.close_anvil(bot, container_id);
                     return true;
                 } else {
-                    info!("Combine task not ready yet ({summary}). Waiting for inventory synchronization...");
+                    warn!("Current set cannot continue: missing armor or the next required book ({summary}). Returning to orders.");
+                    self.restock_needed = true;
+                    self.close_anvil(bot, container_id);
                     return false;
                 }
             }
@@ -748,18 +1092,7 @@ impl EnchanterManager {
                 task.armor_desc, task.enchant_name, task.required_level, cur_lvl, cur_prog * 100.0, needed_xp, bottles_to_throw
             );
             self.close_anvil(bot, container_id);
-            bot.wait_ticks(2).await;
-
-            self.throw_exact_xp_bottles(bot, task.required_level).await;
-            bot.wait_ticks(2).await;
-
-            // Ensure no armor was accidentally equipped
-            Self::ensure_no_worn_armor(bot, &self.player_inventory).await;
-            bot.wait_ticks(2).await;
-
-            info!("Re-opening Anvil to combine {} with {}...", task.armor_desc, task.enchant_name);
-            self.open_anvil(bot).await;
-            bot.wait_ticks(5).await;
+            self.xp_target = Some(task.required_level);
             return false;
         }
 
@@ -771,7 +1104,34 @@ impl EnchanterManager {
         false
     }
 
-    /// Combine an item and an enchanted book inside the anvil container.
+    /// Determine which hotbar buttons (0..=8) to use for placing armor and book into Anvil input slots.
+    /// In a 39-slot Anvil container, slots 30..=38 correspond to hotbar slots 0..=8.
+    pub fn determine_hotbar_buttons_for_combine(item_slot: i16, book_slot: i16) -> (u8, u8) {
+        match (item_slot, book_slot) {
+            (30..=38, 30..=38) => {
+                let a = (item_slot - 30) as u8;
+                let b = (book_slot - 30) as u8;
+                if a == b {
+                    (a, if a == 0 { 1 } else { 0 })
+                } else {
+                    (a, b)
+                }
+            }
+            (30..=38, _) => {
+                let a_btn = (item_slot - 30) as u8;
+                let b_btn = if a_btn == 0 { 1 } else { 0 };
+                (a_btn, b_btn)
+            }
+            (_, 30..=38) => {
+                let b_btn = (book_slot - 30) as u8;
+                let a_btn = if b_btn == 0 { 1 } else { 0 };
+                (a_btn, b_btn)
+            }
+            _ => (0u8, 1u8),
+        }
+    }
+
+    /// Combine an item and an enchanted book inside the anvil container using hotbar Swap into input slots.
     pub async fn combine_in_anvil(
         &mut self,
         bot: &Client,
@@ -780,70 +1140,84 @@ impl EnchanterManager {
         book_inventory_slot: i16,
     ) {
         self.server_anvil_cost.store(0, Ordering::SeqCst);
-        info!(
-            "Anvil Combine: Moving item from slot #{item_inventory_slot} and book from slot #{book_inventory_slot} into Anvil..."
-        );
-
-        // Put item into Slot 0
-        self.click_anvil(bot, container_id, item_inventory_slot, ClickType::Pickup);
-        bot.wait_ticks(3).await;
-        self.click_anvil(bot, container_id, 0, ClickType::Pickup);
-        bot.wait_ticks(3).await;
-
-        // Put book into Slot 1
-        self.click_anvil(bot, container_id, book_inventory_slot, ClickType::Pickup);
-        bot.wait_ticks(3).await;
-        self.click_anvil(bot, container_id, 1, ClickType::Pickup);
-        bot.wait_ticks(5).await; // Wait for server to calculate recipe and update slot 2
-
-        let server_cost = self.server_anvil_cost.load(Ordering::SeqCst);
-        let cur_lvl = self.current_level.load(Ordering::SeqCst);
-        if server_cost > 0 && server_cost < 40 {
-            info!("Server Anvil Cost confirmed: {server_cost} levels (Current Level: {cur_lvl})");
+        self.queue_anvil_combination(item_inventory_slot, book_inventory_slot);
+        if let Some((slot, button, click)) = self.next_combine_click() {
+            self.send_tracked_anvil_click(bot, container_id, slot, button, click);
         }
-
-        if server_cost > 0 && server_cost < 40 && server_cost > cur_lvl {
-            info!("Server cost ({server_cost}) exceeds current level ({cur_lvl})! Taking items back to throw more XP...");
-            self.click_anvil(bot, container_id, 0, ClickType::QuickMove);
-            bot.wait_ticks(3).await;
-            self.click_anvil(bot, container_id, 1, ClickType::QuickMove);
-            bot.wait_ticks(3).await;
-            self.anvil_slots.remove(&0);
-            self.anvil_slots.remove(&1);
-            self.anvil_slots.remove(&2);
-
-            self.close_anvil(bot, container_id);
-            bot.wait_ticks(2).await;
-            self.throw_exact_xp_bottles(bot, server_cost).await;
-            bot.wait_ticks(2).await;
-            Self::ensure_no_worn_armor(bot, &self.player_inventory).await;
-            bot.wait_ticks(2).await;
-            self.open_anvil(bot).await;
-            bot.wait_ticks(5).await;
-            return;
-        }
-
-        // Collect result from Slot 2
-        info!("Claiming combined enchanted item from Anvil output slot #2...");
-        self.click_anvil(bot, container_id, 2, ClickType::QuickMove);
-        bot.wait_ticks(6).await; // 6 ticks wait for SetExperience and inventory updates
-
-        self.anvil_slots.remove(&book_inventory_slot);
-        self.anvil_slots.remove(&0);
-        self.anvil_slots.remove(&1);
-        self.anvil_slots.remove(&2);
-        self.server_anvil_cost.store(0, Ordering::SeqCst);
-        info!("Anvil combine finished! Slot #2 collected, checking next combine...");
     }
 
-    /// Send a click packet to the open anvil container with atomic state_id sequencing.
-    pub fn click_anvil(&self, bot: &Client, container_id: i32, slot: i16, click_type: ClickType) {
-        let state_id = self.anvil_state_id.fetch_add(1, Ordering::SeqCst);
+    pub fn item_at_anvil_slot(&self, slot: i16) -> Option<ItemStack> {
+        self.anvil_slots.get(&slot).cloned()
+            .or_else(|| {
+                if (3..=38).contains(&slot) {
+                    self.player_inventory.get(&(slot - 3 + 9)).cloned()
+                } else {
+                    None
+                }
+            })
+    }
+
+    pub fn anvil_slots_match(&self, hotbar_slot: i16, inv_slot: i16) -> bool {
+        let Some(item_a) = self.item_at_anvil_slot(hotbar_slot) else { return false; };
+        let Some(item_b) = self.item_at_anvil_slot(inv_slot) else { return false; };
+        if matches!(item_a, ItemStack::Empty) || matches!(item_b, ItemStack::Empty) {
+            return false;
+        }
+        item_a == item_b
+    }
+
+    fn queue_anvil_combination(&mut self, item_inventory_slot: i16, book_inventory_slot: i16) {
+        let (armor_button, book_button) =
+            Self::determine_hotbar_buttons_for_combine(item_inventory_slot, book_inventory_slot);
+
+        let armor_already_staged = item_inventory_slot < 30
+            && self.anvil_slots_match(30 + armor_button as i16, item_inventory_slot);
+
+        if item_inventory_slot < 30 && !armor_already_staged {
+            self.combine_clicks.push_back((item_inventory_slot, armor_button, ClickType::Swap));
+        }
+
+        let book_already_staged = book_inventory_slot < 30
+            && self.anvil_slots_match(30 + book_button as i16, book_inventory_slot);
+
+        if book_inventory_slot < 30 && !book_already_staged {
+            self.combine_clicks.push_back((book_inventory_slot, book_button, ClickType::Swap));
+        }
+
+        self.combine_clicks.push_back((0, armor_button, ClickType::Swap));
+        self.combine_clicks.push_back((1, book_button, ClickType::Swap));
+    }
+
+    fn next_combine_click(&mut self) -> Option<(i16, u8, ClickType)> {
+        while let Some((slot, button, click)) = self.combine_clicks.pop_front() {
+            if click == ClickType::Swap && (3..30).contains(&slot)
+                && self.anvil_slots_match(30 + i16::from(button), slot) {
+                continue;
+            }
+            return Some((slot, button, click));
+        }
+        None
+    }
+
+    pub fn failure_limit_reached(&self) -> bool {
+        self.failed_combine_attempts >= 5
+    }
+
+    fn send_tracked_anvil_click(&mut self, bot: &Client, container_id: i32, slot: i16, button: u8, click: ClickType) {
+        let before = self.anvil_slots.get(&slot).cloned().unwrap_or(ItemStack::Empty);
+        let sent_state_id = self.anvil_state_id.load(Ordering::SeqCst);
+        self.click_anvil(bot, container_id, slot, button, click);
+        self.pending_click = Some((slot, before, std::time::Instant::now(), self.player_inventory.clone(), sent_state_id));
+    }
+
+    /// Send a click packet to the open anvil container with the latest server state_id.
+    pub fn click_anvil(&self, bot: &Client, container_id: i32, slot: i16, button_num: u8, click_type: ClickType) {
+        let state_id = self.anvil_state_id.load(Ordering::SeqCst);
         let packet = ServerboundContainerClick {
             container_id,
             state_id,
             slot_num: slot,
-            button_num: 0,
+            button_num,
             click_type,
             changed_slots: Default::default(),
             carried_item: HashedStack(None),
@@ -856,10 +1230,15 @@ impl EnchanterManager {
         info!("Closing Anvil GUI (container #{container_id})...");
         bot.write_packet(ServerboundContainerClose { container_id });
         self.anvil_container_id = None;
+        self.anvil_slots.clear();
+        self.combine_clicks.clear();
+        self.pending_click = None;
+        self.recipe_wait_since = None;
+        self.content_wait_since = None;
         self.server_anvil_cost.store(0, Ordering::SeqCst);
     }
 
-    fn swap_to_hotbar(bot: &Client, inv_slot: i16, hotbar_idx: u8) {
+    pub fn swap_to_hotbar(bot: &Client, inv_slot: i16, hotbar_idx: u8) {
         let packet = ServerboundContainerClick {
             container_id: 0,
             state_id: 0,
@@ -876,6 +1255,97 @@ impl EnchanterManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changed_or_empty_hotbar_still_requires_staging() {
+        use azalea_registry::builtin::ItemKind;
+        for target in [ItemStack::Empty, ItemStack::new(ItemKind::ExperienceBottle, 1)] {
+            let mut manager = EnchanterManager::new();
+            manager.anvil_slots.insert(20, ItemStack::new(ItemKind::EnchantedBook, 1));
+            manager.anvil_slots.insert(31, target);
+            manager.queue_anvil_combination(30, 20);
+            assert_eq!(manager.next_combine_click(), Some((20, 1, ClickType::Swap)));
+        }
+    }
+
+    #[test]
+    fn repeated_failed_combines_reach_worker_stop_limit() {
+        let mut manager = EnchanterManager::new();
+        manager.failed_combine_attempts = 4;
+        assert!(!manager.failure_limit_reached());
+        manager.failed_combine_attempts += 1;
+        assert!(manager.failure_limit_reached());
+        manager.reset_for_next_batch();
+        assert!(!manager.failure_limit_reached());
+    }
+
+    #[test]
+    fn identical_mending_book_in_hotbar_skips_staging_swap() {
+        use azalea_registry::builtin::ItemKind;
+        let mut manager = EnchanterManager::new();
+        let book = ItemStack::new(ItemKind::EnchantedBook, 1);
+        manager.anvil_slots.insert(20, book.clone());
+        manager.anvil_slots.insert(31, book);
+        manager.anvil_slots.insert(30, ItemStack::new(ItemKind::DiamondHelmet, 1));
+        manager.queue_anvil_combination(30, 20);
+        // Logged failure: staging #20 into hotbar #31 swaps identical books.
+        // Use the book already in #31 and proceed straight to the anvil inputs.
+        assert_eq!(manager.next_combine_click(), Some((0, 0, ClickType::Swap)));
+        assert_eq!(manager.next_combine_click(), Some((1, 1, ClickType::Swap)));
+        assert!(manager.next_combine_click().is_none());
+    }
+
+    #[test]
+    fn armor_already_in_hotbar_skips_staging_swap() {
+        use azalea_registry::builtin::ItemKind;
+        let mut manager = EnchanterManager::new();
+        let helmet = ItemStack::new(ItemKind::DiamondHelmet, 1);
+        let book = ItemStack::new(ItemKind::EnchantedBook, 1);
+        manager.anvil_slots.insert(15, helmet.clone());
+        manager.anvil_slots.insert(30, helmet);
+        manager.anvil_slots.insert(31, book);
+        manager.queue_anvil_combination(15, 31);
+        // Helmet is already in hotbar slot #30 (button 0), book is in #31 (button 1)
+        assert_eq!(manager.next_combine_click(), Some((0, 0, ClickType::Swap)));
+        assert_eq!(manager.next_combine_click(), Some((1, 1, ClickType::Swap)));
+        assert!(manager.next_combine_click().is_none());
+    }
+
+    #[test]
+    fn open_anvil_inventory_overrides_stale_player_cache() {
+        use azalea_registry::builtin::ItemKind;
+        let mut manager = EnchanterManager::new();
+        manager.player_inventory.insert(9, ItemStack::new(ItemKind::DiamondHelmet, 1));
+        assert_eq!(manager.armor_inventory_info(None).len(), 1);
+        manager.anvil_container_id = Some(7);
+        manager.anvil_slots.insert(3, ItemStack::Empty);
+        assert!(manager.armor_inventory_info(None).is_empty());
+        manager.anvil_slots.insert(4, ItemStack::new(ItemKind::DiamondChestplate, 1));
+        let items = manager.armor_inventory_info(None);
+        assert_eq!(items.len(), 1);
+        assert!(is_diamond_chestplate(&items[0]));
+    }
+
+    #[test]
+    fn opening_anvil_waits_for_matching_contents_and_rejects_late_snapshots() {
+        let mut manager = EnchanterManager::new();
+        manager.on_open_screen(7, "Anvil");
+        assert!(manager.has_pending_anvil_work());
+        manager.on_set_content(6, 1, &vec![ItemStack::Empty; 39]);
+        assert!(manager.has_pending_anvil_work());
+        assert_eq!(manager.anvil_container_id, Some(7));
+        manager.on_set_content(7, 1, &vec![ItemStack::Empty; 39]);
+        assert!(!manager.has_pending_anvil_work());
+    }
+
+    #[test]
+    fn pending_anvil_click_prevents_early_completion() {
+        let mut manager = EnchanterManager::new();
+        manager.pending_click = Some((2, ItemStack::Empty, std::time::Instant::now(), HashMap::new(), 0));
+        assert!(manager.has_pending_anvil_work());
+        manager.reset_for_next_batch();
+        assert!(!manager.has_pending_anvil_work());
+    }
 
     #[test]
     fn test_total_xp_formula() {
@@ -1028,5 +1498,37 @@ mod tests {
         let (all_done, summary) = manager.check_all_armor_enchanted_from_info(&[helm, chest, legs, boots]);
         assert!(all_done);
         assert_eq!(summary, "Helmet: MAXED, Chestplate: MAXED, Leggings: MAXED, Boots: MAXED");
+    }
+
+    #[test]
+    fn test_determine_hotbar_buttons_for_combine() {
+        // Both in main inventory (< 30): use hotbar button 0 and 1
+        assert_eq!(EnchanterManager::determine_hotbar_buttons_for_combine(3, 24), (0, 1));
+        assert_eq!(EnchanterManager::determine_hotbar_buttons_for_combine(5, 12), (0, 1));
+
+        // Armor in hotbar (slot 30 = hotbar button 0), book in main inventory
+        assert_eq!(EnchanterManager::determine_hotbar_buttons_for_combine(30, 15), (0, 1));
+        // Armor in hotbar (slot 31 = hotbar button 1), book in main inventory
+        assert_eq!(EnchanterManager::determine_hotbar_buttons_for_combine(31, 15), (1, 0));
+
+        // Book in hotbar (slot 30 = hotbar button 0), armor in main inventory
+        assert_eq!(EnchanterManager::determine_hotbar_buttons_for_combine(10, 30), (1, 0));
+        // Book in hotbar (slot 35 = hotbar button 5), armor in main inventory
+        assert_eq!(EnchanterManager::determine_hotbar_buttons_for_combine(10, 35), (0, 5));
+
+        // Both in hotbar: preserve their respective hotbar buttons
+        assert_eq!(EnchanterManager::determine_hotbar_buttons_for_combine(30, 31), (0, 1));
+        assert_eq!(EnchanterManager::determine_hotbar_buttons_for_combine(38, 32), (8, 2));
+    }
+
+    #[test]
+    fn test_click_type_throw() {
+        let _ = ClickType::Throw;
+        let _ = azalea::protocol::packets::game::s_player_action::ServerboundPlayerAction {
+            action: azalea::protocol::packets::game::s_player_action::Action::DropAllItems,
+            pos: BlockPos::default(),
+            direction: azalea::core::direction::Direction::Down,
+            seq: 0,
+        };
     }
 }

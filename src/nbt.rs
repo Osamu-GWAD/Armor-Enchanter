@@ -22,17 +22,21 @@ impl ItemInfo {
         let check_map = |map: &HashMap<String, u32>| {
             map.iter().any(|(k, &lvl)| {
                 let k_clean = k.to_lowercase();
-                let k_name = k_clean.strip_prefix("minecraft:").unwrap_or(&k_clean);
+                let is_blast = k_clean.contains("blast");
+                let is_fire = k_clean.contains("fire");
+                let is_proj = k_clean.contains("projectile") || k_clean.contains("proj");
+
                 let matches = if pattern == "protection" {
-                    k_name == "protection"
-                } else if pattern == "blast_protection" {
-                    k_name == "blast_protection" || k_name == "blastprotection" || k_name.contains("blast")
+                    k_clean.contains("protection") && !is_blast && !is_fire && !is_proj
+                } else if pattern == "blast_protection" || pattern == "blast protect" || pattern == "blast" {
+                    is_blast && (k_clean.contains("protect") || k_clean.contains("protection") || is_blast)
                 } else if pattern == "unbreaking" {
-                    k_name == "unbreaking" || k_name.contains("unbreaking")
+                    k_clean.contains("unbreaking")
                 } else if pattern == "mending" {
-                    k_name == "mending" || k_name.contains("mending")
+                    k_clean.contains("mending")
                 } else {
-                    k_name == pattern || k_name.contains(&pattern)
+                    let pat_clean = pattern.strip_prefix("minecraft:").unwrap_or(&pattern);
+                    k_clean.contains(pat_clean)
                 };
                 matches && lvl >= min_level
             })
@@ -42,36 +46,43 @@ impl ItemInfo {
             return true;
         }
 
-        // Also fallback to checking lore and custom name, as many SMP servers (like DonutSMP)
-        // store custom enchantments or formatted text in the lore / name!
+        // Also fallback to checking lore, custom name, and raw debug/components,
+        // as many SMP servers (like DonutSMP) store enchantments as formatted text in lore / name!
         let matches_text = |text: &str| {
             let t_lower = normalize_small_caps(&text.to_lowercase());
-            if pattern == "protection"
-                && (t_lower.contains("blast")
-                    || t_lower.contains("fire")
-                    || t_lower.contains("projectile"))
-            {
+            let is_blast = t_lower.contains("blast");
+            let is_fire = t_lower.contains("fire");
+            let is_proj = t_lower.contains("projectile") || t_lower.contains("proj");
+
+            let has_base = if pattern == "protection" {
+                t_lower.contains("protection") && !is_blast && !is_fire && !is_proj
+            } else if pattern == "blast_protection" || pattern == "blast protect" || pattern == "blast" {
+                t_lower.contains("blast")
+            } else if pattern == "unbreaking" {
+                t_lower.contains("unbreaking")
+            } else if pattern == "mending" {
+                t_lower.contains("mending")
+            } else {
+                let pat_clean = pattern.strip_prefix("minecraft:").unwrap_or(&pattern).replace('_', " ");
+                t_lower.contains(&pattern) || t_lower.contains(&pat_clean)
+            };
+
+            if !has_base {
                 return false;
             }
-            if t_lower.contains(&pattern) {
-                if min_level <= 1 {
-                    return true;
-                }
-                let roman_lower = match min_level {
-                    2 => "ii",
-                    3 => "iii",
-                    4 => "iv",
-                    5 => "v",
-                    _ => "",
-                };
-                if (!roman_lower.is_empty() && t_lower.contains(roman_lower))
-                    || t_lower.contains(&format!(" {min_level}"))
-                    || t_lower.contains(&min_level.to_string())
-                {
-                    return true;
-                }
+
+            if min_level <= 1 {
+                return true;
             }
-            false
+
+            let roman = match min_level {
+                2 => &["ii", "2", "ⅱ"][..],
+                3 => &["iii", "3", "ⅲ"][..],
+                4 => &["iv", "4", "ⅳ"][..],
+                5 => &["v", "5", "ⅴ"][..],
+                _ => &[][..],
+            };
+            roman.iter().any(|&r| t_lower.contains(r))
         };
 
         if let Some(ref name) = self.custom_name {
@@ -148,7 +159,20 @@ pub fn inspect_item_with_bot(item: &ItemStack, bot: Option<&Client>) -> Option<I
             } else {
                 format!("{ench:?}").to_lowercase()
             };
+            let plain_name = ench_name.strip_prefix("minecraft:").unwrap_or(&ench_name).to_string();
+            info.stored_enchantments.insert(plain_name, level as u32);
             info.stored_enchantments.insert(ench_name, level as u32);
+
+            let ench_lower = format!("{ench:?}").to_lowercase();
+            if ench_lower.contains("mending") {
+                info.stored_enchantments.insert("mending".to_string(), level as u32);
+            } else if ench_lower.contains("unbreaking") {
+                info.stored_enchantments.insert("unbreaking".to_string(), level as u32);
+            } else if ench_lower.contains("blast_protection") || ench_lower.contains("blast") {
+                info.stored_enchantments.insert("blast_protection".to_string(), level as u32);
+            } else if ench_lower.contains("protection") {
+                info.stored_enchantments.insert("protection".to_string(), level as u32);
+            }
         }
     }
     if let Some(enchs) = data.component_patch.get::<Enchantments>() {
@@ -162,7 +186,20 @@ pub fn inspect_item_with_bot(item: &ItemStack, bot: Option<&Client>) -> Option<I
             } else {
                 format!("{ench:?}").to_lowercase()
             };
+            let plain_name = ench_name.strip_prefix("minecraft:").unwrap_or(&ench_name).to_string();
+            info.enchantments.insert(plain_name, level as u32);
             info.enchantments.insert(ench_name, level as u32);
+
+            let ench_lower = format!("{ench:?}").to_lowercase();
+            if ench_lower.contains("mending") {
+                info.enchantments.insert("mending".to_string(), level as u32);
+            } else if ench_lower.contains("unbreaking") {
+                info.enchantments.insert("unbreaking".to_string(), level as u32);
+            } else if ench_lower.contains("blast_protection") || ench_lower.contains("blast") {
+                info.enchantments.insert("blast_protection".to_string(), level as u32);
+            } else if ench_lower.contains("protection") {
+                info.enchantments.insert("protection".to_string(), level as u32);
+            }
         }
     }
     if let Some(cd) = data.component_patch.get::<CustomData>() {
@@ -234,7 +271,18 @@ fn extract_from_components(val: &Value, info: &mut ItemInfo) {
 }
 
 pub fn normalize_small_caps(s: &str) -> String {
-    s.chars()
+    let replaced = s
+        .replace('Ⅰ', "i")
+        .replace('Ⅱ', "ii")
+        .replace('Ⅲ', "iii")
+        .replace('Ⅳ', "iv")
+        .replace('Ⅴ', "v")
+        .replace('ⅰ', "i")
+        .replace('ⅱ', "ii")
+        .replace('ⅲ', "iii")
+        .replace('ⅳ', "iv")
+        .replace('ⅴ', "v");
+    replaced.chars()
         .map(|c| match c {
             'ᴀ' => 'a',
             'ʙ' => 'b',
@@ -381,23 +429,39 @@ fn parse_enchantment_map(val: &Value, target: &mut HashMap<String, u32>) {
 // ---------------------------------------------------------
 
 pub fn is_unbreaking_3(info: &ItemInfo) -> bool {
-    (info.kind.contains("EnchantedBook") || info.kind.contains("Book"))
+    let is_book = info.kind.contains("EnchantedBook")
+        || info.kind.contains("Book")
+        || info.custom_name.as_deref().unwrap_or("").to_lowercase().contains("book")
+        || info.lore.iter().any(|l| l.to_lowercase().contains("book"));
+    (is_book || info.kind.to_lowercase().contains("paper"))
         && info.has_enchantment("unbreaking", 3)
 }
 
 pub fn is_mending(info: &ItemInfo) -> bool {
-    (info.kind.contains("EnchantedBook") || info.kind.contains("Book"))
+    let is_book = info.kind.contains("EnchantedBook")
+        || info.kind.contains("Book")
+        || info.custom_name.as_deref().unwrap_or("").to_lowercase().contains("book")
+        || info.lore.iter().any(|l| l.to_lowercase().contains("book"));
+    (is_book || info.kind.to_lowercase().contains("paper"))
         && info.has_enchantment("mending", 1)
 }
 
 pub fn is_protection_4(info: &ItemInfo) -> bool {
-    (info.kind.contains("EnchantedBook") || info.kind.contains("Book"))
+    let is_book = info.kind.contains("EnchantedBook")
+        || info.kind.contains("Book")
+        || info.custom_name.as_deref().unwrap_or("").to_lowercase().contains("book")
+        || info.lore.iter().any(|l| l.to_lowercase().contains("book"));
+    (is_book || info.kind.to_lowercase().contains("paper"))
         && !info.has_enchantment("blast_protection", 1)
         && info.has_enchantment("protection", 4)
 }
 
 pub fn is_blast_protection_4(info: &ItemInfo) -> bool {
-    (info.kind.contains("EnchantedBook") || info.kind.contains("Book"))
+    let is_book = info.kind.contains("EnchantedBook")
+        || info.kind.contains("Book")
+        || info.custom_name.as_deref().unwrap_or("").to_lowercase().contains("book")
+        || info.lore.iter().any(|l| l.to_lowercase().contains("book"));
+    (is_book || info.kind.to_lowercase().contains("paper"))
         && (info.has_enchantment("blast_protection", 4) || info.has_enchantment("blast protect", 4))
 }
 
@@ -525,11 +589,19 @@ pub fn is_confirm_button(info: &ItemInfo) -> bool {
         }
     }
 
-    // For chests (used in /order -> order submenu as "Collect Items"), only match if name indicates collect/claim
+    // For chests (used in /order -> order submenu as "Collect Items"), match if name or lore indicates collect/claim
     if k.contains("chest") {
         if let Some(ref name) = info.custom_name {
             let nl = normalize_small_caps(&name.to_lowercase());
-            return nl.contains("collect") || nl.contains("claim") || nl.contains("retrieve");
+            if nl.contains("collect") || nl.contains("claim") || nl.contains("retrieve") || nl.contains("delivery") || nl.contains("item") {
+                return true;
+            }
+        }
+        if info.lore.iter().any(|l| {
+            let ll = normalize_small_caps(&l.to_lowercase());
+            ll.contains("collect") || ll.contains("claim") || ll.contains("retrieve")
+        }) {
+            return true;
         }
         return false;
     }
@@ -541,6 +613,8 @@ pub fn is_confirm_button(info: &ItemInfo) -> bool {
             || ll.contains("click to fulfill")
             || ll.contains("click to collect")
             || ll.contains("click to claim")
+            || ll.contains("collect item")
+            || ll.contains("claim item")
         {
             return true;
         }
@@ -656,6 +730,67 @@ mod tests {
         };
         assert!(is_diamond_boots(&boots));
         assert!(is_diamond_armor(&boots));
+    }
+
+    #[test]
+    fn test_inspect_real_itemstack() {
+        let patch = azalea_inventory::DataComponentPatch::default();
+        let item = ItemStack::Present(azalea::inventory::ItemStackData {
+            kind: azalea_registry::builtin::ItemKind::DiamondHelmet,
+            count: 1,
+            component_patch: patch,
+        });
+        let info = inspect_item(&item).unwrap();
+        assert!(is_diamond_helmet(&info));
+    }
+
+    #[test]
+    fn test_protection_4_with_identifier_debug_format() {
+        let mut info = ItemInfo {
+            kind: "EnchantedBook".to_string(),
+            count: 1,
+            ..Default::default()
+        };
+        // Simulated Identifier debug representation
+        info.stored_enchantments.insert("identifier { namespace: \"minecraft\", path: \"protection\" }".to_string(), 4);
+        assert!(is_protection_4(&info), "Should recognize Protection IV even from verbose Debug identifier string");
+        assert!(!is_blast_protection_4(&info), "Protection IV must not match Blast Protection");
+
+        let mut blast_info = ItemInfo {
+            kind: "EnchantedBook".to_string(),
+            count: 1,
+            ..Default::default()
+        };
+        blast_info.stored_enchantments.insert("identifier { namespace: \"minecraft\", path: \"blast_protection\" }".to_string(), 4);
+        assert!(is_blast_protection_4(&blast_info), "Should recognize Blast Protection IV from Debug identifier string");
+        assert!(!is_protection_4(&blast_info), "Blast Protection IV must not match normal Protection");
+    }
+
+    #[test]
+    fn test_lore_and_custom_name_with_spaces_and_unicode() {
+        let book_with_space = ItemInfo {
+            kind: "EnchantedBook".to_string(),
+            count: 1,
+            lore: vec!["Blast Protection IV".to_string()],
+            ..Default::default()
+        };
+        assert!(is_blast_protection_4(&book_with_space), "Should match Blast Protection with spaces");
+
+        let book_with_num = ItemInfo {
+            kind: "Book".to_string(),
+            count: 1,
+            custom_name: Some("Protection 4 Book".to_string()),
+            ..Default::default()
+        };
+        assert!(is_protection_4(&book_with_num), "Should match Protection 4 with Arabic digit");
+
+        let book_with_unicode = ItemInfo {
+            kind: "Book".to_string(),
+            count: 1,
+            lore: vec!["Unbreaking Ⅲ".to_string()],
+            ..Default::default()
+        };
+        assert!(is_unbreaking_3(&book_with_unicode), "Should match Unbreaking III with Unicode Roman numeral");
     }
 }
 
