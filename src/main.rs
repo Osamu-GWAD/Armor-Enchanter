@@ -7,13 +7,14 @@ pub mod nbt;
 pub mod webhook;
 mod logging;
 mod tick_diagnostics;
+mod drops;
 
 use azalea::app::PluginGroup;
 use azalea::prelude::*;
 use azalea::protocol::packets::game::{ClientboundGamePacket, ServerboundContainerClose};
 use azalea::{Client, Event};
 use clap::Parser;
-use enchanter::{parse_throw_speed, smooth_look, swing_arm, EnchanterManager};
+use enchanter::{parse_throw_speed, smooth_look, EnchanterManager};
 use gui::{GuiManager, OrderWorkflowState, WithdrawalPhase, WithdrawalQuota};
 use nbt::{inspect_item_with_bot, is_anvil};
 use std::sync::{Arc, OnceLock};
@@ -285,9 +286,14 @@ async fn handle(bot: Client, event: Event, state: BotState) -> Result<(), anyhow
                         gui.next_drop > 0 || gui.pending_drop.is_some()
                             || gui.count_completed_max_sets(Some(&bot_clone)) > 0
                     };
-                    if resume_drop && !drop_enchanted_armor_in_hopper(&bot_clone, &state_clone).await {
-                        bot_clone.disconnect();
-                        return;
+                    if resume_drop {
+                        info!("Attempting to resume dropping completed enchanted armor into hopper...");
+                        if !drop_enchanted_armor_in_hopper(&bot_clone, &state_clone).await {
+                            warn!("Could not complete armor drop on startup. Resetting pending drop state to allow workflow to continue...");
+                            let mut gui = state_clone.gui.lock().await;
+                            gui.next_drop = 0;
+                            gui.pending_drop = None;
+                        }
                     }
 
                     // Reset and sync inventory state (no clean_inventory)
@@ -873,17 +879,17 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
                     break;
                 }
                 if ench.restock_needed { break; }
-                let discard_slot = ench.book_to_discard.take();
+                let discard_item = ench.book_to_discard.take();
                 let xp_target = ench.xp_target.take();
                 drop(ench);
 
-                if let Some(slot) = discard_slot {
-                    info!("Discarding high XP cost book from slot #{slot} into hopper...");
-                    let dropped = drop_rejected_book_in_hopper(&bot_ench, &state_clone, slot).await;
+                if let Some(ref rejected_book) = discard_item {
+                    info!("Discarding high XP cost book into hopper...");
+                    let dropped = drop_rejected_book_in_hopper(&bot_ench, &state_clone, rejected_book).await;
                     if dropped {
                         info!("Successfully discarded high-cost book into hopper.");
                     } else {
-                        warn!("Failed to confirm discarded book left slot #{slot}.");
+                        warn!("Failed to confirm discarded book left inventory.");
                     }
                     // Check if another book for this armor piece is already available in inventory
                     let has_another_book = {
@@ -1021,115 +1027,133 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
     });
 }
 
-/// Drop a rejected high-cost enchanted book into the nearest hopper within 2 blocks.
-async fn drop_rejected_book_in_hopper(bot: &Client, state: &BotState, slot: i16) -> bool {
-    use azalea::inventory::operations::ClickType;
-    use azalea::protocol::packets::game::s_container_click::{HashedStack, ServerboundContainerClick};
-
-    {
-        let mut gui = state.gui.lock().await;
-        gui.close_current_gui(bot);
-    }
-
-    let Some(hopper_pos) = EnchanterManager::find_nearby_hopper(bot) else {
-        error!("Cannot drop rejected book: no hopper within 2 blocks!");
-        return false;
+/// Stage only an exact, server-observed item, then use the normal selected-hand Q action.
+/// Success means the request was sent; the caller must still confirm the inventory decrease.
+async fn drop_one_inventory_item(
+    bot: &Client, state: &BotState, slot: i16, expected: &azalea::inventory::ItemStack,
+) -> bool {
+    use azalea::entity::inventory::Inventory;
+    use azalea::inventory::{ItemStack, operations::ClickType};
+    use azalea::protocol::packets::game::{
+        s_container_click::{HashedStack, ServerboundContainerClick},
+        s_player_action::{Action, ServerboundPlayerAction},
+        ServerboundSetCarriedItem,
     };
 
+    let Some(active_menu) = bot.get_component::<Inventory>().map(|inventory| inventory.id) else { return false; };
+    if active_menu != 0 {
+        drops::close_menu(bot, active_menu);
+        wait_for_inventory_update(state, std::time::Duration::from_millis(250)).await;
+    }
+    let cursor_empty = bot.get_component::<Inventory>()
+        .is_some_and(|inventory| inventory.carried == ItemStack::Empty);
+    if !*state.spawned.lock().await || !cursor_empty {
+        warn!("Cannot drop while disconnected or carrying an item on the cursor.");
+        return false;
+    }
+    let stage = {
+        let gui = state.gui.lock().await;
+        let Some(stage) = drops::DropStage::new(&gui.player_inventory, slot, expected) else {
+            warn!("Drop source #{slot} changed before staging; no drop sent.");
+            return false;
+        };
+        if stage.needs_swap() {
+            bot.write_packet(ServerboundContainerClick {
+                container_id: 0,
+                state_id: gui.player_state_id,
+                slot_num: stage.source,
+                button_num: (stage.hotbar - 36) as u8,
+                click_type: ClickType::Swap,
+                // Request authoritative corrections rather than changing our cache optimistically.
+                changed_slots: Default::default(),
+                carried_item: HashedStack(None),
+            });
+        }
+        stage
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if !*state.spawned.lock().await { return false; }
+        if stage.ready(&state.gui.lock().await.player_inventory) { break; }
+        if std::time::Instant::now() >= deadline {
+            warn!("Drop staging from #{} to #{} was not confirmed; no drop sent.", stage.source, stage.hotbar);
+            return false;
+        }
+        wait_for_inventory_update(state, std::time::Duration::from_millis(100)).await;
+    }
+    let selected = (stage.hotbar - 36) as u8;
+    bot.set_selected_hotbar_slot(selected);
+    let gui = state.gui.lock().await;
+    let can_drop = bot.get_component::<Inventory>()
+        .is_some_and(|inventory| inventory.id == 0 && inventory.carried == ItemStack::Empty);
+    if !stage.ready(&gui.player_inventory) || !can_drop {
+        warn!("Inventory changed before drop; no drop sent.");
+        return false;
+    }
+    // Explicitly queue selection before Q, without depending on the next GameTick.
+    bot.write_packet(ServerboundSetCarriedItem { slot: selected as u16 });
+    bot.write_packet(ServerboundPlayerAction {
+        action: Action::DropItem,
+        pos: azalea::BlockPos::new(0, 0, 0),
+        direction: azalea::core::direction::Direction::Down,
+        seq: 0,
+    });
+    // Servers can accept Q without echoing its predicted slot removal. Queue
+    // a no-op refresh AFTER Q on the same connection, and confirm only from
+    // the resulting server inventory rather than deleting our cached item.
+    drops::request_inventory_refresh(bot, selected);
+    info!("Sent single-item drop from verified hotbar slot #{}; requested server inventory refresh.", stage.hotbar);
+    true
+}
+
+/// Discard only the exact book rejected by the anvil, after the server returns it.
+async fn drop_rejected_book_in_hopper(
+    bot: &Client, state: &BotState, expected: &azalea::inventory::ItemStack,
+) -> bool {
+    use azalea::inventory::ItemStack;
+    use azalea_registry::builtin::ItemKind;
+    if !matches!(expected, ItemStack::Present(data) if data.count == 1 && data.kind == ItemKind::EnchantedBook) {
+        error!("Rejected anvil input is not a single enchanted book; refusing to discard it.");
+        return false;
+    }
+    state.gui.lock().await.close_current_gui(bot);
+    let Some(hopper_pos) = EnchanterManager::find_nearby_hopper(bot) else {
+        error!("Cannot drop rejected book: no hopper within reach (4.5 blocks)!");
+        return false;
+    };
     let pos = bot.position();
     let dx = hopper_pos.x as f64 + 0.5 - pos.x;
     let dz = hopper_pos.z as f64 + 0.5 - pos.z;
     let dy = hopper_pos.y as f64 + 0.8 - (pos.y + 1.62);
-    smooth_look(
-        bot,
-        (-dx).atan2(dz).to_degrees() as f32,
-        (-dy).atan2((dx * dx + dz * dz).sqrt()).to_degrees() as f32,
-    )
-    .await;
-
-    let gui = state.gui.lock().await;
-
-    // Resolve which slot to drop: check the requested slot first, or fallback to any book
-    let target_slot = if let Some(info) = gui.player_inventory.get(&slot).and_then(|i| crate::nbt::inspect_item_with_bot(i, Some(bot))) {
-        if info.kind.to_lowercase().contains("book") {
-            Some(slot)
-        } else {
-            None
+    smooth_look(bot, (-dx).atan2(dz).to_degrees() as f32,
+        (-dy).atan2((dx * dx + dz * dz).sqrt()).to_degrees() as f32).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let (slot, before) = loop {
+        if !*state.spawned.lock().await { return false; }
+        {
+            let gui = state.gui.lock().await;
+            let matching: Vec<_> = (9..=44).filter(|slot| gui.player_inventory.get(slot) == Some(expected)).collect();
+            if let Some(&slot) = matching.first() { break (slot, matching.len()); }
         }
-    } else {
-        // Fallback: search hotbar and main inventory (9..=44) for a book
-        (9..=44).find(|&s| {
-            gui.player_inventory.get(&s).and_then(|i| crate::nbt::inspect_item_with_bot(i, Some(bot)))
-                .map(|info| info.kind.to_lowercase().contains("book"))
-                .unwrap_or(false)
-        })
-    };
-
-    let Some(drop_slot) = target_slot else {
-        error!("DROP SAFETY VIOLATION: Could not find any valid enchanted book to drop into hopper!");
-        return false;
-    };
-
-    let target_item = gui.player_inventory.get(&drop_slot);
-    let inspected = target_item.and_then(|i| crate::nbt::inspect_item_with_bot(i, Some(bot)));
-    let is_valid_book_drop = match inspected {
-        Some(ref info) => {
-            if crate::nbt::is_xp_bottle(info) {
-                error!("DROP SAFETY VIOLATION: Slot #{drop_slot} contains XP bottles! REFUSING to drop into hopper!");
-                false
-            } else if crate::nbt::is_anvil(info) {
-                error!("DROP SAFETY VIOLATION: Slot #{drop_slot} contains an ANVIL! REFUSING to drop into hopper!");
-                false
-            } else if crate::nbt::is_diamond_armor(info) {
-                error!("DROP SAFETY VIOLATION: Slot #{drop_slot} contains DIAMOND ARMOR! REFUSING to drop into hopper!");
-                false
-            } else if info.kind.to_lowercase().contains("book") {
-                true
-            } else {
-                error!("DROP SAFETY VIOLATION: Slot #{drop_slot} is not a book ({})! REFUSING to drop into hopper!", info.kind);
-                false
-            }
+        if std::time::Instant::now() >= deadline {
+            warn!("The rejected book was not returned to inventory; refusing to substitute another book.");
+            return false;
         }
-        None => {
-            error!("DROP SAFETY VIOLATION: Slot #{drop_slot} is empty or uninspectable! REFUSING TO DROP INTO HOPPER!");
-            false
-        }
+        wait_for_inventory_update(state, std::time::Duration::from_millis(100)).await;
     };
-
-    if !is_valid_book_drop {
-        return false;
-    }
-
-    info!("Throwing rejected book from slot #{drop_slot} into hopper...");
-    bot.write_packet(ServerboundContainerClick {
-        container_id: 0,
-        state_id: gui.player_state_id,
-        slot_num: drop_slot,
-        button_num: 0, // exactly one item
-        click_type: ClickType::Throw,
-        changed_slots: Default::default(),
-        carried_item: HashedStack(None),
-    });
-    drop(gui);
-    swing_arm(bot);
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    if !drop_one_inventory_item(bot, state, slot, expected).await { return false; }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         wait_for_inventory_update(state, std::time::Duration::from_millis(100)).await;
         if !*state.spawned.lock().await { return false; }
-        let mut gui = state.gui.lock().await;
-        let item_now = gui.player_inventory.get(&drop_slot);
-        let inspected_now = item_now.and_then(|i| crate::nbt::inspect_item_with_bot(i, Some(bot)));
-        let is_cleared = inspected_now.is_none() || !inspected_now.as_ref().unwrap().kind.to_lowercase().contains("book");
-        if is_cleared {
-            info!("Confirmed rejected book left slot #{drop_slot} into the hopper.");
-            gui.sync_collected_from_inventory(Some(bot));
-            let mut ench = state.enchanter.lock().await;
-            ench.player_inventory = gui.player_inventory.clone();
+        let gui = state.gui.lock().await;
+        let remaining = (9..=44).filter(|slot| gui.player_inventory.get(slot) == Some(expected)).count();
+        if armor::drop_status(before, remaining) == armor::DropStatus::Confirmed {
+            info!("Server confirmed the rejected book left the player inventory.");
             return true;
         }
         if std::time::Instant::now() >= deadline {
-            warn!("Rejected book drop on slot #{drop_slot} was not acknowledged in 3 seconds.");
+            warn!("Rejected book drop was not confirmed (before={before}, remaining={remaining}).");
             return false;
         }
     }
@@ -1138,9 +1162,6 @@ async fn drop_rejected_book_in_hopper(bot: &Client, state: &BotState, slot: i16)
 /// Drop exactly one set in armor order, using server inventory updates as acknowledgement.
 /// The cursor and pending count survive automatic reconnects in SESSION_GUI.
 async fn drop_enchanted_armor_in_hopper(bot: &Client, state: &BotState) -> bool {
-    use azalea::inventory::operations::ClickType;
-    use azalea::protocol::packets::game::s_container_click::{HashedStack, ServerboundContainerClick};
-
     {
         let mut gui = state.gui.lock().await;
         gui.close_current_gui(bot);
@@ -1148,7 +1169,7 @@ async fn drop_enchanted_armor_in_hopper(bot: &Client, state: &BotState) -> bool 
     }
 
     let Some(hopper_pos) = EnchanterManager::find_nearby_hopper(bot) else {
-        error!("No hopper within 2 blocks. Keeping this set until a hopper is available.");
+        error!("No hopper within reach (4.5 blocks). Keeping this set until a hopper is available.");
         return false;
     };
     let pos = bot.position();
@@ -1192,7 +1213,9 @@ async fn drop_enchanted_armor_in_hopper(bot: &Client, state: &BotState) -> bool 
         }
         let kind = gui.next_drop;
         let Some(plan) = armor::drop_plan(&items, kind) else {
-            warn!("Remaining set is incomplete; refusing to skip {}.", armor::TYPES[kind]);
+            warn!("Remaining set is incomplete (missing complete {}); resetting drop sequence to allow workflow to continue.", armor::TYPES[kind]);
+            gui.next_drop = 0;
+            gui.pending_drop = None;
             return false;
         };
         let slot = plan[0];
@@ -1243,21 +1266,11 @@ async fn drop_enchanted_armor_in_hopper(bot: &Client, state: &BotState) -> bool 
         }
 
         let before = count_type(kind);
+        let expected = gui.player_inventory[&slot].clone();
         gui.pending_drop = Some((kind, before));
-        // Throw directly from the inventory slot. Hotbar swaps would invalidate
-        // later slots and can drop a different item when a swap is rejected.
-        bot.write_packet(ServerboundContainerClick {
-            container_id: 0,
-            state_id: gui.player_state_id,
-            slot_num: slot,
-            button_num: 0, // exactly one item
-            click_type: ClickType::Throw,
-            changed_slots: Default::default(),
-            carried_item: HashedStack(None),
-        });
         drop(gui);
-        swing_arm(bot);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        if !drop_one_inventory_item(bot, state, slot, &expected).await { return false; }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             wait_for_inventory_update(state, std::time::Duration::from_millis(100)).await;
             if !*state.spawned.lock().await { return false; }
@@ -1274,7 +1287,7 @@ async fn drop_enchanted_armor_in_hopper(bot: &Client, state: &BotState) -> bool 
                 break;
             }
             if std::time::Instant::now() >= deadline {
-                warn!("{} drop was not acknowledged. Retaining pending drop for reconnect reconciliation.", armor::TYPES[kind]);
+                warn!("{} drop was not acknowledged (before={before}, remaining={remaining}). Retaining pending drop for reconnect reconciliation.", armor::TYPES[kind]);
                 return false;
             }
         }
@@ -1616,8 +1629,14 @@ async fn main() -> Result<(), anyhow::Error> {
 
 
 #[cfg(test)]
-mod workflow_tests {
+pub(crate) mod workflow_tests {
     use super::*;
+
+    pub(crate) fn local_client() -> Client {
+        let mut world = azalea::ecs::world::World::new();
+        let entity = world.spawn(azalea::entity::inventory::Inventory::default()).id();
+        Client::new(entity, Arc::new(world.into()))
+    }
 
     #[tokio::test]
     async fn inventory_updates_wake_worker_without_waiting_for_poll_timeout() {

@@ -113,6 +113,7 @@ fn finish_update(mut timings: ResMut<TickTimings>) {
             updates = report.updates,
             max_update_ms = report.max_update_ms as u64,
             max_tick_gap_ms = report.max_tick_gap_ms as u64,
+            suppressed_chunk_warnings = crate::logging::take_suppressed_chunk_warnings(),
             "Local scheduler timing (last 30s)"
         );
     }

@@ -11,14 +11,13 @@ use azalea::protocol::packets::game::s_container_click::{HashedStack, Serverboun
 use azalea::protocol::packets::game::s_interact::InteractionHand;
 use azalea::protocol::packets::game::s_player_action::{Action, ServerboundPlayerAction};
 use azalea::protocol::packets::game::s_swing::ServerboundSwing;
-use azalea::protocol::packets::game::ServerboundContainerClose;
 use azalea::BlockPos;
 use azalea::Client;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Experience points required to advance from Level L to Level L + 1 in Minecraft Java Edition.
 pub fn xp_to_next_level(level: u32) -> u32 {
@@ -251,7 +250,7 @@ pub struct EnchanterManager {
     pub throw_speed_ticks: u32,
     pub strict_calculation: bool,
     pub active_combine_task: Option<CombineTask>,
-    pub book_to_discard: Option<i16>,
+    pub book_to_discard: Option<ItemStack>,
     pub last_staged_buttons: Option<(u8, u8)>,
 }
 
@@ -579,7 +578,7 @@ pub fn find_nearby_anvil(bot: &Client) -> Option<BlockPos> {
     candidates.first().map(|(_, pos)| *pos)
 }
 
-/// Scans nearby blocks around the bot to find the nearest hopper within 2 blocks of the bot.
+/// Scans nearby blocks around the bot to find the nearest hopper within reach (up to 4.5 blocks).
 pub fn find_nearby_hopper(bot: &Client) -> Option<BlockPos> {
     let p = bot.position();
     let bx = p.x.floor() as i32;
@@ -592,10 +591,10 @@ pub fn find_nearby_hopper(bot: &Client) -> Option<BlockPos> {
         let w = bot.world();
         let world = w.read();
 
-        // Search horizontal radius +-2, vertical -2..=2 (within 2 blocks of the bot)
-        for dx in -2..=2 {
-            for dz in -2..=2 {
-                for dy in -2..=2 {
+        // Search horizontal radius +-4, vertical -3..=2 (within standard player reach)
+        for dx in -4..=4 {
+            for dz in -4..=4 {
+                for dy in -3..=2 {
                     let pos = BlockPos::new(bx + dx, by + dy, bz + dz);
                     if let Some(state) = world.get_block_state(pos) {
                         let s_str = format!("{state:?}").to_lowercase();
@@ -605,7 +604,7 @@ pub fn find_nearby_hopper(bot: &Client) -> Option<BlockPos> {
                             let cz = pos.z as f64 + 0.5;
 
                             let dist = ((cx - p.x).powi(2) + (cy - p.y).powi(2) + (cz - p.z).powi(2)).sqrt();
-                            if dist <= 2.85 {
+                            if dist <= 4.5 {
                                 candidates.push((dist, pos));
                             }
                         }
@@ -616,7 +615,12 @@ pub fn find_nearby_hopper(bot: &Client) -> Option<BlockPos> {
     }
 
     candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    candidates.first().map(|(_, pos)| *pos)
+    if let Some((dist, pos)) = candidates.first() {
+        debug!("Nearest hopper found at {:?} (distance: {:.2})", pos, dist);
+        Some(*pos)
+    } else {
+        None
+    }
 }
 
 /// Finds the best ground position and target anvil position to place a new anvil,
@@ -1411,8 +1415,14 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
         // When both inputs are present in the anvil, validate the server repair cost
         if has_input0 && has_input1 {
             if server_cost == 0 {
-                // Cost has not arrived yet from server; wait
-                self.recipe_wait_since.get_or_insert_with(std::time::Instant::now);
+                // Missing/invalid recipes must not bypass the recipe watchdog.
+                let since = *self.recipe_wait_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= std::time::Duration::from_secs(3) {
+                    warn!("Anvil inputs received but repair cost is missing; reopening for a fresh recipe.");
+                    self.failed_combine_attempts += 1;
+                    if self.failed_combine_attempts >= 5 { bot.disconnect(); }
+                    self.close_anvil(bot, container_id);
+                }
                 return false;
             }
 
@@ -1436,13 +1446,11 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
                     self.active_combine_task.as_ref().map(|t| t.armor_desc.as_str()).unwrap_or("Armor"),
                     self.active_combine_task.as_ref().map(|t| t.enchant_name).unwrap_or("Book"),
                 );
-                let (armor_button, book_button) = self.last_staged_buttons.unwrap_or((0, 1));
-                // Eject book from slot 1 back to hotbar slot (36 + book_button)
-                self.click_anvil(bot, container_id, 1, book_button, ClickType::Swap);
-                // Eject armor from slot 0 back to hotbar slot (36 + armor_button)
-                self.click_anvil(bot, container_id, 0, armor_button, ClickType::Swap);
+                // Closing returns the inputs. Do not issue two unacknowledged
+                // swaps or guess where the server will put the rejected book.
+                let rejected = self.anvil_slots.get(&1).cloned();
                 self.close_anvil(bot, container_id);
-                self.book_to_discard = Some(36 + book_button as i16);
+                self.book_to_discard = rejected;
                 self.active_combine_task = None;
                 return false;
             }
@@ -1466,7 +1474,7 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
         }
 
         // Cost and result can arrive in either order. If output slot 2 has an item and level suffices
-        if has_output2 && server_cost > 0 && cur_lvl >= server_cost {
+        if has_output2 && server_cost > 0 && server_cost < 40 && cur_lvl >= server_cost {
             let expected_cost = self.active_combine_task.as_ref().map(|t| t.required_level).unwrap_or(40);
             if server_cost <= expected_cost {
                 info!("Output slot #2 ready and level suffices (Level {cur_lvl} >= Cost {server_cost} <= Expected {expected_cost}); collecting via QuickMove...");
@@ -1695,7 +1703,7 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
     /// Close the anvil container.
     pub fn close_anvil(&mut self, bot: &Client, container_id: i32) {
         info!("Closing Anvil GUI (container #{container_id})...");
-        bot.write_packet(ServerboundContainerClose { container_id });
+        crate::drops::close_menu(bot, container_id);
         self.anvil_container_id = None;
         self.anvil_slots.clear();
         self.combine_clicks.clear();
@@ -1724,6 +1732,52 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn missing_recipe_cost_times_out_instead_of_waiting_forever() {
+        use azalea_registry::builtin::ItemKind;
+        let bot = crate::workflow_tests::local_client();
+        let mut manager = EnchanterManager::new();
+        manager.anvil_container_id = Some(7);
+        manager.anvil_slots.insert(0, ItemStack::new(ItemKind::DiamondHelmet, 1));
+        manager.anvil_slots.insert(1, ItemStack::new(ItemKind::EnchantedBook, 1));
+        manager.recipe_wait_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(4));
+        assert!(!manager.process_anvil_combines(&bot).await);
+        assert_eq!(manager.anvil_container_id, None);
+        assert_eq!(manager.failed_combine_attempts, 1);
+        assert!(manager.book_to_discard.is_none());
+    }
+
+    #[tokio::test]
+    async fn too_expensive_recipe_retains_exact_rejected_book_identity() {
+        use azalea_registry::builtin::ItemKind;
+        let bot = crate::workflow_tests::local_client();
+        let mut manager = EnchanterManager::new();
+        let book = ItemStack::new(ItemKind::EnchantedBook, 1);
+        manager.anvil_container_id = Some(7);
+        manager.anvil_slots.insert(0, ItemStack::new(ItemKind::DiamondHelmet, 1));
+        manager.anvil_slots.insert(1, book.clone());
+        manager.server_anvil_cost.store(40, Ordering::SeqCst);
+        assert!(!manager.process_anvil_combines(&bot).await);
+        assert_eq!(manager.anvil_container_id, None);
+        assert_eq!(manager.book_to_discard, Some(book));
+        assert!(manager.combine_clicks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn too_expensive_output_arriving_before_inputs_is_not_collected() {
+        use azalea_registry::builtin::ItemKind;
+        let bot = crate::workflow_tests::local_client();
+        let mut manager = EnchanterManager::new();
+        manager.anvil_container_id = Some(7);
+        manager.anvil_slots.insert(2, ItemStack::new(ItemKind::DiamondHelmet, 1));
+        manager.server_anvil_cost.store(40, Ordering::SeqCst);
+        manager.current_level.store(50, Ordering::SeqCst);
+        manager.recipe_wait_since = Some(std::time::Instant::now());
+        assert!(!manager.process_anvil_combines(&bot).await);
+        assert!(manager.pending_click.is_none());
+        assert_eq!(manager.anvil_container_id, Some(7));
+    }
 
     #[test]
     fn identical_mending_book_in_hotbar_skips_staging_swap() {

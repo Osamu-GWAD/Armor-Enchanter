@@ -9,7 +9,7 @@ use crate::nbt::{
 use azalea::inventory::operations::ClickType;
 use azalea::inventory::ItemStack;
 use azalea::protocol::packets::game::s_container_click::{HashedStack, ServerboundContainerClick};
-use azalea::protocol::packets::game::{ServerboundChatCommand, ServerboundContainerClose};
+use azalea::protocol::packets::game::ServerboundChatCommand;
 use azalea::Client;
 use std::collections::HashMap;
 use tracing::{debug, error, info, warn};
@@ -305,9 +305,7 @@ impl GuiManager {
         }
         if self.current_container_id > 0 {
             info!("Closing lingering container #{} before sending command '{cmd}'...", self.current_container_id);
-            bot.write_packet(ServerboundContainerClose {
-                container_id: self.current_container_id,
-            });
+            crate::drops::close_menu(bot, self.current_container_id);
         }
         if cmd.trim() == "/order" && self.phase == WithdrawalPhase::AnvilPlacement {
             bot.set_direction(bot.direction().y_rot(), 90.0);
@@ -1011,6 +1009,22 @@ impl GuiManager {
             self.state = OrderWorkflowState::OpenedOrderMainMenu;
         } else {
             info!("Other/Submenu GUI screen opened ('{clean_title}').");
+        }
+    }
+
+    /// Anvil slots 3..38 mirror player menu slots 9..44. Keep this server
+    /// snapshot current during enchanting, including before drops/discards.
+    pub fn on_anvil_content(&mut self, items: &[ItemStack], bot: Option<&Client>) {
+        for (slot, item) in items.iter().enumerate().skip(3).take(36) {
+            self.player_inventory.insert((slot + 6) as i16, item.clone());
+        }
+        self.sync_collected_from_inventory(bot);
+    }
+
+    pub fn on_anvil_slot(&mut self, slot: i16, item: &ItemStack, bot: Option<&Client>) {
+        if (3..=38).contains(&slot) {
+            self.player_inventory.insert(slot + 6, item.clone());
+            self.sync_collected_from_inventory(bot);
         }
     }
 
@@ -2523,9 +2537,7 @@ impl GuiManager {
     pub fn close_current_gui(&mut self, bot: &Client) {
         self.clear_watchdog();
         if self.current_container_id > 0 {
-            bot.write_packet(ServerboundContainerClose {
-                container_id: self.current_container_id,
-            });
+            crate::drops::close_menu(bot, self.current_container_id);
             self.current_container_id = 0;
             self.current_slots.clear();
         }
@@ -2600,6 +2612,32 @@ impl GuiManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anvil_updates_refresh_player_cache_without_copying_inputs_or_output() {
+        use azalea_registry::builtin::ItemKind;
+        let mut gui = GuiManager::new();
+        let helmet = ItemStack::new(ItemKind::DiamondHelmet, 1);
+        let book = ItemStack::new(ItemKind::EnchantedBook, 1);
+        gui.player_inventory.insert(9, book.clone());
+        gui.player_inventory.insert(45, helmet.clone());
+        let mut items = vec![ItemStack::Empty; 39];
+        items[0] = helmet.clone();
+        items[1] = book.clone();
+        items[2] = helmet.clone();
+        items[38] = book.clone();
+        gui.on_anvil_content(&items, None);
+        assert_eq!(gui.player_inventory[&9], ItemStack::Empty);
+        assert_eq!(gui.player_inventory[&44], book);
+        assert_eq!(gui.player_inventory[&45], helmet);
+        assert!(!gui.player_inventory.contains_key(&6));
+        gui.on_anvil_slot(3, &helmet, None);
+        gui.on_anvil_slot(38, &ItemStack::Empty, None);
+        gui.on_anvil_slot(1, &book, None);
+        assert_eq!(gui.player_inventory[&9], helmet);
+        assert_eq!(gui.player_inventory[&44], ItemStack::Empty);
+        assert!(!gui.player_inventory.contains_key(&7));
+    }
 
     #[test]
     fn stock_alerts_require_fresh_orders_and_zero_actual_inventory() {
