@@ -251,6 +251,11 @@ pub struct EnchanterManager {
     pub strict_calculation: bool,
     pub active_combine_task: Option<CombineTask>,
     pub book_to_discard: Option<ItemStack>,
+    pub book_to_discard_slot: Option<i16>,
+    pub pending_rejection_book: Option<ItemStack>,
+    pub pending_rejection_slot: Option<i16>,
+    pub rejected_inventory_slots: std::collections::HashSet<i16>,
+    pub rejection_recovery: bool,
     pub last_staged_buttons: Option<(u8, u8)>,
 }
 
@@ -281,6 +286,11 @@ impl EnchanterManager {
             strict_calculation: true,
             active_combine_task: None,
             book_to_discard: None,
+            book_to_discard_slot: None,
+            pending_rejection_book: None,
+            pending_rejection_slot: None,
+            rejected_inventory_slots: std::collections::HashSet::new(),
+            rejection_recovery: false,
             last_staged_buttons: None,
         }
     }
@@ -301,6 +311,9 @@ impl EnchanterManager {
         self.server_anvil_cost.store(0, Ordering::SeqCst);
         self.active_combine_task = None;
         self.book_to_discard = None;
+        self.book_to_discard_slot = None;
+        self.rejected_inventory_slots.clear();
+        self.rejection_recovery = false;
         self.last_staged_buttons = None;
     }
 
@@ -1099,17 +1112,47 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
                 if let Some(info) = inspect_item_with_bot(item, Some(bot)) {
                     if is_diamond_armor(&info) {
                         armor_slots.push((slot, info));
-                    } else if info.kind.contains("Book") || info.kind.contains("EnchantedBook") {
+                    } else if is_protection_4(&info)
+                        || is_blast_protection_4(&info)
+                        || is_unbreaking_3(&info)
+                        || is_mending(&info)
+                        || info.kind.to_lowercase().contains("book")
+                    {
                         book_slots.push((slot, info));
                     }
                 }
             }
         }
 
+        let is_clean = |b: &ItemInfo| -> bool {
+            if is_unbreaking_and_mending(b) {
+                b.repair_cost.unwrap_or(0) <= 1
+            } else {
+                b.repair_cost.unwrap_or(0) == 0
+            }
+        };
+
+        let is_rejected = |slot: i16| -> bool {
+            let inv_slot = if (3..=38).contains(&slot) { slot - 3 + 9 } else { slot };
+            self.rejected_inventory_slots.contains(&inv_slot) || self.rejected_inventory_slots.contains(&slot)
+        };
+
         let find_book = |predicate: &dyn Fn(&ItemInfo) -> bool| -> Option<(i16, ItemInfo)> {
+            // Priority 1: Pick known clean book that has not been rejected
+            let clean = book_slots.iter()
+                .filter(|(s, b)| *s >= 30 && predicate(b) && is_clean(b) && !is_rejected(*s))
+                .chain(book_slots.iter().filter(|(s, b)| *s < 30 && predicate(b) && is_clean(b) && !is_rejected(*s)))
+                .cloned()
+                .next();
+            if clean.is_some() {
+                return clean;
+            }
+            // Priority 2: Fall back to testing unrejected candidate book in anvil.
+            // If server cost exceeds clean formula, process_anvil_combines rejects it
+            // and it is dropped into the hopper and restocked.
             book_slots.iter()
-                .filter(|(s, b)| *s >= 30 && predicate(b))
-                .chain(book_slots.iter().filter(|(s, b)| *s < 30 && predicate(b)))
+                .filter(|(s, b)| *s >= 30 && predicate(b) && !is_rejected(*s))
+                .chain(book_slots.iter().filter(|(s, b)| *s < 30 && predicate(b) && !is_rejected(*s)))
                 .cloned()
                 .next()
         };
@@ -1147,6 +1190,8 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
                         enchant_name: ench_name,
                         required_level: req_level,
                     });
+                } else {
+                    return None;
                 }
             }
 
@@ -1161,6 +1206,22 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
                         enchant_name: "Unbreaking III",
                         required_level: req_level,
                     });
+                } else if !has_mend {
+                    // Check if pre-combined Unbreaking III + Mending book is available
+                    if let Some((comb_slot, b)) = find_book(&|b| is_unbreaking_and_mending(b)) {
+                        let req_level = Self::expected_combine_cost(armor_info, &b);
+                        return Some(CombineTask {
+                            armor_slot: *armor_slot,
+                            book_slot: comb_slot,
+                            armor_desc: armor_info.kind.clone(),
+                            enchant_name: "Unbreaking III & Mending",
+                            required_level: req_level,
+                        });
+                    } else {
+                        return None;
+                    }
+                } else {
+                    return None;
                 }
             }
 
@@ -1175,20 +1236,8 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
                         enchant_name: "Mending",
                         required_level: req_level,
                     });
-                }
-            }
-
-            // Fallback: If armor piece already has a pre-combined (Unbreaking III + Mending) book in inventory
-            if (!has_unb || !has_mend) && has_main_prot {
-                if let Some((comb_slot, b)) = find_book(&|b| is_unbreaking_and_mending(b)) {
-                    let req_level = Self::expected_combine_cost(armor_info, &b);
-                    return Some(CombineTask {
-                        armor_slot: *armor_slot,
-                        book_slot: comb_slot,
-                        armor_desc: armor_info.kind.clone(),
-                        enchant_name: "Unbreaking III & Mending",
-                        required_level: req_level,
-                    });
+                } else {
+                    return None;
                 }
             }
         }
@@ -1400,9 +1449,19 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
         }
         if let Some((slot, button, click)) = self.next_combine_click() {
             self.send_tracked_anvil_click(bot, container_id, slot, button, click);
-            if self.combine_clicks.is_empty() {
+            if self.combine_clicks.is_empty() && !self.rejection_recovery {
                 self.recipe_wait_since = Some(std::time::Instant::now());
             }
+            return false;
+        }
+
+        if self.rejection_recovery && self.combine_clicks.is_empty() && self.pending_click.is_none() {
+            info!("Rejection recovery complete: inputs returned to hotbar. Closing anvil to discard book into hopper...");
+            self.rejection_recovery = false;
+            self.book_to_discard = self.pending_rejection_book.take();
+            self.book_to_discard_slot = self.pending_rejection_slot.take();
+            self.close_anvil(bot, container_id);
+            self.active_combine_task = None;
             return false;
         }
         let cur_lvl = self.current_level.load(Ordering::SeqCst);
@@ -1439,19 +1498,36 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
 
             // High XP cost rejection: if server cost exceeds expected clean cost, or >= 40 ("Too Expensive")
             if server_cost > expected_cost || server_cost >= 40 {
+                let armor_info = self.anvil_slots.get(&0).and_then(|i| inspect_item_with_bot(i, Some(bot)));
+                let book_info = self.anvil_slots.get(&1).and_then(|i| inspect_item_with_bot(i, Some(bot)));
                 warn!(
-                    "REJECTING HIGH-COST BOOK: Server repair cost ({} levels) exceeds expected clean cost ({} levels) for {} with {}! Ejecting inputs and queueing book for hopper discard.",
+                    "REJECTING HIGH-COST COMBINE: Server repair cost ({} levels) exceeds expected clean cost ({} levels)! Armor: kind={}, PWP={:?}, enchants={:?}. Book: kind={}, PWP={:?}, enchants={:?}. Ejecting inputs to hotbar for hopper discard.",
                     server_cost,
                     expected_cost,
-                    self.active_combine_task.as_ref().map(|t| t.armor_desc.as_str()).unwrap_or("Armor"),
-                    self.active_combine_task.as_ref().map(|t| t.enchant_name).unwrap_or("Book"),
+                    armor_info.as_ref().map(|a| a.kind.as_str()).unwrap_or("Armor"),
+                    armor_info.as_ref().and_then(|a| a.repair_cost),
+                    armor_info.as_ref().map(|a| &a.enchantments),
+                    book_info.as_ref().map(|b| b.kind.as_str()).unwrap_or("Book"),
+                    book_info.as_ref().and_then(|b| b.repair_cost),
+                    book_info.as_ref().map(|b| &b.stored_enchantments),
                 );
-                // Closing returns the inputs. Do not issue two unacknowledged
-                // swaps or guess where the server will put the rejected book.
                 let rejected = self.anvil_slots.get(&1).cloned();
-                self.close_anvil(bot, container_id);
-                self.book_to_discard = rejected;
-                self.active_combine_task = None;
+                self.pending_rejection_book = rejected;
+
+                let (armor_button, book_button) = self.last_staged_buttons.unwrap_or((0, 1));
+                self.pending_rejection_slot = Some(36 + book_button as i16);
+
+                // Queue tracked clicks to swap rejected book (slot 1) into hotbar slot book_button,
+                // and swap armor (slot 0) into hotbar slot armor_button.
+                self.combine_clicks.clear();
+                self.combine_clicks.push_back((1, book_button, ClickType::Swap));
+                self.combine_clicks.push_back((0, armor_button, ClickType::Swap));
+                self.rejection_recovery = true;
+                self.recipe_wait_since = None;
+
+                if let Some((slot, button, click)) = self.next_combine_click() {
+                    self.send_tracked_anvil_click(bot, container_id, slot, button, click);
+                }
                 return false;
             }
 
@@ -1759,9 +1835,8 @@ mod tests {
         manager.anvil_slots.insert(1, book.clone());
         manager.server_anvil_cost.store(40, Ordering::SeqCst);
         assert!(!manager.process_anvil_combines(&bot).await);
-        assert_eq!(manager.anvil_container_id, None);
-        assert_eq!(manager.book_to_discard, Some(book));
-        assert!(manager.combine_clicks.is_empty());
+        assert_eq!(manager.pending_rejection_book, Some(book));
+        assert!(manager.rejection_recovery);
     }
 
     #[tokio::test]
@@ -2303,5 +2378,67 @@ mod tests {
         let mut fresh_prot_chest = ItemInfo { kind: "DiamondChestplate".to_string(), count: 1, ..Default::default() };
         fresh_prot_chest.enchantments.insert("protection".to_string(), 4);
         assert_eq!(EnchanterManager::expected_combine_cost(&fresh_prot_chest, &comb_book), 7);
+    }
+
+    #[test]
+    fn high_repair_cost_book_is_filtered_out_by_find_next_combine_task() {
+        use azalea_registry::builtin::{DataComponentKind, ItemKind};
+        use azalea_inventory::components::{DataComponentUnion, RepairCost, Lore};
+
+        let bot = crate::workflow_tests::local_client();
+        let mut manager = EnchanterManager::new();
+
+        let helmet = ItemStack::new(ItemKind::DiamondHelmet, 1);
+        let mut high_cost_book = ItemStack::new(ItemKind::EnchantedBook, 1);
+        if let ItemStack::Present(data) = &mut high_cost_book {
+            let lore = Lore { lines: vec![azalea::FormattedText::from("Protection IV")] };
+            unsafe {
+                data.component_patch.unchecked_insert_component(
+                    DataComponentKind::Lore,
+                    Some(DataComponentUnion::from(lore)),
+                );
+                data.component_patch.unchecked_insert_component(
+                    DataComponentKind::RepairCost,
+                    Some(DataComponentUnion::from(RepairCost { cost: 31 })),
+                );
+            }
+        }
+
+        manager.player_inventory.insert(9, helmet);
+        manager.player_inventory.insert(10, high_cost_book.clone());
+
+        // When marked as rejected, it is ignored
+        manager.rejected_inventory_slots.insert(10);
+        assert!(manager.find_next_combine_task(&bot).is_none());
+        assert!(!manager.has_available_book_for_current_armor(&bot));
+        manager.rejected_inventory_slots.clear();
+
+        // Now add a clean Prot IV book
+        let mut clean_book = ItemStack::new(ItemKind::EnchantedBook, 1);
+        if let ItemStack::Present(data) = &mut clean_book {
+            let lore = Lore { lines: vec![azalea::FormattedText::from("Protection IV")] };
+            unsafe {
+                data.component_patch.unchecked_insert_component(
+                    DataComponentKind::Lore,
+                    Some(DataComponentUnion::from(lore)),
+                );
+            }
+        }
+        manager.player_inventory.insert(11, clean_book);
+
+        // find_next_combine_task prioritizes the clean book in slot 11 (container slot 5) over the high-cost book in slot 10 (container slot 4)
+        let task = manager.find_next_combine_task(&bot).unwrap();
+        assert_eq!(task.book_slot, 5);
+        assert_eq!(task.armor_slot, 3);
+
+        // If the clean book in slot 11 is rejected, it falls back to the candidate in slot 10 (container slot 4) for anvil evaluation
+        manager.rejected_inventory_slots.insert(11);
+        let task2 = manager.find_next_combine_task(&bot).unwrap();
+        assert_eq!(task2.book_slot, 4);
+
+        // Once the high-cost book is also rejected (after anvil server cost rejection / hopper discard), no books remain
+        manager.rejected_inventory_slots.insert(10);
+        assert!(manager.find_next_combine_task(&bot).is_none());
+        assert!(!manager.has_available_book_for_current_armor(&bot));
     }
 }

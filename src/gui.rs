@@ -1079,6 +1079,7 @@ impl GuiManager {
     /// Update an individual slot when ClientboundContainerSetSlot is received.
     pub fn on_set_slot(&mut self, container_id: i32, state_id: u32, slot: i16, item: &ItemStack, bot: Option<&Client>) {
         if container_id == -2 {
+            self.player_state_id = state_id;
             if let Some(slot) = crate::armor::player_menu_slot(slot as u32) {
                 self.player_inventory.insert(slot, item.clone());
                 self.sync_collected_from_inventory(bot);

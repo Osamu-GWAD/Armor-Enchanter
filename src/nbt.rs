@@ -11,6 +11,7 @@ pub struct ItemInfo {
     pub lore: Vec<String>,
     pub enchantments: HashMap<String, u32>,
     pub stored_enchantments: HashMap<String, u32>,
+    pub repair_cost: Option<u32>,
     pub raw_components: Option<Value>,
     pub raw_debug: Option<String>,
 }
@@ -107,7 +108,7 @@ impl ItemInfo {
     }
 }
 
-use azalea_inventory::components::{CustomData, CustomName, Enchantments, ItemName, Lore, StoredEnchantments};
+use azalea_inventory::components::{CustomData, CustomName, Enchantments, ItemName, Lore, RepairCost, StoredEnchantments};
 use azalea::Client;
 
 /// Inspect an ItemStack and extract its detailed NBT and component info,
@@ -124,6 +125,10 @@ pub fn inspect_item_with_bot(item: &ItemStack, bot: Option<&Client>) -> Option<I
         raw_debug: Some(format!("{:?}", data.component_patch)),
         ..Default::default()
     };
+
+    if let Some(rc) = data.component_patch.get::<RepairCost>() {
+        info.repair_cost = Some(rc.cost as u32);
+    }
 
     // 1. Direct typed extraction from DataComponentPatch
     if let Some(cn) = data.component_patch.get::<CustomName>() {
@@ -263,6 +268,22 @@ fn extract_from_components(val: &Value, info: &mut ItemInfo) {
                 }
                 "enchantments" => {
                     parse_enchantment_map(v, &mut info.enchantments);
+                }
+                "repair_cost" => {
+                    if let Some(num) = v.as_u64() {
+                        info.repair_cost = Some(num as u32);
+                    }
+                }
+                "custom_data" => {
+                    if let Value::Object(cd_map) = v {
+                        for (k, v) in cd_map {
+                            if k.eq_ignore_ascii_case("repaircost") {
+                                if let Some(num) = v.as_u64() {
+                                    info.repair_cost = Some(num as u32);
+                                }
+                            }
+                        }
+                    }
                 }
                 _ => {}
             }

@@ -128,6 +128,7 @@ struct BotState {
     total_experience: Arc<std::sync::atomic::AtomicU32>,
     server_anvil_cost: Arc<std::sync::atomic::AtomicU32>,
     maintenance_active: Arc<std::sync::atomic::AtomicBool>,
+    is_enchanting: Arc<std::sync::atomic::AtomicBool>,
 }
 
 // Each account runs in its own process. Preserve transactions across reconnects.
@@ -172,6 +173,7 @@ impl Default for BotState {
             total_experience,
             server_anvil_cost,
             maintenance_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            is_enchanting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -207,7 +209,7 @@ async fn handle(bot: Client, event: Event, state: BotState) -> Result<(), anyhow
                         if !is_spawned {
                             break;
                         }
-                        let is_enchanting = state_wd.enchanter.lock().await.is_enchanting;
+                        let is_enchanting = state_wd.is_enchanting.load(std::sync::atomic::Ordering::SeqCst);
                         if is_enchanting {
                             continue;
                         }
@@ -483,6 +485,7 @@ async fn handle(bot: Client, event: Event, state: BotState) -> Result<(), anyhow
             warn!("Disconnected from server: {:?}", reason);
             *state.spawned.lock().await = false;
             *state.order_sent.lock().await = false;
+            state.is_enchanting.store(false, std::sync::atomic::Ordering::SeqCst);
             {
                 let mut ench = state.enchanter.lock().await;
                 ench.is_enchanting = false;
@@ -514,8 +517,8 @@ async fn handle_packet(bot: &Client, packet: &Arc<ClientboundGamePacket>, state:
                 let mut ench = state.enchanter.lock().await;
                 ench.on_open_screen(p.container_id, &title);
             } else {
+                let is_enchanting = state.is_enchanting.load(std::sync::atomic::Ordering::SeqCst);
                 let mut gui = state.gui.lock().await;
-                let is_enchanting = state.enchanter.lock().await.is_enchanting;
                 if !gui.is_fulfilling_target && (is_enchanting || gui.phase == WithdrawalPhase::Done || gui.state == OrderWorkflowState::WithdrawalComplete) {
                     info!("Non-anvil container #{} ('{}') opened while enchanting/done; dismissing.", p.container_id, title);
                     bot.write_packet(ServerboundContainerClose { container_id: p.container_id });
@@ -539,7 +542,7 @@ async fn handle_packet(bot: &Client, packet: &Arc<ClientboundGamePacket>, state:
                 gui.on_set_content(p.container_id, p.state_id, &p.items, Some(bot));
 
                 if p.container_id > 0 {
-                    let is_enchanting = state.enchanter.lock().await.is_enchanting;
+                    let is_enchanting = state.is_enchanting.load(std::sync::atomic::Ordering::SeqCst);
                     if !gui.is_fulfilling_target && (is_enchanting || gui.phase == WithdrawalPhase::Done || gui.state == OrderWorkflowState::WithdrawalComplete) {
                         bot.write_packet(ServerboundContainerClose { container_id: p.container_id });
                         return;
@@ -730,16 +733,19 @@ async fn wait_for_inventory_update(state: &BotState, timeout: std::time::Duratio
 }
 
 async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
-    let mut ench = state.enchanter.lock().await;
-    if ench.is_enchanting {
+    if state.is_enchanting.compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_err() {
         return;
     }
-    ench.is_enchanting = true;
-    {
+    let player_inv = {
         let mut gui = state.gui.lock().await;
-        ench.player_inventory = gui.player_inventory.clone();
         gui.close_current_gui(bot);
         gui.state = OrderWorkflowState::WithdrawalComplete;
+        gui.player_inventory.clone()
+    };
+    {
+        let mut ench = state.enchanter.lock().await;
+        ench.is_enchanting = true;
+        ench.player_inventory = player_inv;
     }
     info!("Withdrawal complete! Starting autonomous enchanting routine...");
 
@@ -766,6 +772,7 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
             if !placed {
                 warn!("No anvil placed and could not place one from inventory!");
                 ench.is_enchanting = false;
+                state_clone.is_enchanting.store(false, std::sync::atomic::Ordering::SeqCst);
                 drop(ench);
 
                 let has_anvil = player_inv.values().any(|item| {
@@ -782,14 +789,17 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
                     let placed2 = ench.place_anvil(&bot_ench, &player_inv).await;
                     if !placed2 {
                         error!("Anvil placement still failed after /home 1. Disconnecting bot to prevent loop.");
+                        state_clone.is_enchanting.store(false, std::sync::atomic::Ordering::SeqCst);
                         bot_ench.disconnect();
                         return;
                     }
                     ench.is_enchanting = true;
+                    state_clone.is_enchanting.store(true, std::sync::atomic::Ordering::SeqCst);
                 } else {
                     let mut gui = state_clone.gui.lock().await;
                     gui.phase = WithdrawalPhase::AnvilPlacement;
                     gui.state = OrderWorkflowState::Spawned;
+                    state_clone.is_enchanting.store(false, std::sync::atomic::Ordering::SeqCst);
                     gui.prepare_to_send_command(&bot_ench, "/order");
                     return;
                 }
@@ -827,6 +837,7 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
                     if anvil_open_attempts >= 6 {
                         error!("Anvil failed to open after 6 attempts! Disconnecting to rejoin and start where left...");
                         state_clone.enchanter.lock().await.is_enchanting = false;
+                        state_clone.is_enchanting.store(false, std::sync::atomic::Ordering::SeqCst);
                         bot_ench.disconnect();
                         return;
                     }
@@ -844,6 +855,7 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
                         if !placed {
                             warn!("Cannot place Anvil (out of anvils in inventory). Looking completely down at feet (pitch: 90.0) and aborting enchanting routine to withdraw replacement anvil from orders!");
                             ench.is_enchanting = false;
+                            state_clone.is_enchanting.store(false, std::sync::atomic::Ordering::SeqCst);
                             drop(ench);
                             crate::enchanter::smooth_look(&bot_ench, bot_ench.direction().y_rot(), 90.0).await;
                             bot_ench.set_direction(bot_ench.direction().y_rot(), 90.0);
@@ -880,16 +892,21 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
                 }
                 if ench.restock_needed { break; }
                 let discard_item = ench.book_to_discard.take();
+                let discard_slot = ench.book_to_discard_slot.take();
                 let xp_target = ench.xp_target.take();
                 drop(ench);
 
                 if let Some(ref rejected_book) = discard_item {
                     info!("Discarding high XP cost book into hopper...");
-                    let dropped = drop_rejected_book_in_hopper(&bot_ench, &state_clone, rejected_book).await;
+                    let dropped = drop_rejected_book_in_hopper(&bot_ench, &state_clone, rejected_book, discard_slot).await;
                     if dropped {
                         info!("Successfully discarded high-cost book into hopper.");
                     } else {
                         warn!("Failed to confirm discarded book left inventory.");
+                        let mut ench = state_clone.enchanter.lock().await;
+                        if let Some(slot) = discard_slot {
+                            ench.rejected_inventory_slots.insert(slot);
+                        }
                     }
                     // Check if another book for this armor piece is already available in inventory
                     let has_another_book = {
@@ -926,6 +943,8 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
                     {
                         let mut ench = state_clone.enchanter.lock().await;
                         ench.player_inventory = worker.player_inventory.clone();
+                    }
+                    {
                         let mut gui = state_clone.gui.lock().await;
                         gui.player_inventory = worker.player_inventory.clone();
                         gui.sync_collected_from_inventory(Some(&bot_ench));
@@ -942,13 +961,16 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
             }
 
             // 5. Close Anvil
-            {
+            let inv = {
                 let mut ench = state_clone.enchanter.lock().await;
                 if let Some(id) = ench.anvil_container_id {
                     ench.close_anvil(&bot_ench, id);
                 }
+                ench.player_inventory.clone()
+            };
+            {
                 let mut gui = state_clone.gui.lock().await;
-                gui.player_inventory = ench.player_inventory.clone();
+                gui.player_inventory = inv;
                 gui.sync_collected_from_inventory(Some(&bot_ench));
             }
             bot_ench.wait_ticks(2).await;
@@ -964,6 +986,7 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
             let ready = state_clone.enchanter.lock().await.check_all_armor_enchanted(&bot_ench).0;
             if ready && !drop_enchanted_armor_in_hopper(&bot_ench, &state_clone).await {
                 error!("Drop not confirmed; retaining current set for recovery.");
+                state_clone.is_enchanting.store(false, std::sync::atomic::Ordering::SeqCst);
                 bot_ench.disconnect();
                 return;
             }
@@ -984,6 +1007,7 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
                     let mut ench = state_clone.enchanter.lock().await;
                     ench.reset_for_next_batch();
                     ench.is_enchanting = true;
+                    state_clone.is_enchanting.store(true, std::sync::atomic::Ordering::SeqCst);
                     ench.player_inventory = inventory;
                     info!("Starting the next stocked set immediately; no order withdrawal or inventory cleaning needed.");
                     continue 'sets;
@@ -998,6 +1022,7 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
             let mut ench = state_clone.enchanter.lock().await;
             ench.reset_for_next_batch();
         }
+        state_clone.is_enchanting.store(false, std::sync::atomic::Ordering::SeqCst);
         let anvil_count = {
             let mut gui = state_clone.gui.lock().await;
             gui.reset_and_sync_inventory(Some(&bot_ench));
@@ -1017,11 +1042,14 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
             gui.state = OrderWorkflowState::Spawned;
             gui.prepare_to_send_command(&bot_ench, "/order");
         } else {
-            let mut gui = state_clone.gui.lock().await;
-            gui.phase = WithdrawalPhase::ItemsRetrieval;
-            gui.state = OrderWorkflowState::Spawned;
+            {
+                let mut gui = state_clone.gui.lock().await;
+                gui.phase = WithdrawalPhase::ItemsRetrieval;
+                gui.state = OrderWorkflowState::Spawned;
+            }
             bot_ench.wait_ticks(3).await;
             info!("Opening /order to check remaining armors in 'Your Orders'...");
+            let mut gui = state_clone.gui.lock().await;
             gui.prepare_to_send_command(&bot_ench, "/order");
         }
     });
@@ -1108,7 +1136,7 @@ async fn drop_one_inventory_item(
 
 /// Discard only the exact book rejected by the anvil, after the server returns it.
 async fn drop_rejected_book_in_hopper(
-    bot: &Client, state: &BotState, expected: &azalea::inventory::ItemStack,
+    bot: &Client, state: &BotState, expected: &azalea::inventory::ItemStack, preferred_slot: Option<i16>,
 ) -> bool {
     use azalea::inventory::ItemStack;
     use azalea_registry::builtin::ItemKind;
@@ -1132,7 +1160,13 @@ async fn drop_rejected_book_in_hopper(
         if !*state.spawned.lock().await { return false; }
         {
             let gui = state.gui.lock().await;
-            let matching: Vec<_> = (9..=44).filter(|slot| gui.player_inventory.get(slot) == Some(expected)).collect();
+            if let Some(pref) = preferred_slot {
+                if gui.player_inventory.get(&pref) == Some(expected) {
+                    let total = (9..=44).filter(|s| gui.player_inventory.get(s) == Some(expected)).count();
+                    break (pref, total);
+                }
+            }
+            let matching: Vec<_> = (36..=44).chain(9..=35).filter(|slot| gui.player_inventory.get(slot) == Some(expected)).collect();
             if let Some(&slot) = matching.first() { break (slot, matching.len()); }
         }
         if std::time::Instant::now() >= deadline {

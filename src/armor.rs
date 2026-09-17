@@ -42,13 +42,25 @@ pub fn is_complete(info: &ItemInfo) -> bool {
     })
 }
 
+pub fn is_clean_armor(info: &ItemInfo) -> bool {
+    let prior_works = (info.has_enchantment("protection", 4) || info.has_enchantment("blast_protection", 4)) as u32
+        + (info.has_enchantment("unbreaking", 3) as u32)
+        + (info.has_enchantment("mending", 1) as u32);
+    let max_allowed_pwp = if prior_works == 0 {
+        0
+    } else {
+        (1u32 << prior_works) - 1
+    };
+    info.repair_cost.unwrap_or(0) <= max_allowed_pwp
+}
+
 /// Pick one piece of each type per set. Finish the current type before moving on,
 /// even when a later piece has more enchants or the current book is unavailable.
 pub fn next_armor(items: &[(i16, ItemInfo)]) -> Option<&(i16, ItemInfo)> {
     for kind in 0..4 {
         let mut candidates: Vec<_> = items
             .iter()
-            .filter(|(_, info)| armor_type(info) == Some(kind))
+            .filter(|(_, info)| armor_type(info) == Some(kind) && is_clean_armor(info))
             .collect();
         if candidates.iter().any(|(_, info)| is_complete(info)) {
             continue;
