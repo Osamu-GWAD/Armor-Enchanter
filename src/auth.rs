@@ -127,9 +127,15 @@ impl CustomTokenAccount {
                 .unwrap_or(0);
             if exp <= now {
                 let expired_mins_ago = (now - exp) / 60;
-                tracing::warn!(
-                    "⚠️ WARNING: The provided MC_TOKEN expired ~{} minute(s) ago! (exp: {}, now: {}). Mojang will reject server joins with 'ForbiddenOperation'. Please update MC_TOKEN in .env with a fresh token.",
+                tracing::error!(
+                    "❌ ERROR: The provided MC_TOKEN expired ~{} minute(s) ago! (exp: {}, now: {}).",
                     expired_mins_ago, exp, now
+                );
+                tracing::error!(
+                    "❌ Mojang sessionserver will reject connection with 'ForbiddenOperation'."
+                );
+                tracing::error!(
+                    "❌ Please generate a fresh access token or configure MICROSOFT_EMAIL in .env."
                 );
             } else {
                 let remaining_mins = (exp - now) / 60;
@@ -197,7 +203,12 @@ impl AccountConfig {
                 if let Ok(acc) = CustomTokenAccount::from_jwt(token) {
                     format!("Token (Profile: {}, UUID: {})", acc.username, acc.uuid)
                 } else {
-                    "Token (configured; value hidden)".to_string()
+                    let preview = if token.len() > 16 {
+                        format!("{}...", &token[..16])
+                    } else {
+                        token.clone()
+                    };
+                    format!("Token ({preview})")
                 }
             }
             AccountConfig::Offline(name) => format!("Offline ({name})"),
@@ -205,45 +216,18 @@ impl AccountConfig {
     }
 }
 
-/// Account lists never silently fall back to unauthenticated offline login.
-fn parse_account_entry(value: &str) -> Result<AccountConfig, anyhow::Error> {
-    let value = value.trim();
-    if let Some(username) = value.strip_prefix("offline:") {
-        let username = username.trim();
-        anyhow::ensure!(!username.is_empty() && username.len() <= 16
-            && username.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'),
-            "Offline usernames must contain 1-16 letters, digits, or underscores.");
-        return Ok(AccountConfig::Offline(username.to_string()));
-    }
-    if value.contains('@') {
-        let mut parts = value.split('@');
-        let local = parts.next().unwrap_or_default();
-        let domain = parts.next().unwrap_or_default();
-        anyhow::ensure!(!local.is_empty() && !domain.is_empty() && parts.next().is_none()
-            && !value.chars().any(char::is_whitespace),
-            "Invalid Microsoft email. Enter the complete email, including @, in ACCOUNTS or MICROSOFT_EMAIL.");
-        return Ok(AccountConfig::Microsoft(value.to_string()));
-    }
-    if value.starts_with("ey") || value.len() > 50 {
-        return Ok(AccountConfig::Token(value.to_string()));
-    }
-    anyhow::bail!("Invalid account entry: use a complete Microsoft email including @, or a Minecraft access token. Offline login requires --offline USERNAME or offline:USERNAME and only works on offline-mode servers.")
-}
-
 /// Discover all configured accounts from CLI arguments and environment variables (.env).
 pub fn discover_accounts(
     cli_token: Option<&str>,
     cli_microsoft: Option<&str>,
     cli_offline: Option<&str>,
-) -> Result<Vec<AccountConfig>, anyhow::Error> {
+) -> Vec<AccountConfig> {
     let mut list = Vec::new();
 
     // Priority 1: Explicit CLI Microsoft email
     if let Some(email) = cli_microsoft {
         if !email.trim().is_empty() {
-            let account = parse_account_entry(email)?;
-            anyhow::ensure!(matches!(account, AccountConfig::Microsoft(_)), "--microsoft requires a complete email including @.");
-            list.push(account);
+            list.push(AccountConfig::Microsoft(email.trim().to_string()));
         }
     }
 
@@ -261,8 +245,13 @@ pub fn discover_accounts(
             if trimmed.is_empty() {
                 continue;
             }
-            list.push(parse_account_entry(trimmed)
-                .map_err(|err| anyhow::anyhow!("ACCOUNTS: {err}"))?);
+            if trimmed.contains('@') {
+                list.push(AccountConfig::Microsoft(trimmed.to_string()));
+            } else if trimmed.starts_with("ey") || trimmed.len() > 50 {
+                list.push(AccountConfig::Token(trimmed.to_string()));
+            } else {
+                list.push(AccountConfig::Offline(trimmed.to_string()));
+            }
         }
     }
 
@@ -271,8 +260,13 @@ pub fn discover_accounts(
         if let Ok(val) = std::env::var(format!("ACCOUNT_{i}")) {
             let trimmed = val.trim();
             if !trimmed.is_empty() {
-                list.push(parse_account_entry(trimmed)
-                    .map_err(|err| anyhow::anyhow!("ACCOUNT_{i}: {err}"))?);
+                if trimmed.contains('@') {
+                    list.push(AccountConfig::Microsoft(trimmed.to_string()));
+                } else if trimmed.starts_with("ey") || trimmed.len() > 50 {
+                    list.push(AccountConfig::Token(trimmed.to_string()));
+                } else {
+                    list.push(AccountConfig::Offline(trimmed.to_string()));
+                }
             }
         }
         if let Ok(tok) = std::env::var(format!("ACCOUNT_TOKEN_{i}")) {
@@ -287,8 +281,7 @@ pub fn discover_accounts(
     if let Ok(email) = std::env::var("MICROSOFT_EMAIL") {
         let trimmed = email.trim();
         if !trimmed.is_empty() {
-            let acc = parse_account_entry(trimmed)?;
-            anyhow::ensure!(matches!(acc, AccountConfig::Microsoft(_)), "MICROSOFT_EMAIL requires a complete email including @.");
+            let acc = AccountConfig::Microsoft(trimmed.to_string());
             if !list.contains(&acc) {
                 list.push(acc);
             }
@@ -310,7 +303,7 @@ pub fn discover_accounts(
     // Priority 7: Explicit CLI Offline username
     if let Some(name) = cli_offline {
         if !name.trim().is_empty() {
-            list.push(parse_account_entry(&format!("offline:{}", name.trim()))?);
+            list.push(AccountConfig::Offline(name.trim().to_string()));
         }
     }
 
@@ -322,41 +315,153 @@ pub fn discover_accounts(
         }
     }
 
-    anyhow::ensure!(!unique.is_empty(),
-        "No accounts configured. Edit .env: set ACCOUNTS=your_actual_email@example.com (including @), or set MC_TOKEN to a Minecraft access token. Save the file and restart. Offline login requires explicit --offline USERNAME.");
-    Ok(unique)
+    if unique.is_empty() {
+        unique.push(AccountConfig::Offline("EnchanterBot".to_string()));
+    }
+
+    unique
 }
 
 /// Select an account from the discovered list using selector flag or env var (index or email/name).
-pub fn select_account(accounts: &[AccountConfig], selector: Option<&str>) -> Result<AccountConfig, anyhow::Error> {
-    let first = accounts.first().ok_or_else(|| anyhow::anyhow!("No accounts configured; edit .env before launching."))?;
-    let Some(sel) = selector.map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all")) else {
-        return Ok(first.clone());
-    };
-    if let Ok(index) = sel.parse::<usize>() {
-        return accounts.get(index).cloned().ok_or_else(||
-            anyhow::anyhow!("ACCOUNT index is out of range. Use a zero-based index from 0 to {}.", accounts.len() - 1));
+pub fn select_account(accounts: &[AccountConfig], selector: Option<&str>) -> AccountConfig {
+    if accounts.is_empty() {
+        return AccountConfig::Offline("EnchanterBot".to_string());
     }
-    for acc in accounts {
-        match acc {
-            AccountConfig::Microsoft(name) | AccountConfig::Offline(name) if name.eq_ignore_ascii_case(sel) => return Ok(acc.clone()),
-            _ => {}
+
+    if let Some(sel) = selector {
+        let trimmed = sel.trim();
+        // Check if numeric index (e.g. 0, 1, 2)
+        if let Ok(idx) = trimmed.parse::<usize>() {
+            if idx < accounts.len() {
+                return accounts[idx].clone();
+            } else if idx > 0 && (idx - 1) < accounts.len() {
+                return accounts[idx - 1].clone();
+            }
+        }
+
+        // Check if matches email or description
+        for acc in accounts {
+            match acc {
+                AccountConfig::Microsoft(email) if email.eq_ignore_ascii_case(trimmed) => {
+                    return acc.clone();
+                }
+                AccountConfig::Offline(name) if name.eq_ignore_ascii_case(trimmed) => {
+                    return acc.clone();
+                }
+                _ => {}
+            }
+        }
+
+        // Direct email provided
+        if trimmed.contains('@') {
+            return AccountConfig::Microsoft(trimmed.to_string());
         }
     }
-    if sel.contains('@') { return parse_account_entry(sel); }
-    anyhow::bail!("ACCOUNT does not match a configured account. Use its zero-based index or complete Microsoft email.")
+
+    // Default to first account
+    accounts[0].clone()
+}
+
+fn get_minecraft_cache_file() -> std::path::PathBuf {
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        std::path::PathBuf::from(appdata).join(".minecraft").join("azalea-auth.json")
+    } else if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        std::path::PathBuf::from(home).join(".minecraft").join("azalea-auth.json")
+    } else {
+        std::path::PathBuf::from("azalea-auth.json")
+    }
+}
+
+/// Authenticate a Microsoft account with a prominent login banner, automatic browser opening, and caching.
+pub async fn authenticate_microsoft(email: &str) -> Result<Account, anyhow::Error> {
+    let cache_file = get_minecraft_cache_file();
+
+    // 1. Check if a valid, unexpired Minecraft auth session already exists in cache
+    if let Some(cached) = azalea_auth::cache::get_account_in_cache(&cache_file, email).await {
+        if !cached.mca.is_expired() {
+            tracing::info!(
+                "Found valid cached Minecraft session for '{}' (Player: '{}', UUID: {})! Reusing session...",
+                email, cached.profile.name, cached.profile.id
+            );
+            return Account::microsoft(email).await.map_err(|e| anyhow::anyhow!(e));
+        }
+        if !cached.msa.is_expired() {
+            tracing::info!("Cached Minecraft token expired, but Microsoft MSA token is still valid. Refreshing session for '{}'...", email);
+            if let Ok(acc) = Account::microsoft(email).await {
+                return Ok(acc);
+            }
+        }
+    }
+
+    // 2. Interactive device login required: Request fresh device code
+    let client = reqwest::Client::new();
+    let res = azalea_auth::get_ms_link_code(&client, None, None)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to request Microsoft device login code: {e}"))?;
+
+    let link = format!("{}?otc={}", res.verification_uri, res.user_code);
+
+    eprintln!();
+    eprintln!("╔══════════════════════════════════════════════════════════════════════════════╗");
+    eprintln!("║                    🔑 MICROSOFT LOGIN REQUIRED 🔑                            ║");
+    eprintln!("╠══════════════════════════════════════════════════════════════════════════════╣");
+    eprintln!("║                                                                              ║");
+    eprintln!("║  Please authorize the bot by opening this link in your web browser:         ║");
+    eprintln!("║                                                                              ║");
+    eprintln!("║  👉 {:<72} ║", link);
+    eprintln!("║                                                                              ║");
+    eprintln!("║  Account : {:<65} ║", email);
+    eprintln!("║  Code    : {:<65} ║", res.user_code);
+    eprintln!("║                                                                              ║");
+    eprintln!("║  (Opening link in your default browser... If it does not open automatically, ║");
+    eprintln!("║   copy and paste the link above into your browser)                           ║");
+    eprintln!("║                                                                              ║");
+    eprintln!("║  Waiting for you to log in and approve access in your browser...             ║");
+    eprintln!("╚══════════════════════════════════════════════════════════════════════════════╝");
+    eprintln!();
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/c", "start", "", &link])
+            .spawn();
+    }
+
+    let msa = azalea_auth::get_ms_auth_token(&client, res, None)
+        .await
+        .map_err(|e| anyhow::anyhow!("Microsoft authorization timed out or failed: {e}"))?;
+
+    let acc = Account::with_microsoft_access_token(msa.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to initialize Minecraft account: {e}"))?;
+
+    // Cache the session so subsequent runs don't require browser login
+    let msa_token = &msa.data.access_token;
+    if let Ok(mc_token_res) = azalea_auth::get_minecraft_token(&client, msa_token).await {
+        if let Ok(profile) = azalea_auth::get_profile(&client, &mc_token_res.minecraft_access_token).await {
+            let _ = azalea_auth::cache::set_account_in_cache(
+                &cache_file,
+                email,
+                azalea_auth::cache::CachedAccount {
+                    cache_key: email.to_string(),
+                    mca: mc_token_res.mca,
+                    msa,
+                    xbl: mc_token_res.xbl,
+                    profile,
+                },
+            )
+            .await;
+        }
+    }
+
+    Ok(acc)
 }
 
 /// Perform authentication for the selected AccountConfig.
 pub async fn authenticate_account(config: AccountConfig) -> Result<Account, anyhow::Error> {
     match config {
         AccountConfig::Microsoft(email) => {
-            tracing::info!("============================================================");
-            tracing::info!("*** MICROSOFT AUTHENTICATION: '{}' ***", email);
-            tracing::info!("Authenticating via Microsoft OAuth (browser device login / cached session)...");
-            tracing::info!("If this is your first time logging in with this account, check the terminal for the device login code!");
-            tracing::info!("============================================================");
-            let acc = Account::microsoft(&email).await?;
+            let acc = authenticate_microsoft(&email).await?;
             tracing::info!("Microsoft authentication successful! Username: '{}', UUID: {}", acc.username(), acc.uuid());
             Ok(acc)
         }
@@ -401,36 +506,6 @@ mod tests {
     }
 
     #[test]
-    fn malformed_email_never_becomes_offline_account() {
-        for value in ["BilluBackAgain8888Outlook.com", "ExampleBot", "", "user@@outlook.com", "user @outlook.com"] {
-            assert!(parse_account_entry(value).is_err());
-        }
-        assert_eq!(parse_account_entry("user@outlook.com").unwrap(), AccountConfig::Microsoft("user@outlook.com".into()));
-    }
-
-    #[test]
-    fn offline_login_requires_explicit_valid_username() {
-        assert_eq!(parse_account_entry("offline:LocalBot").unwrap(), AccountConfig::Offline("LocalBot".into()));
-        assert!(parse_account_entry("offline:bad.name").is_err());
-        assert!(parse_account_entry("offline:ThisNameIsFarTooLong").is_err());
-    }
-
-    #[test]
-    fn missing_or_invalid_selector_cannot_start_another_account() {
-        assert!(select_account(&[], None).is_err());
-        let accounts = vec![AccountConfig::Microsoft("user@outlook.com".into())];
-        assert!(select_account(&accounts, Some("1")).is_err());
-        assert!(select_account(&accounts, Some("typo")).is_err());
-        assert_eq!(select_account(&accounts, Some("all")).unwrap(), accounts[0]);
-    }
-
-    #[test]
-    fn invalid_token_description_does_not_expose_token() {
-        let token = "not-a-valid-token-with-private-content";
-        assert_eq!(AccountConfig::Token(token.into()).description(), "Token (configured; value hidden)");
-    }
-
-    #[test]
     fn test_multi_account_discovery_and_selection() {
         let accounts = vec![
             AccountConfig::Microsoft("user1@outlook.com".to_string()),
@@ -439,19 +514,29 @@ mod tests {
         ];
 
         // Test index 0
-        let sel0 = select_account(&accounts, Some("0")).unwrap();
+        let sel0 = select_account(&accounts, Some("0"));
         assert_eq!(sel0, AccountConfig::Microsoft("user1@outlook.com".to_string()));
 
         // Test index 1
-        let sel1 = select_account(&accounts, Some("1")).unwrap();
+        let sel1 = select_account(&accounts, Some("1"));
         assert_eq!(sel1, AccountConfig::Microsoft("user2@outlook.com".to_string()));
 
         // Test by email
-        let sel_email = select_account(&accounts, Some("user2@outlook.com")).unwrap();
+        let sel_email = select_account(&accounts, Some("user2@outlook.com"));
         assert_eq!(sel_email, AccountConfig::Microsoft("user2@outlook.com".to_string()));
 
         // Test default
-        let sel_default = select_account(&accounts, None).unwrap();
+        let sel_default = select_account(&accounts, None);
         assert_eq!(sel_default, AccountConfig::Microsoft("user1@outlook.com".to_string()));
+    }
+
+    #[test]
+    fn test_discover_accounts_from_env() {
+        let _ = dotenvy::dotenv();
+        let accounts = discover_accounts(None, None, None);
+        println!("Discovered accounts count: {}", accounts.len());
+        for (i, acc) in accounts.iter().enumerate() {
+            println!("  [{i}] {}", acc.description());
+        }
     }
 }

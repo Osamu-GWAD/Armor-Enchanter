@@ -12,14 +12,13 @@ An autonomous, high-performance Minecraft enchanting bot built in Rust with [Aza
     - 2× Diamond Helmet, 2× Diamond Chestplate, 2× Diamond Leggings, 2× Diamond Boots, collecting both pieces from each order together
     - 8× Unbreaking III, 8× Mending, 4× Blast Protection IV, 4× Protection IV enchanted books (24 books total)
     - 4× Stacks of Bottles o' Enchanting (256 bottles total; partial stacks count by bottle quantity)
-    - Anvil supply (retrieved and placed in Phase 1; any additional anvils returned in a server stack are preserved)
+    - 1× Anvil (retrieved and placed in Phase 1 before Phase 2 item retrieval, leaving all 36 slots free)
 
-- **Inventory preservation and anvil recovery**:
-  - Automatic selling is disabled. XP bottles, spare anvils, and unrelated items stay in inventory.
-  - XP bottles are used for enchanting, never splashed simply to clear surplus stacks.
-  - Anvil counts use current inventory plus a confirmed world block. A broken anvil is replaced from inventory, or withdrawn from `/order` when no replacement remains.
-  - Placement must be confirmed in the world before enchanting continues.
-  - If inventory is full, the bot finishes a craftable partial set; otherwise it preserves everything and retries orders after 45 seconds. Free space manually if unrelated items prevent progress.
+- **Automated `/sell` Inventory Cleaning**:
+  - Upon spawn and between batches, automatically scans player inventory slots (9..=44).
+  - Identifies foreign items (cobblestone, dirt, junk books, weapons, drops) and surplus items beyond quota.
+  - Opens `/sell`, transfers unneeded items via `ClickType::QuickMove`, and closes the container to sell them for money.
+  - Strictly preserves completed max-enchanted armor and in-progress armor pieces.
 
 - **Exact Level-to-Level XP Calculation & Rapid Throwing**:
   - Computes exact XP required for anvil combines using official Minecraft Java level formulas:
@@ -30,11 +29,15 @@ An autonomous, high-performance Minecraft enchanting bot built in Rust with [Aza
   - Throws bottles in rapid, authentic streams (1 tick per throw) with `ServerboundSwing` arm animations, reaching required levels in under 1 second.
 
 - **Optimal Anvil Sequencing ([iamcal/enchant-order](https://github.com/iamcal/enchant-order))**:
-  - Sequences combines to minimize prior work penalties and cumulative level costs:
-    - **Helmet**: Protection IV (4 lvl) $\to$ Unbreaking III (4 lvl) $\to$ Mending (5 lvl)
-    - **Chestplate**: Protection IV (4 lvl) $\to$ Unbreaking III (4 lvl) $\to$ Mending (5 lvl)
-    - **Leggings**: Blast Protection IV (8 lvl) $\to$ Unbreaking III (4 lvl) $\to$ Mending (5 lvl)
-    - **Boots**: Blast Protection IV (8 lvl) $\to$ Unbreaking III (4 lvl) $\to$ Mending (5 lvl)
+  - Tree-merge sequence minimizing prior work penalties and cumulative level costs:
+    - **Book Merge**: Unbreaking III (book) + Mending (book) $\to$ (Unbreaking III + Mending) book (2 lvl)
+    - **Base Armor Merge**:
+      - **Helmet**: Blank Helmet + Protection IV (4 lvl)
+      - **Chestplate**: Blank Chestplate + Protection IV (4 lvl)
+      - **Leggings**: Blank Leggings + Blast Protection IV (8 lvl)
+      - **Boots**: Blank Boots + Blast Protection IV (8 lvl)
+    - **Final Tree Merge**: Armor (with Prot IV / Blast Prot IV) + (Unbreaking III + Mending) book (7 lvl)
+  - Result: Fully enchanted armor piece with Prior Work Penalty of only 2 (3 levels) instead of 3 (7 levels).
 
 - **Anti-Cheat Resilient & Humanized Interactions**:
   - **Smooth View Interpolation**: Mimics human mouse rotation using a cosine ease-in-out curve ($\alpha = \frac{1 - \cos(\pi t)}{2}$) over 2–6 ticks, eliminating abrupt aim snapping while keeping rotations responsive.
@@ -98,10 +101,10 @@ cargo run --release -- --microsoft player1@outlook.com
 
 ## Serial armor workflow and recovery
 
-- Withdraw two helmets, chestplates, leggings, and boots from `/order`, plus the books and XP listed above. The eight armor pieces, 24 books, and four XP stacks require all 36 inventory slots. Spare items can reduce how much fits in one withdrawal.
+- Withdraw two helmets, chestplates, leggings, and boots from `/order`, plus the books and XP listed above. The eight armor pieces, 24 books, and four XP stacks fit the 36 inventory slots after placing the anvil.
 - Finish enchanting the helmet, then chestplate, leggings, and boots. A missing piece or required book returns the unfinished set to restocking. Duplicate armor does not take priority over the next type.
 - Once all four pieces are complete, aim at a hopper within two blocks and drop exactly one helmet, chestplate, leggings, and boots, in that order. Each drop waits for the server to report one fewer piece before advancing. No hotbar swaps or optimistic inventory deletion are used for drops.
-- Immediately enchant and drop the second stocked set in the same order. `/order` restocking runs after both sets, or when supplies are missing.
+- Immediately enchant and drop the second stocked set in the same order. Inventory cleaning and `/order` restocking run after both sets, or when supplies are missing, rather than after every set.
 - Anvil and drop workers wake on server inventory updates. Opening the anvil releases its state lock immediately after interaction, allowing screen packets to be processed without a fixed post-interaction delay. Timeouts and per-item acknowledgements remain in place; live throughput has not been benchmarked.
 - A missing hopper or unconfirmed drop retains the sequence and reconnects for reconciliation. Pending drop bookkeeping survives automatic reconnects within the same account process. It is not saved across a process restart.
 - Inventory withdrawal snapshots are handed to the enchanter before it starts. Anvil transfers wait for source and inventory changes; direct player-inventory packets update the same caches.
@@ -152,6 +155,47 @@ cargo run --release -- --account 0
 cargo test
 ```
 
+### Unsigned chat
+
+Chat signing is disabled on every connection. The bot does not request player
+chat certificates; outgoing chat and commands are unsigned. Microsoft/Minecraft
+authentication for joining online-mode servers remains enabled. Servers that
+require signed chat may reject unsigned messages.
+
+### GameTick lag warnings
+
+Azalea targets one game tick every 50 ms. A `GameTick is more than 10 ticks behind`
+warning means the local scheduler has accumulated roughly half a second of lag
+and discarded overdue ticks to avoid a catch-up burst. It does not measure server TPS.
+
+The bot requests a view distance of 2 chunks instead of Azalea's default of 8,
+reducing chunk/entity traffic where the server honors that setting. All enchanting
+interactions are nearby. Override with `--view-distance 8` or `VIEW_DISTANCE=8`
+if needed (accepted range: 2–32). Multi-account launches forward the setting.
+
+Every 30 seconds, `Local scheduler timing` reports executed `local_tps`, the
+number of ticks and updates, `max_update_ms`, and `max_tick_gap_ms`. The update
+measurement spans the outer schedule from First to Last; it excludes GameTick
+and time waiting for the ECS lock or for the thread to run. Large update times
+point to work within that schedule; long tick gaps with fast updates require
+checking GameTick work, other local tasks, lock contention, and host load.
+The warning alone does not identify which of those caused the lag. Tick-lag
+warnings do not automatically reconnect or alter the 20-TPS simulation.
+
+Console logging is initialized with a dedicated worker and a bounded 4096-line queue. If
+the terminal stalls and fills that queue, new log lines are dropped instead of
+blocking game ticks. The worker guard remains alive until normal shutdown to
+flush queued output. Debug-only item audits are skipped when debug logging is
+disabled, and the fallback GUI watchdog runs every 100 ms; packet-driven actions
+still wake on server updates. Development builds also optimize the encryption
+and decompression dependencies, as Azalea's workspace profile is not inherited.
+
+Rebuild with `cargo build --release --locked` and use `run.bat` or `run_all.bat`.
+If warnings persist, compare one account against all accounts and profile CPU
+usage during chunk loading and inventory updates. These changes remove known
+sources of overhead and blocking; a live run is needed to confirm the cause of
+any particular warning.
+
 ---
 
 ## Architecture
@@ -162,11 +206,3 @@ cargo test
 - `src/gui.rs`: Container window tracking, order item inspection, and slot click packet interactions.
 - `src/nbt.rs`: NBT parsing utilities for item identification and enchantment verification.
 - `src/auth.rs`: Minecraft session authentication and token resolution.
-
-## Account setup errors
-
-The launcher creates `.env` on first use and exits. Edit that file in the same folder as the launcher, save it, and launch again. Set `ACCOUNTS` to complete Microsoft email addresses, including the `@` symbol; multiple emails are comma-separated. Microsoft authentication uses the browser/device login and retrieves the Minecraft profile name automatically.
-
-For example, replace the placeholder in `ACCOUNTS=your_actual_email@outlook.com` with your real email. A value such as `ExampleUserOutlook.com` is missing `@` and must not be used as a Minecraft username. Empty configuration and malformed account entries now stop before any server connection. Your existing `.env` is never overwritten by setup.
-
-Offline mode is only selected explicitly using `--offline LocalBot` or `ACCOUNTS=offline:LocalBot`, for servers that permit offline authentication. Account selection uses zero-based indices; invalid selectors stop rather than silently selecting a different account.

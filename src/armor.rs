@@ -71,26 +71,6 @@ pub fn next_armor(items: &[(i16, ItemInfo)]) -> Option<&(i16, ItemInfo)> {
     None
 }
 
-/// Remaining books for the same one-piece-per-type set the enchanter selects.
-/// Order: Mending, Unbreaking III, Protection IV, Blast Protection IV.
-pub fn books_to_finish_set(items: &[(i16, ItemInfo)]) -> Option<[u32; 4]> {
-    let mut needed = [0; 4];
-    for kind in 0..4 {
-        let protection = if kind < 2 { "protection" } else { "blast_protection" };
-        let (_, info) = items.iter().filter(|(_, info)| armor_type(info) == Some(kind))
-            .min_by_key(|(slot, info)| {
-                let progress = i32::from(info.has_enchantment(protection, 4))
-                    + i32::from(info.has_enchantment("unbreaking", 3))
-                    + i32::from(info.has_enchantment("mending", 1));
-                (-progress, *slot)
-            })?;
-        needed[0] += u32::from(!info.has_enchantment("mending", 1));
-        needed[1] += u32::from(!info.has_enchantment("unbreaking", 3));
-        needed[if kind < 2 { 2 } else { 3 }] += u32::from(!info.has_enchantment(protection, 4));
-    }
-    Some(needed)
-}
-
 /// A stable drop plan contains exactly one completed item of each remaining type.
 pub fn drop_plan(items: &[(i16, ItemInfo)], next: usize) -> Option<Vec<i16>> {
     (next..4)
@@ -180,17 +160,6 @@ mod tests {
         assert_eq!(next_armor(&items).unwrap().0, 13);
         items[4].1 = piece(3, true);
         assert!(next_armor(&items).is_none());
-    }
-
-    #[test]
-    fn partially_finished_set_needs_only_the_missing_boots_enchantment() {
-        let mut items: Vec<_> = (0..4).map(|kind| (9 + kind as i16, piece(kind, true))).collect();
-        items[3].1.enchantments.remove("blast_protection");
-        // Raw duplicates must not inflate the books needed to finish the current set.
-        items.extend((0..4).map(|kind| (20 + kind as i16, piece(kind, false))));
-        assert_eq!(books_to_finish_set(&items), Some([0, 0, 0, 1]));
-        items.retain(|(_, info)| armor_type(info) != Some(2));
-        assert_eq!(books_to_finish_set(&items), None);
     }
 
     #[test]

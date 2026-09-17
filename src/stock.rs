@@ -58,7 +58,11 @@ impl StockAudit {
 
     pub fn is_empty(&self, page: usize, listing: &OrderListing) -> bool {
         self.empty.iter().any(|(p, entry, time)| {
-            *p == page && entry == listing && time.elapsed() < Duration::from_secs(45)
+            *p == page
+                && entry.slot == listing.slot
+                && entry.name == listing.name
+                && (entry.icon.is_empty() == listing.icon.is_empty())
+                && time.elapsed() < Duration::from_secs(45)
         })
     }
 

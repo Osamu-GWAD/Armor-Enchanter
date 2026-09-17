@@ -446,6 +446,18 @@ pub fn is_mending(info: &ItemInfo) -> bool {
         && info.has_enchantment("mending", 1)
 }
 
+pub fn is_unbreaking_and_mending(info: &ItemInfo) -> bool {
+    is_unbreaking_3(info) && is_mending(info)
+}
+
+pub fn is_single_unbreaking_3(info: &ItemInfo) -> bool {
+    is_unbreaking_3(info) && !is_mending(info)
+}
+
+pub fn is_single_mending(info: &ItemInfo) -> bool {
+    is_mending(info) && !is_unbreaking_3(info)
+}
+
 pub fn is_protection_4(info: &ItemInfo) -> bool {
     let is_book = info.kind.contains("EnchantedBook")
         || info.kind.contains("Book")

@@ -9,17 +9,11 @@ echo.
 
 if not exist ".env" (
     if exist ".env.example" (
+        echo [.env] not found. Copying .env.example to .env...
         copy ".env.example" ".env" >nul
-    ) else (
-        echo # Add your Microsoft email including the @ symbol.> .env
-        echo ACCOUNTS=>> .env
+        echo Please edit .env with your Microsoft accounts, then press any key.
+        pause
     )
-    echo Created .env. Open it and set ACCOUNTS to your full Microsoft email, including @.
-    echo Example: ACCOUNTS=your_email@outlook.com
-    echo For multiple accounts, separate complete emails with commas.
-    echo Save .env, then run this launcher again. No bot has been started.
-    pause
-    exit /b 1
 )
 
 echo Starting all configured accounts concurrently...

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-azalea = { version = "0.16.0", default-features = false, features = ["serde", "packet-event", "online-mode"] }
+azalea = "0.16.0"
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -14,10 +14,21 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
+tracing-appender = "0.2"
 azalea-auth = "0.16.0"
 azalea-registry = "0.16.0"
 azalea-inventory = "0.16.0"
 reqwest = "0.13"
 dotenvy = "0.15"
 
+# Dependency profiles are not inherited from Azalea's own workspace.
+# Keep packet encryption/decompression fast when using `cargo run` as well.
+[profile.dev.package.azalea-crypto]
+opt-level = 3
+[profile.dev.package.cfb8]
+opt-level = 3
+[profile.dev.package.aes]
+opt-level = 3
+[profile.dev.package.flate2]
+opt-level = 3
 

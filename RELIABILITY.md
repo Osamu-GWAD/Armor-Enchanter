@@ -1,13 +1,3 @@
-## September 12 log fixes
-
-- Removed automatic selling and surplus XP burning. An unexpected sell screen closes without depositing items; recovery resumes `/order`.
-- Replaced historical anvil totals with current inventory plus confirmed placed-anvil availability. Missing anvils trigger replacement withdrawal, including mid-set; placement needs a world-block confirmation.
-- Identical hotbar staging swaps are skipped. Different items still require acknowledged transfers, and five failed combinations stop the worker for reconnect instead of reopening indefinitely.
-- Partly finished sets only require books for their missing enchants. Full inventories preserve items and retry after 45 seconds when no set can finish.
-- Collection scans use the actual top-container size, supporting the 54-slot collection screen in the log.
-- Reduced GUI polling, cached unchanged inventory item metadata, and skipped debug NBT serialization when debug logging is disabled. Disabled Azalea's duplicate logging plugin while retaining the bot's subscriber. These reduce local overhead; live tick timing still depends on host and server load.
-- Navigation refresh budgets survive repeated main-menu snapshots; slower responses get three seconds before recovery.
-
 # Reliability changes
 
 ## Verified stock alerts

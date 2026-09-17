@@ -5,20 +5,26 @@ pub mod enchanter;
 pub mod gui;
 pub mod nbt;
 pub mod webhook;
+mod logging;
+mod tick_diagnostics;
 
+use azalea::app::PluginGroup;
 use azalea::prelude::*;
 use azalea::protocol::packets::game::{ClientboundGamePacket, ServerboundContainerClose};
 use azalea::{Client, Event};
 use clap::Parser;
-use enchanter::{smooth_look, swing_arm, EnchanterManager};
+use enchanter::{parse_throw_speed, smooth_look, swing_arm, EnchanterManager};
 use gui::{GuiManager, OrderWorkflowState, WithdrawalPhase, WithdrawalQuota};
+use nbt::{inspect_item_with_bot, is_anvil};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{Mutex, Notify};
-use tracing::{error, info, warn, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing::{error, info, warn};
 
 static GLOBAL_QUOTA: OnceLock<WithdrawalQuota> = OnceLock::new();
 static GLOBAL_ORDER_TARGET: OnceLock<String> = OnceLock::new();
+static GLOBAL_XP_THROW_SPEED: OnceLock<u32> = OnceLock::new();
+static GLOBAL_XP_STRICT_CALCULATION: OnceLock<bool> = OnceLock::new();
+static GLOBAL_VIEW_DISTANCE: OnceLock<u8> = OnceLock::new();
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Minecraft Auto-Enchanter Bot with Token Support & GUI Automation", long_about = None)]
@@ -30,6 +36,10 @@ struct Args {
     /// Server port
     #[arg(short, long, default_value_t = 25565)]
     port: u16,
+
+    /// Requested chunk view distance; nearby enchanting only needs 2 chunks
+    #[arg(long, env = "VIEW_DISTANCE", default_value_t = 2, value_parser = clap::value_parser!(u8).range(2..=32))]
+    view_distance: u8,
 
     /// Minecraft JWT or Bearer access token for online-mode authentication
     #[arg(short, long, env = "MC_TOKEN", hide_env_values = true)]
@@ -72,7 +82,7 @@ struct Args {
     xp_stacks: u32,
 
     /// Number of anvils to withdraw
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 2)]
     anvils: u32,
 
     /// Number of Diamond Helmets to withdraw
@@ -94,6 +104,14 @@ struct Args {
     /// Target player username whose buy orders will be fulfilled (e.g. zn6h)
     #[arg(long, env = "ORDER_TARGET_NAME", default_value = "zn6h")]
     order_target: String,
+
+    /// XP bottle throwing delay in ticks (speed: 1 = normal 1 tick/50ms, 2 = 2 ticks/100ms slower/safer, 0 = burst)
+    #[arg(long, env = "XP_THROW_SPEED", default_value = "1")]
+    xp_throw_speed: String,
+
+    /// Whether to use strict zero-overshoot XP calculation and single-bottle precision
+    #[arg(long, env = "XP_STRICT_CALCULATION", default_value_t = true, action = clap::ArgAction::Set)]
+    xp_strict_calculation: bool,
 }
 
 #[derive(Clone, Component)]
@@ -103,10 +121,12 @@ struct BotState {
     spawned: Arc<Mutex<bool>>,
     order_sent: Arc<Mutex<bool>>,
     inventory_updated: Arc<Notify>,
+    experience_updated: Arc<Notify>,
     current_level: Arc<std::sync::atomic::AtomicU32>,
     experience_progress_milli: Arc<std::sync::atomic::AtomicU32>,
     total_experience: Arc<std::sync::atomic::AtomicU32>,
     server_anvil_cost: Arc<std::sync::atomic::AtomicU32>,
+    maintenance_active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 // Each account runs in its own process. Preserve transactions across reconnects.
@@ -125,11 +145,19 @@ impl Default for BotState {
         let experience_progress_milli = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let total_experience = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let server_anvil_cost = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let experience_updated = Arc::new(Notify::new());
         let mut enchanter = EnchanterManager::new();
+        if let Some(&speed) = GLOBAL_XP_THROW_SPEED.get() {
+            enchanter.throw_speed_ticks = speed;
+        }
+        if let Some(&strict) = GLOBAL_XP_STRICT_CALCULATION.get() {
+            enchanter.strict_calculation = strict;
+        }
         enchanter.current_level = current_level.clone();
         enchanter.experience_progress_milli = experience_progress_milli.clone();
         enchanter.total_experience = total_experience.clone();
         enchanter.server_anvil_cost = server_anvil_cost.clone();
+        enchanter.experience_updated = experience_updated.clone();
 
         Self {
             gui: SESSION_GUI.get_or_init(|| Arc::new(Mutex::new(gui))).clone(),
@@ -137,10 +165,12 @@ impl Default for BotState {
             spawned: Arc::new(Mutex::new(false)),
             order_sent: Arc::new(Mutex::new(false)),
             inventory_updated: Arc::new(Notify::new()),
+            experience_updated,
             current_level,
             experience_progress_milli,
             total_experience,
             server_anvil_cost,
+            maintenance_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -148,6 +178,10 @@ impl Default for BotState {
 async fn handle(bot: Client, event: Event, state: BotState) -> Result<(), anyhow::Error> {
     match event {
         Event::Init => {
+            bot.set_client_information(azalea::ClientInformation {
+                view_distance: *GLOBAL_VIEW_DISTANCE.get().unwrap_or(&2),
+                ..Default::default()
+            });
             info!("Bot initialized, connecting to server...");
         }
         Event::Login => {
@@ -162,7 +196,7 @@ async fn handle(bot: Client, event: Event, state: BotState) -> Result<(), anyhow
                 let bot_clone = bot.clone();
                 let state_clone = state.clone();
 
-                // Wall-clock watchdog keeps working even while game ticks fall behind.
+                // Packet updates wake GUI actions immediately; this is only a fallback.
                 let bot_wd = bot.clone();
                 let state_wd = state.clone();
                 tokio::spawn(async move {
@@ -182,7 +216,6 @@ async fn handle(bot: Client, event: Event, state: BotState) -> Result<(), anyhow
                         pump_gui_actions(bot_wd.clone(), state_wd.clone(), None).await;
                     }
                 });
-
                 tokio::spawn(async move {
                     // Fast spawn warmup before sending commands
                     info!("Waiting 30 ticks (~1.5s) for server spawn cooldown before sending commands...");
@@ -191,12 +224,61 @@ async fn handle(bot: Client, event: Event, state: BotState) -> Result<(), anyhow
                     // Teleport to player base using /home 1 so block interactions (anvil) are in non-protected territory
                     let initial_pos = bot_clone.position();
                     info!("Initial spawn position: {:?}", initial_pos);
-                    info!("Teleporting to base via /home 1...");
-                    gui::send_command(&bot_clone, "/home 1");
-                    bot_clone.wait_ticks(20).await; // 1 second for teleport settle
+
+                    let mut at_base = {
+                        let mut ench = state_clone.enchanter.lock().await;
+                        ench.check_if_anvil_placed(&bot_clone).await || EnchanterManager::find_nearby_hopper(&bot_clone).is_some()
+                    };
+
+                    if !at_base {
+                        for attempt in 1..=15 {
+                            info!("Teleporting to base via /home 1 (attempt {attempt}/15)...");
+                            state_clone.maintenance_active.store(false, std::sync::atomic::Ordering::SeqCst);
+                            gui::send_command(&bot_clone, "/home 1");
+                            bot_clone.wait_ticks(30).await; // 1.5s for teleport settle
+
+                            let current_pos = bot_clone.position();
+                            let dist = (current_pos - initial_pos).length();
+                            let base_blocks = {
+                                let mut ench = state_clone.enchanter.lock().await;
+                                ench.check_if_anvil_placed(&bot_clone).await || EnchanterManager::find_nearby_hopper(&bot_clone).is_some()
+                            };
+
+                            if dist > 5.0 || base_blocks {
+                                info!("Arrived at base! Position after /home 1: {:?} (distance from spawn: {:.1})", current_pos, dist);
+                                at_base = true;
+                                break;
+                            }
+
+                            if state_clone.maintenance_active.load(std::sync::atomic::Ordering::SeqCst) {
+                                warn!("Destination area in maintenance; waiting 10 seconds before retrying /home 1...");
+                                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                            } else {
+                                if attempt >= 3 && attempt % 2 == 1 {
+                                    info!("Trying fallback '/home' command (attempt {attempt}/15)...");
+                                    gui::send_command(&bot_clone, "/home");
+                                    bot_clone.wait_ticks(30).await;
+                                    let pos2 = bot_clone.position();
+                                    if (pos2 - initial_pos).length() > 5.0 {
+                                        info!("Arrived at base via /home! Position: {:?}", pos2);
+                                        at_base = true;
+                                        break;
+                                    }
+                                }
+                                bot_clone.wait_ticks(40).await;
+                            }
+                        }
+                    }
+
+                    if !at_base {
+                        error!("Could not teleport to base (/home 1 failed or destination in maintenance). Current position: {:?}.", bot_clone.position());
+                        error!("Aborting startup to prevent withdrawing items in an unsafe/protected location. Disconnecting...");
+                        bot_clone.disconnect();
+                        return;
+                    }
 
                     let current_pos = bot_clone.position();
-                    info!("Position after /home 1: {:?}", current_pos);
+                    info!("Verified at base position: {:?}", current_pos);
 
                     let resume_drop = {
                         let gui = state_clone.gui.lock().await;
@@ -208,8 +290,16 @@ async fn handle(bot: Client, event: Event, state: BotState) -> Result<(), anyhow
                         return;
                     }
 
-                    // Preserve all supplies and unrelated items on login.
-                    state_clone.gui.lock().await.reset_and_sync_inventory(Some(&bot_clone));
+                    // Reset and sync inventory state (no clean_inventory)
+                    {
+                        let mut gui = state_clone.gui.lock().await;
+                        gui.reset_and_sync_inventory(Some(&bot_clone));
+                    }
+
+                    {
+                        let mut gui = state_clone.gui.lock().await;
+                        gui.reset_and_sync_inventory(Some(&bot_clone));
+                    }
 
                     // Check if an anvil is ALREADY placed at base
                     let anvil_placed = {
@@ -217,43 +307,53 @@ async fn handle(bot: Client, event: Event, state: BotState) -> Result<(), anyhow
                         ench.check_if_anvil_placed(&bot_clone).await
                     };
 
-                    let has_anvil_in_inv = {
+                    // Ensure any anvils in inventory are moved to offhand (slot 45)
+                    {
                         let mut gui = state_clone.gui.lock().await;
-                        gui.placed_anvil_available = anvil_placed;
-                        gui.sync_collected_from_inventory(Some(&bot_clone));
-                        gui.collected.anvils >= 1
+                        crate::enchanter::EnchanterManager::ensure_anvils_in_offhand(&bot_clone, &mut gui.player_inventory).await;
+                    }
+
+                    let anvil_count = {
+                        let gui = state_clone.gui.lock().await;
+                        gui.player_inventory.values().filter_map(|item| {
+                            inspect_item_with_bot(item, Some(&bot_clone))
+                                .filter(|info| is_anvil(info))
+                                .map(|info| info.count as u32)
+                        }).sum::<u32>()
                     };
 
-                    if anvil_placed {
-                        info!("Anvil is already placed on the ground! Proceeding to Phase 2: Items Retrieval.");
+                    info!("Initial base check: placed anvil = {anvil_placed}, inventory anvil count = {anvil_count}");
+
+                    if anvil_count < 2 {
+                        info!("Bot has {anvil_count} anvil(s) (< 2, or anvil == 1). Starting Phase 1: Anvil Placement (looking down at feet & withdrawing Anvil from /order)...");
+                        let mut gui = state_clone.gui.lock().await;
+                        gui.phase = WithdrawalPhase::AnvilPlacement;
+                        gui.anvil_stack_dropped = false;
+                    } else if anvil_placed {
+                        info!("Anvil is already placed on the ground and bot has {anvil_count} anvils! Proceeding to Phase 2: Items Retrieval.");
                         let mut gui = state_clone.gui.lock().await;
                         gui.phase = WithdrawalPhase::ItemsRetrieval;
-                        gui.placed_anvil_available = true;
-                        gui.sync_collected_from_inventory(Some(&bot_clone));
-                    } else if has_anvil_in_inv {
-                        info!("Anvil found in inventory! Placing it now...");
+                    } else {
+                        info!("Anvil found in inventory ({anvil_count} anvils)! Placing it now...");
                         let player_inv = {
                             let gui = state_clone.gui.lock().await;
                             gui.player_inventory.clone()
                         };
-                        let mut ench = state_clone.enchanter.lock().await;
-                        ench.place_anvil(&bot_clone, &player_inv).await;
-                        if !ench.anvil_placed {
-                            bot_clone.disconnect();
-                            return;
+                        let placed = {
+                            let mut ench = state_clone.enchanter.lock().await;
+                            ench.place_anvil(&bot_clone, &player_inv).await
+                        };
+                        if placed {
+                            info!("Anvil placement verified! Proceeding to Phase 2: Items Retrieval.");
+                        } else {
+                            warn!("Anvil was in inventory but placement could not be verified in world! Proceeding to Phase 2 since anvil is already in inventory.");
                         }
-                        drop(ench);
                         let mut gui = state_clone.gui.lock().await;
                         gui.phase = WithdrawalPhase::ItemsRetrieval;
-                        gui.placed_anvil_available = true;
-                        gui.sync_collected_from_inventory(Some(&bot_clone));
-                    } else {
-                        info!("No placed anvil and none in inventory. Starting Phase 1: Anvil Placement (withdrawing 1 Anvil from /order)...");
-                        let mut gui = state_clone.gui.lock().await;
-                        gui.phase = WithdrawalPhase::AnvilPlacement;
                     }
 
-                    {
+                    let needs_anvils = state_clone.gui.lock().await.phase == WithdrawalPhase::AnvilPlacement;
+                    if !needs_anvils {
                         let mut gui = state_clone.gui.lock().await;
                         let completed_sets = gui.count_completed_max_sets(Some(&bot_clone));
                         if completed_sets > 0 {
@@ -271,9 +371,14 @@ async fn handle(bot: Client, event: Event, state: BotState) -> Result<(), anyhow
                             return;
                         }
 
-                        if gui.can_craft_god_armor(Some(&bot_clone)) {
+                        let anvil_ready = {
+                            let mut ench = state_clone.enchanter.lock().await;
+                            ench.check_if_anvil_placed(&bot_clone).await || anvil_count >= 1
+                        };
+
+                        if anvil_ready && (gui.can_craft_god_armor(Some(&bot_clone)) || (gui.count_free_inventory_slots() == 0 && gui.has_any_craftable_combines(Some(&bot_clone)))) {
                             let craftable_sets = gui.count_craftable_god_sets(Some(&bot_clone));
-                            info!("Detected craftable materials for {craftable_sets} COMPLETE God-armor set(s) in inventory from previous session! Proceeding directly to enchanting routine...");
+                            info!("Detected craftable materials for {craftable_sets} COMPLETE God-armor set(s) or partial combines in inventory from previous session! Proceeding directly to enchanting routine...");
                             gui.phase = WithdrawalPhase::Done;
                             gui.state = OrderWorkflowState::WithdrawalComplete;
                             gui.clear_watchdog();
@@ -282,7 +387,7 @@ async fn handle(bot: Client, event: Event, state: BotState) -> Result<(), anyhow
                             return;
                         }
 
-                        if gui.collected.is_fulfilled(&gui.quota) {
+                        if anvil_ready && gui.collected.is_fulfilled(&gui.quota) {
                             info!("All items already fulfilled in inventory; proceeding directly to enchanting!");
                             gui.phase = WithdrawalPhase::Done;
                             gui.state = OrderWorkflowState::WithdrawalComplete;
@@ -291,6 +396,13 @@ async fn handle(bot: Client, event: Event, state: BotState) -> Result<(), anyhow
                             trigger_enchanting_routine(&bot_clone, &state_clone).await;
                             return;
                         }
+                    }
+
+                    if state_clone.gui.lock().await.phase == WithdrawalPhase::AnvilPlacement {
+                        info!("Looking completely down at feet (pitch: 90.0) before running /order...");
+                        crate::enchanter::smooth_look(&bot_clone, bot_clone.direction().y_rot(), 90.0).await;
+                        bot_clone.set_direction(bot_clone.direction().y_rot(), 90.0);
+                        bot_clone.wait_ticks(2).await;
                     }
 
                     info!("Running /order command for item withdrawal...");
@@ -331,7 +443,20 @@ async fn handle(bot: Client, event: Event, state: BotState) -> Result<(), anyhow
                     }
                 });
             } else {
-                info!("[Chat] {}", message);
+                if clean_msg.contains("connecting to an area in maintenance") || clean_msg.contains("area in maintenance") {
+                    warn!("[Chat Maintenance] Destination area is in maintenance: {}", message);
+                    state.maintenance_active.store(true, std::sync::atomic::Ordering::SeqCst);
+                } else if clean_msg.contains("proxy limbo") || clean_msg.contains("server is restarting") || clean_msg.contains("servers are updating") {
+                    warn!("[Chat Restart] Server is restarting / in proxy limbo: '{}'", message);
+                    let bot_clone = bot.clone();
+                    tokio::spawn(async move {
+                        warn!("Waiting 15 seconds for server update to settle before disconnecting to trigger clean auto-reconnect...");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+                        bot_clone.disconnect();
+                    });
+                } else {
+                    info!("[Chat] {}", message);
+                }
             }
         }
         Event::Packet(packet) => {
@@ -384,8 +509,9 @@ async fn handle_packet(bot: &Client, packet: &Arc<ClientboundGamePacket>, state:
                 ench.on_open_screen(p.container_id, &title);
             } else {
                 let mut gui = state.gui.lock().await;
-                if !gui.is_fulfilling_target && gui.state == OrderWorkflowState::WithdrawalComplete {
-                    info!("Non-anvil container #{} ('{}') opened after withdrawal complete; dismissing.", p.container_id, title);
+                let is_enchanting = state.enchanter.lock().await.is_enchanting;
+                if !gui.is_fulfilling_target && (is_enchanting || gui.phase == WithdrawalPhase::Done || gui.state == OrderWorkflowState::WithdrawalComplete) {
+                    info!("Non-anvil container #{} ('{}') opened while enchanting/done; dismissing.", p.container_id, title);
                     bot.write_packet(ServerboundContainerClose { container_id: p.container_id });
                 } else {
                     gui.on_open_screen(p.container_id, &title);
@@ -407,7 +533,8 @@ async fn handle_packet(bot: &Client, packet: &Arc<ClientboundGamePacket>, state:
                 gui.on_set_content(p.container_id, p.state_id, &p.items, Some(bot));
 
                 if p.container_id > 0 {
-                    if !gui.is_fulfilling_target && gui.state == OrderWorkflowState::WithdrawalComplete {
+                    let is_enchanting = state.enchanter.lock().await.is_enchanting;
+                    if !gui.is_fulfilling_target && (is_enchanting || gui.phase == WithdrawalPhase::Done || gui.state == OrderWorkflowState::WithdrawalComplete) {
                         bot.write_packet(ServerboundContainerClose { container_id: p.container_id });
                         return;
                     }
@@ -474,6 +601,7 @@ async fn handle_packet(bot: &Client, packet: &Arc<ClientboundGamePacket>, state:
             // Compute true current experience points instead of stale/corrupted server lifetime total
             let true_current_xp = enchanter::calculate_current_xp(p.experience_level as u32, p.experience_progress);
             state.total_experience.store(true_current_xp, std::sync::atomic::Ordering::SeqCst);
+            state.experience_updated.notify_waiters();
 
             tracing::debug!(
                 "[XP Sync] Level: {}, Progress: {:.1}%, True Current XP: {} (Server Lifetime Total: {})",
@@ -514,28 +642,11 @@ async fn handle_packet(bot: &Client, packet: &Arc<ClientboundGamePacket>, state:
     state.inventory_updated.notify_one();
 }
 
-async fn sync_inventory_counts(bot: &Client, state: &BotState) {
-    state.gui.lock().await.sync_collected_from_inventory(Some(bot));
-}
-
-/// Resume order withdrawal when a broken/missing anvil has no inventory replacement.
-async fn restock_anvil(bot: &Client, state: &BotState) {
-    {
-        let mut ench = state.enchanter.lock().await;
-        if let Some(id) = ench.anvil_container_id { ench.close_anvil(bot, id); }
-        ench.is_enchanting = false;
-    }
-    let mut gui = state.gui.lock().await;
-    gui.placed_anvil_available = false;
-    gui.phase = WithdrawalPhase::AnvilPlacement;
-    gui.reset_and_sync_inventory(Some(bot));
-    gui.state = OrderWorkflowState::WaitingForNextOrder;
-    gui.action_in_progress = false;
-    info!("Anvil broke or is missing and inventory has no replacement; withdrawing from /order.");
-    gui.prepare_to_send_command(bot, "/order");
-}
 
 async fn pump_gui_actions(bot_clone: Client, state_clone: BotState, expected: Option<(i32, u64)>) {
+    if expected.is_some() {
+        bot_clone.wait_ticks(3).await;
+    }
     let mut g = state_clone.gui.lock().await;
     if expected.is_some_and(|(id, epoch)| g.current_container_id != id || g.gui_action_epoch != epoch) {
         return;
@@ -546,33 +657,45 @@ async fn pump_gui_actions(bot_clone: Client, state_clone: BotState, expected: Op
     if was_selling { return; }
 
     // Check if Phase 1 (AnvilPlacement) completed
-    if g.phase == WithdrawalPhase::AnvilPlacement && g.collected.anvils >= 1 {
+    if g.phase == WithdrawalPhase::AnvilPlacement && (g.anvil_stack_dropped || g.collected.anvils >= 2) {
         g.phase = WithdrawalPhase::ItemsRetrieval;
         g.state = OrderWorkflowState::WaitingForNextOrder;
-        info!("Phase 1 completed: 1 Anvil withdrawn into inventory!");
+        info!("Phase 1 completed: Anvil stack handled! Ensuring anvils in offhand...");
+        crate::enchanter::EnchanterManager::ensure_anvils_in_offhand(&bot_clone, &mut g.player_inventory).await;
         g.close_current_gui(&bot_clone);
         let player_inv = g.player_inventory.clone();
         drop(g);
 
-        bot_clone.wait_ticks(2).await;
-        info!("Placing Anvil on ground adjacent to bot...");
-        {
+        bot_clone.wait_ticks(5).await;
+        let anvil_placed = {
             let mut ench = state_clone.enchanter.lock().await;
-            ench.place_anvil(&bot_clone, &player_inv).await;
-            if !ench.anvil_placed {
-                bot_clone.disconnect();
-                return;
+            ench.check_if_anvil_placed(&bot_clone).await
+        };
+        if !anvil_placed {
+            info!("No anvil placed in world. Attempting to place anvil from inventory...");
+            let placed = {
+                let mut ench = state_clone.enchanter.lock().await;
+                ench.place_anvil(&bot_clone, &player_inv).await
+            };
+            if placed {
+                info!("Anvil verified placed in world! Ready for Phase 2.");
+            } else {
+                warn!("Warning: Anvil placement verification failed after withdrawal! Checking /home 1...");
+                gui::send_command(&bot_clone, "/home 1");
+                bot_clone.wait_ticks(30).await;
+                let placed2 = {
+                    let mut ench = state_clone.enchanter.lock().await;
+                    ench.place_anvil(&bot_clone, &player_inv).await
+                };
+                if placed2 {
+                    info!("Anvil verified placed successfully after /home 1! Ready for Phase 2.");
+                } else {
+                    warn!("Anvil placement could not be verified after /home 1; proceeding to items retrieval.");
+                }
             }
+        } else {
+            info!("Anvil is already placed in world! Ready for Phase 2.");
         }
-        {
-            let mut gui = state_clone.gui.lock().await;
-            gui.placed_anvil_available = true;
-            gui.sync_collected_from_inventory(Some(&bot_clone));
-        }
-
-        bot_clone.wait_ticks(3).await;
-        info!("Keeping remaining anvils and supplies for future batches.");
-        sync_inventory_counts(&bot_clone, &state_clone).await;
 
         bot_clone.wait_ticks(3).await;
         info!("Opening /order for Phase 2 (Items Retrieval)...");
@@ -630,6 +753,45 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
         EnchanterManager::ensure_no_worn_armor(&bot_ench, &player_inv).await;
         bot_ench.wait_ticks(1).await;
 
+        // 2. Ensure Anvil is placed
+        {
+            let mut ench = state_clone.enchanter.lock().await;
+            let placed = ench.place_anvil(&bot_ench, &player_inv).await;
+            if !placed {
+                warn!("No anvil placed and could not place one from inventory!");
+                ench.is_enchanting = false;
+                drop(ench);
+
+                let has_anvil = player_inv.values().any(|item| {
+                    crate::nbt::inspect_item_with_bot(item, Some(&bot_ench))
+                        .map(|info| crate::nbt::is_anvil(&info))
+                        .unwrap_or(false)
+                });
+
+                if has_anvil {
+                    warn!("Player has an anvil in inventory but placement failed. Running /home 1 and retrying placement...");
+                    gui::send_command(&bot_ench, "/home 1");
+                    bot_ench.wait_ticks(30).await;
+                    let mut ench = state_clone.enchanter.lock().await;
+                    let placed2 = ench.place_anvil(&bot_ench, &player_inv).await;
+                    if !placed2 {
+                        error!("Anvil placement still failed after /home 1. Disconnecting bot to prevent loop.");
+                        bot_ench.disconnect();
+                        return;
+                    }
+                    ench.is_enchanting = true;
+                } else {
+                    let mut gui = state_clone.gui.lock().await;
+                    gui.phase = WithdrawalPhase::AnvilPlacement;
+                    gui.state = OrderWorkflowState::Spawned;
+                    gui.prepare_to_send_command(&bot_ench, "/order");
+                    return;
+                }
+            }
+        }
+
+        bot_ench.wait_ticks(2).await;
+
         'sets: loop {
             // Finish and drop one set, then use the next set already in inventory.
             let mut anvil_open_attempts = 0;
@@ -656,8 +818,9 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
 
                 if !is_open {
                     anvil_open_attempts += 1;
-                    if anvil_open_attempts >= 2 {
-                        error!("No GUI available: Anvil failed to open after 2 attempts! Instant rejoining server...");
+                    if anvil_open_attempts >= 6 {
+                        error!("Anvil failed to open after 6 attempts! Disconnecting to rejoin and start where left...");
+                        state_clone.enchanter.lock().await.is_enchanting = false;
                         bot_ench.disconnect();
                         return;
                     }
@@ -669,19 +832,21 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
 
                     let mut ench = state_clone.enchanter.lock().await;
                     if !ench.check_if_anvil_placed(&bot_ench).await {
-                        let has_replacement = current_inv.iter().any(|(slot, item)|
-                            (9..=44).contains(slot) && nbt::inspect_item_with_bot(item, Some(&bot_ench))
-                                .is_some_and(|info| nbt::is_anvil(&info)));
-                        if !has_replacement {
+                        info!("Anvil is not present in world (broke or missing). Placing a new Anvil from inventory...");
+                        let placed = ench.place_anvil(&bot_ench, &current_inv).await;
+                        bot_ench.wait_ticks(2).await;
+                        if !placed {
+                            warn!("Cannot place Anvil (out of anvils in inventory). Looking completely down at feet (pitch: 90.0) and aborting enchanting routine to withdraw replacement anvil from orders!");
+                            ench.is_enchanting = false;
                             drop(ench);
-                            restock_anvil(&bot_ench, &state_clone).await;
-                            return;
-                        }
-                        info!("Replacing broken or missing anvil from inventory...");
-                        ench.place_anvil(&bot_ench, &current_inv).await;
-                        if !ench.anvil_placed {
-                            drop(ench);
-                            bot_ench.disconnect();
+                            crate::enchanter::smooth_look(&bot_ench, bot_ench.direction().y_rot(), 90.0).await;
+                            bot_ench.set_direction(bot_ench.direction().y_rot(), 90.0);
+                            bot_ench.wait_ticks(2).await;
+                            let mut gui = state_clone.gui.lock().await;
+                            gui.phase = WithdrawalPhase::AnvilPlacement;
+                            gui.anvil_stack_dropped = false;
+                            gui.state = OrderWorkflowState::Spawned;
+                            gui.prepare_to_send_command(&bot_ench, "/order");
                             return;
                         }
                     }
@@ -703,10 +868,6 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
 
                 let mut ench = state_clone.enchanter.lock().await;
                 let finished = ench.process_anvil_combines(&bot_ench).await;
-                if ench.failure_limit_reached() {
-                    bot_ench.disconnect();
-                    return;
-                }
                 if finished {
                     info!("Anvil combining phase finished successfully!");
                     break;
@@ -718,11 +879,24 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
                     // The worker shares XP atomics, while packet handlers retain access
                     // to the main enchanter inventory and can process XP updates promptly.
                     let mut worker = EnchanterManager::new();
+                    {
+                        let ench_lock = state_clone.enchanter.lock().await;
+                        worker.throw_speed_ticks = ench_lock.throw_speed_ticks;
+                        worker.strict_calculation = ench_lock.strict_calculation;
+                    }
                     worker.player_inventory = state_clone.enchanter.lock().await.player_inventory.clone();
                     worker.current_level = state_clone.current_level.clone();
                     worker.experience_progress_milli = state_clone.experience_progress_milli.clone();
                     worker.total_experience = state_clone.total_experience.clone();
+                    worker.experience_updated = state_clone.experience_updated.clone();
                     worker.throw_exact_xp_bottles(&bot_ench, target).await;
+                    {
+                        let mut ench = state_clone.enchanter.lock().await;
+                        ench.player_inventory = worker.player_inventory.clone();
+                        let mut gui = state_clone.gui.lock().await;
+                        gui.player_inventory = worker.player_inventory.clone();
+                        gui.sync_collected_from_inventory(Some(&bot_ench));
+                    }
                     if worker.get_level_and_progress().0 < target {
                         warn!("XP could not reach level {target}; returning to inventory reconciliation.");
                         info!("Checking /order for XP bottles before considering an out-of-stock alert.");
@@ -745,6 +919,13 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
                 gui.sync_collected_from_inventory(Some(&bot_ench));
             }
             bot_ench.wait_ticks(2).await;
+
+            // Ensure any armor accidentally worn into equipment slots 5..=8 is unequipped
+            {
+                let gui_inv = state_clone.gui.lock().await.player_inventory.clone();
+                EnchanterManager::ensure_no_worn_armor(&bot_ench, &gui_inv).await;
+            }
+            bot_ench.wait_ticks(1).await;
 
             // 6. Drop enchanted armor into the nearest hopper within 2 blocks
             let ready = state_clone.enchanter.lock().await.check_all_armor_enchanted(&bot_ench).0;
@@ -780,24 +961,34 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
 
         // 7. Reset state and check /order -> Your Orders for next batch of armors
         info!("Reconciling inventory before the next withdrawal...");
-        let placed_anvil = {
+        {
             let mut ench = state_clone.enchanter.lock().await;
             ench.reset_for_next_batch();
-            ench.check_if_anvil_placed(&bot_ench).await
-        };
-        {
-            let mut gui = state_clone.gui.lock().await;
-            gui.placed_anvil_available = placed_anvil;
-            gui.reset_and_sync_inventory(Some(&bot_ench));
-            gui.phase = if placed_anvil { WithdrawalPhase::ItemsRetrieval }
-                else { WithdrawalPhase::AnvilPlacement };
-            gui.state = OrderWorkflowState::WaitingForNextOrder;
         }
-
-        bot_ench.wait_ticks(3).await;
-        info!("Opening /order to check remaining armors in 'Your Orders'...");
-        {
+        let anvil_count = {
             let mut gui = state_clone.gui.lock().await;
+            gui.reset_and_sync_inventory(Some(&bot_ench));
+            crate::enchanter::EnchanterManager::ensure_anvils_in_offhand(&bot_ench, &mut gui.player_inventory).await;
+            gui.collected.anvils
+        };
+
+        if anvil_count < 2 {
+            info!("Bot has {anvil_count} anvil(s) (< 2, or anvil == 1). Looking completely down at feet (pitch: 90.0) and running /order...");
+            crate::enchanter::smooth_look(&bot_ench, bot_ench.direction().y_rot(), 90.0).await;
+            bot_ench.set_direction(bot_ench.direction().y_rot(), 90.0);
+            bot_ench.wait_ticks(2).await;
+
+            let mut gui = state_clone.gui.lock().await;
+            gui.phase = WithdrawalPhase::AnvilPlacement;
+            gui.anvil_stack_dropped = false;
+            gui.state = OrderWorkflowState::Spawned;
+            gui.prepare_to_send_command(&bot_ench, "/order");
+        } else {
+            let mut gui = state_clone.gui.lock().await;
+            gui.phase = WithdrawalPhase::ItemsRetrieval;
+            gui.state = OrderWorkflowState::Spawned;
+            bot_ench.wait_ticks(3).await;
+            info!("Opening /order to check remaining armors in 'Your Orders'...");
             gui.prepare_to_send_command(&bot_ench, "/order");
         }
     });
@@ -864,6 +1055,52 @@ async fn drop_enchanted_armor_in_hopper(bot: &Client, state: &BotState) -> bool 
             return false;
         };
         let slot = plan[0];
+
+        // CRITICAL DROP SAFETY GUARD: Strict verification that the slot about to be dropped
+        // contains the intended complete diamond armor piece, and NEVER an XP bottle, book, anvil, or stacked item!
+        let target_item = gui.player_inventory.get(&slot);
+        let inspected = target_item.and_then(|i| crate::nbt::inspect_item_with_bot(i, Some(bot)));
+        let is_valid_armor_drop = match inspected {
+            Some(ref info) => {
+                if crate::nbt::is_xp_bottle(info) {
+                    error!(
+                        "DROP SAFETY VIOLATION: Slot #{slot} contains XP bottles ({} x{})! REFUSING to drop into hopper!",
+                        info.kind, info.count
+                    );
+                    false
+                } else if crate::nbt::is_anvil(info) {
+                    error!("DROP SAFETY VIOLATION: Slot #{slot} contains an ANVIL! REFUSING to drop into hopper!");
+                    false
+                } else if info.kind.to_lowercase().contains("book") {
+                    error!("DROP SAFETY VIOLATION: Slot #{slot} contains a BOOK! REFUSING to drop into hopper!");
+                    false
+                } else if info.count != 1 {
+                    error!(
+                        "DROP SAFETY VIOLATION: Slot #{slot} has stacked count {} (armor cannot stack)! REFUSING to drop into hopper!",
+                        info.count
+                    );
+                    false
+                } else if armor::armor_type(info) != Some(kind) || !armor::is_complete(info) {
+                    error!(
+                        "DROP SAFETY VIOLATION: Slot #{slot} is not complete {}! Found: {} (enchants: {:?}). REFUSING TO DROP!",
+                        armor::TYPES[kind], info.kind, info.enchantments
+                    );
+                    false
+                } else {
+                    true
+                }
+            }
+            None => {
+                error!("DROP SAFETY VIOLATION: Slot #{slot} is empty or uninspectable! REFUSING TO DROP INTO HOPPER!");
+                false
+            }
+        };
+
+        if !is_valid_armor_drop {
+            gui.pending_drop = None;
+            return false;
+        }
+
         let before = count_type(kind);
         gui.pending_drop = Some((kind, before));
         // Throw directly from the inventory slot. Hotbar swaps would invalidate
@@ -1028,7 +1265,6 @@ async fn run_target_delivery(bot_ench: Client, state_clone: BotState, complete_s
         let mut gui = state_clone.gui.lock().await;
         gui.reset_and_sync_inventory(Some(&bot_ench));
     }
-    sync_inventory_counts(&bot_ench, &state_clone).await;
     {
         let mut gui = state_clone.gui.lock().await;
         gui.phase = WithdrawalPhase::ItemsRetrieval;
@@ -1045,26 +1281,45 @@ async fn run_target_delivery(bot_ench: Client, state_clone: BotState, complete_s
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    dotenvy::dotenv().ok();
+    // Robust .env loading: check current working directory first, then executable directory
+    let env_file_loaded = if let Ok(path) = dotenvy::dotenv() {
+        Some(path)
+    } else if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let exe_env = exe_dir.join(".env");
+            if exe_env.exists() {
+                dotenvy::from_path(&exe_env).ok().map(|_| exe_env)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .with_ansi(false)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("Failed to set tracing subscriber");
+    // Keep the worker guard alive until shutdown so logs can drain.
+    let _log_guard = logging::init();
 
     let args = Args::parse();
 
     info!("Starting Minecraft Enchanter Bot...");
     info!("Target Server: {}:{}", args.server, args.port);
 
+    if let Some(ref path) = env_file_loaded {
+        info!("Loaded environment configuration from: {}", path.display());
+    } else {
+        warn!("⚠️ No '.env' file found in current directory or next to Enchanter.exe!");
+        warn!("⚠️ The bot will default to offline mode unless credentials are provided via CLI arguments.");
+    }
+
     // Discover all accounts from CLI flags and .env (supporting multi-account)
     let discovered_accounts = auth::discover_accounts(
         args.token.as_deref(),
         args.microsoft.as_deref(),
         args.offline.as_deref(),
-    )?;
+    );
 
     info!("Discovered {} configured account(s):", discovered_accounts.len());
     for (i, acc) in discovered_accounts.iter().enumerate() {
@@ -1079,16 +1334,23 @@ async fn main() -> Result<(), anyhow::Error> {
         info!("============================================================");
 
         let current_exe = std::env::current_exe()?;
+        let exe_dir = current_exe.parent().map(|p| p.to_path_buf());
         let mut children = Vec::new();
 
         for (i, acc) in discovered_accounts.iter().enumerate() {
             info!("Launching account [{i}] ({}) in dedicated window...", acc.description());
 
             let mut cmd = std::process::Command::new(&current_exe);
+            if let Some(ref dir) = exe_dir {
+                cmd.current_dir(dir);
+            }
             cmd.arg("--account").arg(i.to_string());
             cmd.arg("--server").arg(&args.server);
             cmd.arg("--port").arg(args.port.to_string());
+            cmd.arg("--view-distance").arg(args.view_distance.to_string());
             cmd.arg("--order-target").arg(&args.order_target);
+            cmd.arg("--xp-throw-speed").arg(&args.xp_throw_speed);
+            cmd.arg("--xp-strict-calculation").arg(args.xp_strict_calculation.to_string());
             for (flag, value) in [
                 ("--mending", args.mending), ("--unb3", args.unb3),
                 ("--prot4", args.prot4), ("--blast-prot4", args.blast_prot4),
@@ -1131,8 +1393,19 @@ async fn main() -> Result<(), anyhow::Error> {
         return Ok(());
     }
 
-    let selected_account = auth::select_account(&discovered_accounts, args.account.as_deref())?;
+    let selected_account = auth::select_account(&discovered_accounts, args.account.as_deref());
     info!("Selected account: {}", selected_account.description());
+
+    if let auth::AccountConfig::Offline(ref name) = selected_account {
+        if args.server.to_lowercase().contains("donutsmp") {
+            warn!("========================================================================");
+            warn!("⚠️ WARNING: donutsmp.net is an online-mode server and requires authentication!");
+            warn!("⚠️ Connecting as offline account '{}' will be rejected by the server with:", name);
+            warn!("⚠️ 'You are not logged into your Minecraft account.'");
+            warn!("⚠️ To connect successfully, configure MC_TOKEN or MICROSOFT_EMAIL in .env");
+            warn!("========================================================================");
+        }
+    }
 
     let account = auth::authenticate_account(selected_account).await?;
 
@@ -1151,19 +1424,52 @@ async fn main() -> Result<(), anyhow::Error> {
     GLOBAL_QUOTA.set(quota).ok();
     GLOBAL_ORDER_TARGET.set(args.order_target.clone()).ok();
 
+    // Check fallback env vars for throw speed if XP_THROW_SPEED wasn't passed explicitly
+    let raw_throw_speed = if std::env::var("XP_THROW_SPEED").is_ok() || args.xp_throw_speed != "1" {
+        args.xp_throw_speed.clone()
+    } else if let Ok(s) = std::env::var("XP_THROW_SPEED_TICKS") {
+        s
+    } else if let Ok(s) = std::env::var("XP_THROW_DELAY_TICKS") {
+        s
+    } else {
+        args.xp_throw_speed.clone()
+    };
+    let throw_speed_ticks = parse_throw_speed(&raw_throw_speed);
+    let strict_calculation = args.xp_strict_calculation;
+
+    GLOBAL_XP_THROW_SPEED.set(throw_speed_ticks).ok();
+    GLOBAL_XP_STRICT_CALCULATION.set(strict_calculation).ok();
+    GLOBAL_VIEW_DISTANCE.set(args.view_distance).ok();
+    info!("Requested chunk view distance: {}", args.view_distance);
+
+    info!(
+        "XP Bot Configuration: Throw Speed = {} tick(s) per bottle (raw: '{}'), Strict Calculation = {}",
+        throw_speed_ticks, raw_throw_speed, strict_calculation
+    );
+
     info!("Order fulfillment target username set to: '{}'", args.order_target);
 
     let address = format!("{}:{}", args.server, args.port);
 
+    info!("Chat signing disabled: using unsigned chat and commands.");
     loop {
         info!("Connecting to {} as '{}'...", address, account.username());
-        ClientBuilder::new()
+        // Keep online authentication, but never request chat certificates or
+        // establish a signing session (including after reconnecting).
+        ClientBuilder::new_without_plugins()
+            .add_plugins(
+                azalea::DefaultPlugins
+                    .build()
+                    .disable::<azalea::chat_signing::ChatSigningPlugin>(),
+            )
+            .add_plugins(azalea::bot::DefaultBotPlugins)
+            .add_plugins(tick_diagnostics::TickDiagnosticsPlugin)
             .set_handler(handle)
             .start(account.clone(), address.clone())
             .await;
 
-        warn!("Connection closed or reset by server. Instant rejoining server...");
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        warn!("Connection closed or reset by server. Waiting 12 seconds before reconnecting to let proxy cache clear...");
+        tokio::time::sleep(tokio::time::Duration::from_secs(12)).await;
     }
 }
 
