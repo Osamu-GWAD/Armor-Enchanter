@@ -217,7 +217,7 @@ pub fn swing_arm(bot: &Client) {
 }
 
 /// An individual combine task inside the anvil.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CombineTask {
     pub armor_slot: i16,
     pub book_slot: i16,
@@ -250,6 +250,9 @@ pub struct EnchanterManager {
     pub restock_needed: bool,
     pub throw_speed_ticks: u32,
     pub strict_calculation: bool,
+    pub active_combine_task: Option<CombineTask>,
+    pub book_to_discard: Option<i16>,
+    pub last_staged_buttons: Option<(u8, u8)>,
 }
 
 impl EnchanterManager {
@@ -277,6 +280,9 @@ impl EnchanterManager {
             restock_needed: false,
             throw_speed_ticks: 1,
             strict_calculation: true,
+            active_combine_task: None,
+            book_to_discard: None,
+            last_staged_buttons: None,
         }
     }
 
@@ -294,6 +300,9 @@ impl EnchanterManager {
         self.anvil_slots.clear();
         self.anvil_container_id = None;
         self.server_anvil_cost.store(0, Ordering::SeqCst);
+        self.active_combine_task = None;
+        self.book_to_discard = None;
+        self.last_staged_buttons = None;
     }
 
     /// Returns the current level and experience progress percentage (0.0 to 1.0)
@@ -1022,14 +1031,58 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
         }
     }
 
-    /// Determine the next combination task based on the optimal iamcal/enchant-order tree-merge sequence:
-    /// 1. Book Merge: Unbreaking III Book + Mending Book -> Combined (Unbreaking III + Mending) Book (2 lvl)
-    /// 2. Base Armor Merge:
-    ///    - Helmet / Chestplate: Blank Armor + Protection IV Book (4 lvl)
-    ///    - Leggings / Boots: Blank Armor + Blast Protection IV Book (8 lvl)
-    /// 3. Final Tree Merge:
-    ///    - Armor (Prot IV / Blast Prot IV) + (Unbreaking III + Mending) Book (7 lvl)
-    /// 4. Fallback: If combined book is unavailable and cannot be crafted, apply available single books directly.
+    /// Returns the expected anvil level cost for combining an armor piece with a sacrifice book,
+    /// assuming clean items/books (zero prior-work penalty on fresh books from orders).
+    pub fn expected_combine_cost(armor: &ItemInfo, book: &ItemInfo) -> u32 {
+        let is_prot_piece = is_diamond_helmet(armor) || is_diamond_chestplate(armor);
+        let is_blast_piece = is_diamond_leggings(armor) || is_diamond_boots(armor);
+
+        let has_main_prot = if is_prot_piece {
+            armor.has_enchantment("protection", 4)
+        } else if is_blast_piece {
+            armor.has_enchantment("blast_protection", 4)
+        } else {
+            false
+        };
+        let has_unb = armor.has_enchantment("unbreaking", 3);
+        let has_mend = armor.has_enchantment("mending", 1);
+
+        let prior_works = (has_main_prot as u32) + (has_unb as u32) + (has_mend as u32);
+        let armor_penalty = if prior_works == 0 {
+            0
+        } else {
+            (1u32 << prior_works) - 1
+        };
+
+        let enchant_cost = if is_protection_4(book) {
+            4
+        } else if is_blast_protection_4(book) {
+            8
+        } else if is_unbreaking_and_mending(book) {
+            // Unbreaking 3 (3 lvls) + Mending (2 lvls) = 5 lvls
+            5
+        } else if is_unbreaking_3(book) {
+            3
+        } else if is_mending(book) {
+            2
+        } else {
+            1
+        };
+
+        // If the book is an already-crafted combined book (e.g. Unb III + Mending), its clean penalty is 1
+        let book_penalty = if is_unbreaking_and_mending(book) { 1 } else { 0 };
+
+        armor_penalty + book_penalty + enchant_cost
+    }
+
+    /// Determine the next combination task based on the sequential combining sequence:
+    /// 1. Base Protection:
+    ///    - Helmet / Chestplate: Blank Armor + Protection IV Book (4 levels)
+    ///    - Leggings / Boots: Blank Armor + Blast Protection IV Book (8 levels)
+    /// 2. Unbreaking III:
+    ///    - Armor (Base Prot) + Unbreaking III Book (4 levels, penalty becomes 3)
+    /// 3. Mending:
+    ///    - Armor (Base Prot + Unb III) + Mending Book (5 levels, penalty becomes 7)
     pub fn find_next_combine_task(&self, bot: &Client) -> Option<CombineTask> {
         let mut armor_slots: Vec<(i16, ItemInfo)> = Vec::new();
         let mut book_slots: Vec<(i16, ItemInfo)> = Vec::new();
@@ -1072,14 +1125,14 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
             let has_unb = armor_info.has_enchantment("unbreaking", 3);
             let has_mend = armor_info.has_enchantment("mending", 1);
 
-            // STEP 1: If base protection is missing and a protection book is available, apply it first
+            // STEP 1: If base protection is missing, apply it first (Prot IV: 4 lvl, Blast Prot IV: 8 lvl)
             if !has_main_prot {
                 let target_book = if is_prot_piece {
                     find_book(&|b| is_protection_4(b))
-                        .map(|(s, _)| ("Protection IV", 4u32, s))
+                        .map(|(s, b)| ("Protection IV", Self::expected_combine_cost(armor_info, &b), s))
                 } else {
                     find_book(&|b| is_blast_protection_4(b))
-                        .map(|(s, _)| ("Blast Protection IV", 8u32, s))
+                        .map(|(s, b)| ("Blast Protection IV", Self::expected_combine_cost(armor_info, &b), s))
                 };
 
                 if let Some((ench_name, req_level, b_slot)) = target_book {
@@ -1093,95 +1146,43 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
                 }
             }
 
-            // STEP 2 & 3: Tree merge with (Unbreaking III + Mending)
-            if !has_unb || !has_mend {
-                // If armor piece needs both Unbreaking III and Mending:
-                if !has_unb && !has_mend {
-                    // Check if we already have a combined (Unbreaking III + Mending) book
-                    if let Some((comb_slot, _)) = find_book(&|b| is_unbreaking_and_mending(b)) {
-                        if has_main_prot {
-                            return Some(CombineTask {
-                                armor_slot: *armor_slot,
-                                book_slot: comb_slot,
-                                armor_desc: armor_info.kind.clone(),
-                                enchant_name: "Unbreaking III & Mending",
-                                required_level: 7,
-                            });
-                        }
-                    } else {
-                        // Check if we can craft the combined book (Unbreaking III + Mending -> 2 lvl)
-                        let single_unb = find_book(&|b| is_single_unbreaking_3(b));
-                        let single_mend = find_book(&|b| is_single_mending(b));
-
-                        if let (Some((unb_slot, _)), Some((mend_slot, _))) = (single_unb, single_mend) {
-                            if unb_slot != mend_slot {
-                                return Some(CombineTask {
-                                    armor_slot: unb_slot,
-                                    book_slot: mend_slot,
-                                    armor_desc: "Unbreaking III Book".to_string(),
-                                    enchant_name: "Mending",
-                                    required_level: 2,
-                                });
-                            }
-                        }
-                    }
-                }
-
-                // If combined book exists and armor has base protection:
-                if let Some((comb_slot, _)) = find_book(&|b| is_unbreaking_and_mending(b)) {
-                    if has_main_prot {
-                        return Some(CombineTask {
-                            armor_slot: *armor_slot,
-                            book_slot: comb_slot,
-                            armor_desc: armor_info.kind.clone(),
-                            enchant_name: "Unbreaking III & Mending",
-                            required_level: 7,
-                        });
-                    }
-                }
-
-                // STEP 4: Fallback for individual combines if combined book is not possible
-                if !has_unb {
-                    if let Some((unb_slot, _)) = find_book(&|b| is_unbreaking_3(b)) {
-                        return Some(CombineTask {
-                            armor_slot: *armor_slot,
-                            book_slot: unb_slot,
-                            armor_desc: armor_info.kind.clone(),
-                            enchant_name: "Unbreaking III",
-                            required_level: 4,
-                        });
-                    }
-                }
-
-                if !has_mend {
-                    if let Some((mend_slot, _)) = find_book(&|b| is_mending(b)) {
-                        return Some(CombineTask {
-                            armor_slot: *armor_slot,
-                            book_slot: mend_slot,
-                            armor_desc: armor_info.kind.clone(),
-                            enchant_name: "Mending",
-                            required_level: 5,
-                        });
-                    }
+            // STEP 2: Apply Unbreaking III next (Cost: 4 lvl when Base Prot is present)
+            if !has_unb {
+                if let Some((unb_slot, b)) = find_book(&|b| is_unbreaking_3(b)) {
+                    let req_level = Self::expected_combine_cost(armor_info, &b);
+                    return Some(CombineTask {
+                        armor_slot: *armor_slot,
+                        book_slot: unb_slot,
+                        armor_desc: armor_info.kind.clone(),
+                        enchant_name: "Unbreaking III",
+                        required_level: req_level,
+                    });
                 }
             }
 
-            // Fallback for base protection if deferred
-            if !has_main_prot {
-                let target_book = if is_prot_piece {
-                    find_book(&|b| is_protection_4(b))
-                        .map(|(s, _)| ("Protection IV", 4u32, s))
-                } else {
-                    find_book(&|b| is_blast_protection_4(b))
-                        .map(|(s, _)| ("Blast Protection IV", 8u32, s))
-                };
-
-                if let Some((ench_name, req_level, b_slot)) = target_book {
+            // STEP 3: Apply Mending last (Cost: 5 lvl when Base Prot + Unb III are present)
+            if !has_mend {
+                if let Some((mend_slot, b)) = find_book(&|b| is_mending(b)) {
+                    let req_level = Self::expected_combine_cost(armor_info, &b);
                     return Some(CombineTask {
                         armor_slot: *armor_slot,
-                        book_slot: b_slot,
+                        book_slot: mend_slot,
                         armor_desc: armor_info.kind.clone(),
-                        enchant_name: ench_name,
+                        enchant_name: "Mending",
+                        required_level: req_level,
+                    });
+                }
+            }
+
+            // Fallback: If armor piece already has a pre-combined (Unbreaking III + Mending) book in inventory
+            if (!has_unb || !has_mend) && has_main_prot {
+                if let Some((comb_slot, b)) = find_book(&|b| is_unbreaking_and_mending(b)) {
+                    let req_level = Self::expected_combine_cost(armor_info, &b);
+                    return Some(CombineTask {
+                        armor_slot: *armor_slot,
+                        book_slot: comb_slot,
+                        armor_desc: armor_info.kind.clone(),
+                        enchant_name: "Unbreaking III & Mending",
                         required_level: req_level,
                     });
                 }
@@ -1189,6 +1190,11 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
         }
 
         None
+    }
+
+    /// Checks whether another book matching the next combine requirement for current armor piece is available in player inventory.
+    pub fn has_available_book_for_current_armor(&self, bot: &Client) -> bool {
+        self.find_next_combine_task(bot).is_some()
     }
 
     /// Check if all 4 diamond armor pieces are present and fully enchanted according to user specifications.
@@ -1402,26 +1408,73 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
         let has_input1 = self.anvil_slots.get(&1).map(|s| !matches!(s, ItemStack::Empty)).unwrap_or(false);
         let has_output2 = self.anvil_slots.get(&2).map(|s| !matches!(s, ItemStack::Empty)).unwrap_or(false);
 
-        // If inputs exist and server cost > current level, return inputs to inventory and throw XP
-        if (has_input0 || has_input1) && server_cost > 0 && server_cost < 40 && server_cost > cur_lvl {
-            info!("Anvil inputs present but server cost ({server_cost}) > current level ({cur_lvl})! Returning inputs to inventory to throw XP...");
-            self.close_anvil(bot, container_id);
-            self.xp_target = Some(server_cost);
-            return false;
+        // When both inputs are present in the anvil, validate the server repair cost
+        if has_input0 && has_input1 {
+            if server_cost == 0 {
+                // Cost has not arrived yet from server; wait
+                self.recipe_wait_since.get_or_insert_with(std::time::Instant::now);
+                return false;
+            }
+
+            let expected_cost = if let Some(ref t) = self.active_combine_task {
+                t.required_level
+            } else {
+                let armor_info = self.anvil_slots.get(&0).and_then(|i| inspect_item_with_bot(i, Some(bot)));
+                let book_info = self.anvil_slots.get(&1).and_then(|i| inspect_item_with_bot(i, Some(bot)));
+                match (armor_info, book_info) {
+                    (Some(ref a), Some(ref b)) => Self::expected_combine_cost(a, b),
+                    _ => 40,
+                }
+            };
+
+            // High XP cost rejection: if server cost exceeds expected clean cost, or >= 40 ("Too Expensive")
+            if server_cost > expected_cost || server_cost >= 40 {
+                warn!(
+                    "REJECTING HIGH-COST BOOK: Server repair cost ({} levels) exceeds expected clean cost ({} levels) for {} with {}! Ejecting inputs and queueing book for hopper discard.",
+                    server_cost,
+                    expected_cost,
+                    self.active_combine_task.as_ref().map(|t| t.armor_desc.as_str()).unwrap_or("Armor"),
+                    self.active_combine_task.as_ref().map(|t| t.enchant_name).unwrap_or("Book"),
+                );
+                let (armor_button, book_button) = self.last_staged_buttons.unwrap_or((0, 1));
+                // Eject book from slot 1 back to hotbar slot (36 + book_button)
+                self.click_anvil(bot, container_id, 1, book_button, ClickType::Swap);
+                // Eject armor from slot 0 back to hotbar slot (36 + armor_button)
+                self.click_anvil(bot, container_id, 0, armor_button, ClickType::Swap);
+                self.close_anvil(bot, container_id);
+                self.book_to_discard = Some(36 + book_button as i16);
+                self.active_combine_task = None;
+                return false;
+            }
+
+            // Valid cost, but current player level is too low: close anvil to throw exact XP bottles
+            if server_cost > cur_lvl {
+                info!("Anvil inputs valid (Cost: {server_cost} <= Expected: {expected_cost}), but > current level ({cur_lvl}). Closing anvil to throw XP...");
+                self.close_anvil(bot, container_id);
+                self.xp_target = Some(server_cost);
+                return false;
+            }
+
+            // Valid cost and level suffices: collect output slot 2 via QuickMove
+            if has_output2 && cur_lvl >= server_cost {
+                info!("Output slot #2 ready and level suffices (Level {cur_lvl} >= Cost {server_cost} <= Expected {expected_cost}); collecting via QuickMove...");
+                self.send_tracked_anvil_click(bot, container_id, 2, 0, ClickType::QuickMove);
+                self.recipe_wait_since = None;
+                self.active_combine_task = None;
+                return false;
+            }
         }
 
-        // Cost and result can arrive in either order. Never clear valid inputs
-        // just because the repair-cost packet has not arrived yet.
-        if has_output2 && server_cost == 0 {
-            self.recipe_wait_since.get_or_insert_with(std::time::Instant::now);
-        }
-
-        // If output slot 2 has an item and level suffices, collect it via QuickMove
-        if has_output2 && server_cost > 0 && server_cost < 40 && cur_lvl >= server_cost {
-            info!("Output slot #2 has an item and level suffices (Level {cur_lvl} >= Cost {server_cost}); collecting via QuickMove...");
-            self.send_tracked_anvil_click(bot, container_id, 2, 0, ClickType::QuickMove);
-            self.recipe_wait_since = None;
-            return false;
+        // Cost and result can arrive in either order. If output slot 2 has an item and level suffices
+        if has_output2 && server_cost > 0 && cur_lvl >= server_cost {
+            let expected_cost = self.active_combine_task.as_ref().map(|t| t.required_level).unwrap_or(40);
+            if server_cost <= expected_cost {
+                info!("Output slot #2 ready and level suffices (Level {cur_lvl} >= Cost {server_cost} <= Expected {expected_cost}); collecting via QuickMove...");
+                self.send_tracked_anvil_click(bot, container_id, 2, 0, ClickType::QuickMove);
+                self.recipe_wait_since = None;
+                self.active_combine_task = None;
+                return false;
+            }
         }
 
         if let Some(since) = self.recipe_wait_since {
@@ -1487,7 +1540,7 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
             "Executing Anvil Combine: {} (slot #{}) + {} Book (slot #{}) [Level Cost: {} <= Current Level: {}]",
             task.armor_desc, task.armor_slot, task.enchant_name, task.book_slot, task.required_level, cur_lvl
         );
-        self.combine_in_anvil(bot, container_id, task.armor_slot, task.book_slot).await;
+        self.combine_in_anvil(bot, container_id, &task).await;
         false
     }
 
@@ -1523,11 +1576,14 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
         &mut self,
         bot: &Client,
         container_id: i32,
-        item_inventory_slot: i16,
-        book_inventory_slot: i16,
+        task: &CombineTask,
     ) {
         self.server_anvil_cost.store(0, Ordering::SeqCst);
-        self.queue_anvil_combination(item_inventory_slot, book_inventory_slot);
+        let (armor_button, book_button) =
+            Self::determine_hotbar_buttons_for_combine(task.armor_slot, task.book_slot);
+        self.last_staged_buttons = Some((armor_button, book_button));
+        self.active_combine_task = Some(task.clone());
+        self.queue_anvil_combination(task.armor_slot, task.book_slot);
         if let Some((slot, button, click)) = self.next_combine_click() {
             self.send_tracked_anvil_click(bot, container_id, slot, button, click);
         }
@@ -1647,6 +1703,8 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
         self.recipe_wait_since = None;
         self.content_wait_since = None;
         self.server_anvil_cost.store(0, Ordering::SeqCst);
+        self.active_combine_task = None;
+        self.last_staged_buttons = None;
     }
 
     pub fn swap_to_hotbar(bot: &Client, inv_slot: i16, hotbar_idx: u8) {
@@ -2129,5 +2187,67 @@ mod tests {
 
         // Invalid defaults to 1
         assert_eq!(parse_throw_speed("invalid_xyz"), 1);
+    }
+
+    #[test]
+    fn test_expected_combine_cost_exact_website_values() {
+        let mut helm = ItemInfo { kind: "DiamondHelmet".to_string(), count: 1, ..Default::default() };
+        let mut chest = ItemInfo { kind: "DiamondChestplate".to_string(), count: 1, ..Default::default() };
+        let mut legs = ItemInfo { kind: "DiamondLeggings".to_string(), count: 1, ..Default::default() };
+        let mut boots = ItemInfo { kind: "DiamondBoots".to_string(), count: 1, ..Default::default() };
+
+        let mut prot4_book = ItemInfo { kind: "EnchantedBook".to_string(), count: 1, ..Default::default() };
+        prot4_book.stored_enchantments.insert("protection".to_string(), 4);
+
+        let mut blast4_book = ItemInfo { kind: "EnchantedBook".to_string(), count: 1, ..Default::default() };
+        blast4_book.stored_enchantments.insert("blast_protection".to_string(), 4);
+
+        let mut unb3_book = ItemInfo { kind: "EnchantedBook".to_string(), count: 1, ..Default::default() };
+        unb3_book.stored_enchantments.insert("unbreaking".to_string(), 3);
+
+        let mut mend_book = ItemInfo { kind: "EnchantedBook".to_string(), count: 1, ..Default::default() };
+        mend_book.stored_enchantments.insert("mending".to_string(), 1);
+
+        // Step 1: Base Protection
+        // Chestplate + Prot 4 = 4 levels
+        assert_eq!(EnchanterManager::expected_combine_cost(&chest, &prot4_book), 4);
+        // Helmet + Prot 4 = 4 levels
+        assert_eq!(EnchanterManager::expected_combine_cost(&helm, &prot4_book), 4);
+        // Leggings + Blast Prot 4 = 8 levels
+        assert_eq!(EnchanterManager::expected_combine_cost(&legs, &blast4_book), 8);
+        // Boots + Blast Prot 4 = 8 levels
+        assert_eq!(EnchanterManager::expected_combine_cost(&boots, &blast4_book), 8);
+
+        // Step 2: Unbreaking 3 on armor that already has Base Prot (1 prior work, penalty 1)
+        chest.enchantments.insert("protection".to_string(), 4);
+        helm.enchantments.insert("protection".to_string(), 4);
+        legs.enchantments.insert("blast_protection".to_string(), 4);
+        boots.enchantments.insert("blast_protection".to_string(), 4);
+
+        // Cost is 1 (penalty) + 3 (enchant) = 4 levels
+        assert_eq!(EnchanterManager::expected_combine_cost(&chest, &unb3_book), 4);
+        assert_eq!(EnchanterManager::expected_combine_cost(&helm, &unb3_book), 4);
+        assert_eq!(EnchanterManager::expected_combine_cost(&legs, &unb3_book), 4);
+        assert_eq!(EnchanterManager::expected_combine_cost(&boots, &unb3_book), 4);
+
+        // Step 3: Mending on armor that has Base Prot + Unbreaking 3 (2 prior works, penalty 3)
+        chest.enchantments.insert("unbreaking".to_string(), 3);
+        helm.enchantments.insert("unbreaking".to_string(), 3);
+        legs.enchantments.insert("unbreaking".to_string(), 3);
+        boots.enchantments.insert("unbreaking".to_string(), 3);
+
+        // Cost is 3 (penalty) + 2 (enchant) = 5 levels
+        assert_eq!(EnchanterManager::expected_combine_cost(&chest, &mend_book), 5);
+        assert_eq!(EnchanterManager::expected_combine_cost(&helm, &mend_book), 5);
+        assert_eq!(EnchanterManager::expected_combine_cost(&legs, &mend_book), 5);
+        assert_eq!(EnchanterManager::expected_combine_cost(&boots, &mend_book), 5);
+
+        // Already-combined book (Unbreaking III + Mending) on armor with Base Prot (penalty 1) = 7 levels
+        let mut comb_book = ItemInfo { kind: "EnchantedBook".to_string(), count: 1, ..Default::default() };
+        comb_book.stored_enchantments.insert("unbreaking".to_string(), 3);
+        comb_book.stored_enchantments.insert("mending".to_string(), 1);
+        let mut fresh_prot_chest = ItemInfo { kind: "DiamondChestplate".to_string(), count: 1, ..Default::default() };
+        fresh_prot_chest.enchantments.insert("protection".to_string(), 4);
+        assert_eq!(EnchanterManager::expected_combine_cost(&fresh_prot_chest, &comb_book), 7);
     }
 }
