@@ -1067,7 +1067,47 @@ async fn drop_one_inventory_item(
         s_player_action::{Action, ServerboundPlayerAction},
         ServerboundSetCarriedItem,
     };
-
+    if !matches!(expected, ItemStack::Present(data) if data.count == 1) {
+        warn!("Refusing to drop stacked item from slot #{slot}.");
+        return false;
+    }
+    // Strict safety check: Never drop incomplete diamond armor, anvils, or XP bottles under any circumstances!
+    if let ItemStack::Present(data) = expected {
+        let k = format!("{:?}", data.kind).to_lowercase();
+        if k.contains("anvil") {
+            error!("CRITICAL DROP SAFETY VIOLATION: Refusing to drop anvil!");
+            return false;
+        }
+        if k.contains("bottle") || k.contains("experience") {
+            error!("CRITICAL DROP SAFETY VIOLATION: Refusing to drop XP bottles!");
+            return false;
+        }
+        if k.contains("diamond") && (k.contains("helmet") || k.contains("chestplate") || k.contains("leggings") || k.contains("boots")) {
+            let is_comp = crate::nbt::inspect_item_with_bot(expected, Some(bot))
+                .map(|info| crate::armor::is_complete(&info))
+                .unwrap_or(false);
+            if !is_comp {
+                error!(
+                    "CRITICAL DROP SAFETY VIOLATION: Expected drop item is incomplete diamond armor ({})! REFUSING TO DROP!",
+                    k
+                );
+                return false;
+            }
+        }
+    }
+    if let Some(info) = crate::nbt::inspect_item_with_bot(expected, Some(bot)) {
+        if crate::nbt::is_anvil(&info) || crate::nbt::is_xp_bottle(&info) {
+            error!("CRITICAL DROP SAFETY VIOLATION: Expected drop item is anvil or XP bottle! REFUSING TO DROP!");
+            return false;
+        }
+        if crate::nbt::is_diamond_armor(&info) && !crate::armor::is_complete(&info) {
+            error!(
+                "CRITICAL DROP SAFETY VIOLATION: Expected drop item is incomplete {} (enchants: {:?})! REFUSING TO DROP!",
+                info.kind, info.enchantments
+            );
+            return false;
+        }
+    }
     let Some(active_menu) = bot.get_component::<Inventory>().map(|inventory| inventory.id) else { return false; };
     if active_menu != 0 {
         drops::close_menu(bot, active_menu);
@@ -1111,6 +1151,10 @@ async fn drop_one_inventory_item(
     }
     let selected = (stage.hotbar - 36) as u8;
     bot.set_selected_hotbar_slot(selected);
+    bot.write_packet(ServerboundSetCarriedItem { slot: selected as u16 });
+    // Crucial: Wait for server tick to process the selected slot change before dropping!
+    bot.wait_ticks(2).await;
+
     let gui = state.gui.lock().await;
     let can_drop = bot.get_component::<Inventory>()
         .is_some_and(|inventory| inventory.id == 0 && inventory.carried == ItemStack::Empty);
@@ -1118,8 +1162,51 @@ async fn drop_one_inventory_item(
         warn!("Inventory changed before drop; no drop sent.");
         return false;
     }
-    // Explicitly queue selection before Q, without depending on the next GameTick.
-    bot.write_packet(ServerboundSetCarriedItem { slot: selected as u16 });
+
+    // Critical Pre-Drop Verification: Inspect what item is physically about to be dropped from the hand!
+    if let Some(held_item) = gui.player_inventory.get(&stage.hotbar) {
+        if let ItemStack::Present(data) = held_item {
+            let k = format!("{:?}", data.kind).to_lowercase();
+            if k.contains("diamond") && (k.contains("helmet") || k.contains("chestplate") || k.contains("leggings") || k.contains("boots")) {
+                let is_comp = crate::nbt::inspect_item_with_bot(held_item, Some(bot))
+                    .map(|info| crate::armor::is_complete(&info))
+                    .unwrap_or(false);
+                if !is_comp {
+                    error!(
+                        "FATAL DROP SAFETY VIOLATION: Hand slot #{} contains incomplete diamond armor ({})! REFUSING TO DROP INTO HOPPER!",
+                        stage.hotbar, k
+                    );
+                    return false;
+                }
+            }
+            if k.contains("anvil") {
+                error!("FATAL DROP SAFETY VIOLATION: Hand slot #{} contains an ANVIL! REFUSING TO DROP INTO HOPPER!", stage.hotbar);
+                return false;
+            }
+            if k.contains("experience") || k.contains("bottle") {
+                error!("FATAL DROP SAFETY VIOLATION: Hand slot #{} contains XP BOTTLES! REFUSING TO DROP INTO HOPPER!", stage.hotbar);
+                return false;
+            }
+        }
+        if let Some(held_info) = crate::nbt::inspect_item_with_bot(held_item, Some(bot)) {
+            if crate::nbt::is_diamond_armor(&held_info) && !crate::armor::is_complete(&held_info) {
+                error!(
+                    "FATAL DROP SAFETY VIOLATION: Hand slot #{} contains incomplete diamond armor ({} enchants: {:?})! REFUSING TO DROP INTO HOPPER!",
+                    stage.hotbar, held_info.kind, held_info.enchantments
+                );
+                return false;
+            }
+            if crate::nbt::is_anvil(&held_info) {
+                error!("FATAL DROP SAFETY VIOLATION: Hand slot #{} contains an ANVIL! REFUSING TO DROP INTO HOPPER!", stage.hotbar);
+                return false;
+            }
+            if crate::nbt::is_xp_bottle(&held_info) {
+                error!("FATAL DROP SAFETY VIOLATION: Hand slot #{} contains XP BOTTLES! REFUSING TO DROP INTO HOPPER!", stage.hotbar);
+                return false;
+            }
+        }
+    }
+
     bot.write_packet(ServerboundPlayerAction {
         action: Action::DropItem,
         pos: azalea::BlockPos::new(0, 0, 0),
@@ -1143,6 +1230,12 @@ async fn drop_rejected_book_in_hopper(
     if !matches!(expected, ItemStack::Present(data) if data.count == 1 && data.kind == ItemKind::EnchantedBook) {
         error!("Rejected anvil input is not a single enchanted book; refusing to discard it.");
         return false;
+    }
+    if let Some(info) = crate::nbt::inspect_item_with_bot(expected, Some(bot)) {
+        if crate::nbt::is_diamond_armor(&info) || crate::nbt::is_anvil(&info) || crate::nbt::is_xp_bottle(&info) {
+            error!("CRITICAL GUARD: Refusing to discard non-book item {} in drop_rejected_book_in_hopper!", info.kind);
+            return false;
+        }
     }
     state.gui.lock().await.close_current_gui(bot);
     let Some(hopper_pos) = EnchanterManager::find_nearby_hopper(bot) else {

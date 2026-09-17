@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Experience points required to advance from Level L to Level L + 1 in Minecraft Java Edition.
 pub fn xp_to_next_level(level: u32) -> u32 {
@@ -1511,11 +1511,28 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
                     book_info.as_ref().and_then(|b| b.repair_cost),
                     book_info.as_ref().map(|b| &b.stored_enchantments),
                 );
-                let rejected = self.anvil_slots.get(&1).cloned();
-                self.pending_rejection_book = rejected;
+                let is_actual_book = book_info.as_ref().map_or(false, |b| {
+                    b.kind.to_lowercase().contains("book")
+                        || is_protection_4(b)
+                        || is_blast_protection_4(b)
+                        || is_unbreaking_3(b)
+                        || is_mending(b)
+                });
+                if !is_actual_book {
+                    error!(
+                        "ANVIL REJECTION SAFETY: Slot #1 is not an enchanted book (found: {})! Refusing to queue for hopper discard.",
+                        book_info.as_ref().map(|b| b.kind.as_str()).unwrap_or("None")
+                    );
+                    self.pending_rejection_book = None;
+                    self.pending_rejection_slot = None;
+                } else {
+                    let rejected = self.anvil_slots.get(&1).cloned();
+                    self.pending_rejection_book = rejected;
+                    let (_armor_button, book_button) = self.last_staged_buttons.unwrap_or((0, 1));
+                    self.pending_rejection_slot = Some(36 + book_button as i16);
+                }
 
                 let (armor_button, book_button) = self.last_staged_buttons.unwrap_or((0, 1));
-                self.pending_rejection_slot = Some(36 + book_button as i16);
 
                 // Queue tracked clicks to swap rejected book (slot 1) into hotbar slot book_button,
                 // and swap armor (slot 0) into hotbar slot armor_button.

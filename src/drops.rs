@@ -55,7 +55,16 @@ impl DropStage {
         // Prefer an identical item already in hand to avoid a redundant swap.
         let hotbar = (36..=44).find(|slot| inventory.get(slot) == Some(expected))
             .or_else(|| (36..=44).find(|slot| inventory.get(slot) == Some(&ItemStack::Empty)))
-            .unwrap_or(36);
+            .or_else(|| (36..=44).find(|slot| {
+                inventory.get(slot).map_or(true, |item| {
+                    if let ItemStack::Present(data) = item {
+                        let k = format!("{:?}", data.kind).to_lowercase();
+                        !k.contains("diamond") && !k.contains("anvil") && !k.contains("helmet") && !k.contains("chestplate") && !k.contains("leggings") && !k.contains("boots")
+                    } else {
+                        true
+                    }
+                })
+            }))?;
         let source = if inventory.get(&hotbar) == Some(expected) { hotbar } else { source };
         Some(Self { source, hotbar, expected: expected.clone(), displaced: inventory.get(&hotbar)?.clone() })
     }
@@ -148,5 +157,16 @@ mod tests {
         assert!(DropStage::new(&slots, 9, &helmet).is_none());
         let stack = ItemStack::new(ItemKind::ExperienceBottle, 64);
         assert!(DropStage::new(&HashMap::from([(40, stack.clone())]), 40, &stack).is_none());
+    }
+
+    #[test]
+    fn drop_stage_refuses_to_displace_diamond_armor() {
+        let leggings = ItemStack::new(ItemKind::DiamondLeggings, 1);
+        let book = ItemStack::new(ItemKind::EnchantedBook, 1);
+        // All hotbar slots filled with diamond armor
+        let mut slots: HashMap<i16, ItemStack> = (36..=44).map(|s| (s, leggings.clone())).collect();
+        slots.insert(9, book.clone());
+        // Dropping the book from slot 9 must NOT choose an armor slot and must return None
+        assert!(DropStage::new(&slots, 9, &book).is_none());
     }
 }
