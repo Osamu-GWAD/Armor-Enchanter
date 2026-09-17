@@ -1411,8 +1411,25 @@ impl GuiManager {
                             continue;
                         }
 
-                        if self.count_free_inventory_slots() == 0 && !is_xp_bottle(&info) && !(self.phase == WithdrawalPhase::AnvilPlacement && is_anvil(&info)) {
-                            info!("Player inventory has 0 free slots; cannot collect unstackable '{order_name}' at slot #{slot}.");
+                        let has_stackable_xp_slot = (9..=44).any(|s| {
+                            if let Some(ItemStack::Present(data)) = self.player_inventory.get(&s) {
+                                let k = format!("{:?}", data.kind).to_lowercase();
+                                (k.contains("experience") || k.contains("bottle")) && data.count < 64
+                            } else {
+                                false
+                            }
+                        });
+
+                        let cannot_collect = if is_xp_bottle(&info) {
+                            self.count_free_inventory_slots() == 0 && !has_stackable_xp_slot
+                        } else if self.phase == WithdrawalPhase::AnvilPlacement && is_anvil(&info) {
+                            false
+                        } else {
+                            self.count_free_inventory_slots() == 0
+                        };
+
+                        if cannot_collect {
+                            info!("Player inventory has 0 free slots (and no partial stack); cannot collect '{order_name}' at slot #{slot}.");
                             self.current_menu_skipped_slots.push(slot);
                             continue;
                         }

@@ -103,7 +103,7 @@ cargo run --release -- --microsoft player1@outlook.com
 
 - Withdraw two helmets, chestplates, leggings, and boots from `/order`, plus the books and XP listed above. The eight armor pieces, 24 books, and four XP stacks fit the 36 inventory slots after placing the anvil.
 - Finish enchanting the helmet, then chestplate, leggings, and boots. A missing piece or required book returns the unfinished set to restocking. Duplicate armor does not take priority over the next type.
-- Once all four pieces are complete, aim at a hopper within two blocks and drop exactly one helmet, chestplate, leggings, and boots, in that order. Any required hotbar swap waits for server confirmation, and each drop waits for the server to report one fewer piece before advancing. Inventory entries are never optimistically deleted to confirm drops.
+- Once all four pieces are complete, aim at a hopper within 4.5 blocks and drop exactly one helmet, chestplate, leggings, and boots, in that order. Each item is thrown directly from its verified inventory slot, and each drop waits for the server to report one fewer piece before advancing. Inventory entries are never optimistically deleted to confirm drops.
 - Immediately enchant and drop the second stocked set in the same order. Inventory cleaning and `/order` restocking run after both sets, or when supplies are missing, rather than after every set.
 - Anvil and drop workers wake on server inventory updates. Opening the anvil releases its state lock immediately after interaction, allowing screen packets to be processed without a fixed post-interaction delay. Timeouts and per-item acknowledgements remain in place; live throughput has not been benchmarked.
 - A missing hopper or unconfirmed drop retains the sequence and reconnects for reconciliation. Pending drop bookkeeping survives automatic reconnects within the same account process. It is not saved across a process restart.
@@ -155,30 +155,18 @@ cargo run --release -- --account 0
 cargo test
 ```
 
-### Connection-only diagnostics
-
-```powershell
-cargo run --release -- --account 0 --diagnose-seconds 35
-```
-
-This connects one account for a bounded session (1–600 seconds), reports spawn,
-inventory packets and local tick timing, then exits. Inventory automation and
-alerts are disabled in this mode.
-
 ### Drop confirmation
 
-Completed armor and rejected books are moved into a hotbar slot only after
-checking the exact item. Both sides of any staging swap must be confirmed by
-server inventory updates before the bot selects that slot and sends a single
-normal Q drop. It waits up to ten seconds for an inventory decrease; moving an
-item between slots alone never confirms a drop. Armor progress is retained for
-reconciliation after reconnect. An inventory decrease does not prove hopper pickup.
+Completed armor and rejected books use the direct inventory-slot throw from
+commit `53b7303`, with exact-item and protected-item checks immediately before
+sending. There is no hotbar staging or hand selection. This also works when every
+hotbar slot contains protected armor. The bot waits up to ten seconds for a server
+inventory decrease. An inventory decrease does not prove hopper pickup.
 
-After Q, the bot requests a full server inventory snapshot with a same-slot
+After the drop, the bot requests a full server inventory snapshot with a same-slot
 hotbar swap (a no-op) and a mismatched menu state ID. This handles servers that
-accept Q without echoing the slot removal. The cache is updated from the server's
-response; sending the drop itself never counts as confirmation. Connection-only
-diagnostics also issue this no-op once to verify snapshot responses.
+accept a drop without echoing the slot removal. The cache is updated from the
+server's response; sending the drop itself never counts as confirmation.
 
 Anvil contents update the player inventory cache while the menu is open, and
 closing a menu also updates Azalea's active container. High-cost books are tracked

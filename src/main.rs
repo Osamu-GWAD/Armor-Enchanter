@@ -1055,18 +1055,14 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
     });
 }
 
-/// Stage only an exact, server-observed item, then use the normal selected-hand Q action.
+/// Drop the verified inventory slot directly, as in commit 53b7303.
 /// Success means the request was sent; the caller must still confirm the inventory decrease.
 async fn drop_one_inventory_item(
     bot: &Client, state: &BotState, slot: i16, expected: &azalea::inventory::ItemStack,
 ) -> bool {
     use azalea::entity::inventory::Inventory;
     use azalea::inventory::{ItemStack, operations::ClickType};
-    use azalea::protocol::packets::game::{
-        s_container_click::{HashedStack, ServerboundContainerClick},
-        s_player_action::{Action, ServerboundPlayerAction},
-        ServerboundSetCarriedItem,
-    };
+    use azalea::protocol::packets::game::s_container_click::{HashedStack, ServerboundContainerClick};
     if !matches!(expected, ItemStack::Present(data) if data.count == 1) {
         warn!("Refusing to drop stacked item from slot #{slot}.");
         return false;
@@ -1119,108 +1115,30 @@ async fn drop_one_inventory_item(
         warn!("Cannot drop while disconnected or carrying an item on the cursor.");
         return false;
     }
-    let stage = {
-        let gui = state.gui.lock().await;
-        let Some(stage) = drops::DropStage::new(&gui.player_inventory, slot, expected) else {
-            warn!("Drop source #{slot} changed before staging; no drop sent.");
-            return false;
-        };
-        if stage.needs_swap() {
-            bot.write_packet(ServerboundContainerClick {
-                container_id: 0,
-                state_id: gui.player_state_id,
-                slot_num: stage.source,
-                button_num: (stage.hotbar - 36) as u8,
-                click_type: ClickType::Swap,
-                // Request authoritative corrections rather than changing our cache optimistically.
-                changed_slots: Default::default(),
-                carried_item: HashedStack(None),
-            });
-        }
-        stage
-    };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if !*state.spawned.lock().await { return false; }
-        if stage.ready(&state.gui.lock().await.player_inventory) { break; }
-        if std::time::Instant::now() >= deadline {
-            warn!("Drop staging from #{} to #{} was not confirmed; no drop sent.", stage.source, stage.hotbar);
-            return false;
-        }
-        wait_for_inventory_update(state, std::time::Duration::from_millis(100)).await;
-    }
-    let selected = (stage.hotbar - 36) as u8;
-    bot.set_selected_hotbar_slot(selected);
-    bot.write_packet(ServerboundSetCarriedItem { slot: selected as u16 });
-    // Crucial: Wait for server tick to process the selected slot change before dropping!
-    bot.wait_ticks(2).await;
-
     let gui = state.gui.lock().await;
     let can_drop = bot.get_component::<Inventory>()
         .is_some_and(|inventory| inventory.id == 0 && inventory.carried == ItemStack::Empty);
-    if !stage.ready(&gui.player_inventory) || !can_drop {
-        warn!("Inventory changed before drop; no drop sent.");
+    if !(9..=44).contains(&slot) || gui.player_inventory.get(&slot) != Some(expected) || !can_drop {
+        warn!("Drop source #{slot} or active menu changed; no drop sent.");
         return false;
     }
-
-    // Critical Pre-Drop Verification: Inspect what item is physically about to be dropped from the hand!
-    if let Some(held_item) = gui.player_inventory.get(&stage.hotbar) {
-        if let ItemStack::Present(data) = held_item {
-            let k = format!("{:?}", data.kind).to_lowercase();
-            if k.contains("diamond") && (k.contains("helmet") || k.contains("chestplate") || k.contains("leggings") || k.contains("boots")) {
-                let is_comp = crate::nbt::inspect_item_with_bot(held_item, Some(bot))
-                    .map(|info| crate::armor::is_complete(&info))
-                    .unwrap_or(false);
-                if !is_comp {
-                    error!(
-                        "FATAL DROP SAFETY VIOLATION: Hand slot #{} contains incomplete diamond armor ({})! REFUSING TO DROP INTO HOPPER!",
-                        stage.hotbar, k
-                    );
-                    return false;
-                }
-            }
-            if k.contains("anvil") {
-                error!("FATAL DROP SAFETY VIOLATION: Hand slot #{} contains an ANVIL! REFUSING TO DROP INTO HOPPER!", stage.hotbar);
-                return false;
-            }
-            if k.contains("experience") || k.contains("bottle") {
-                error!("FATAL DROP SAFETY VIOLATION: Hand slot #{} contains XP BOTTLES! REFUSING TO DROP INTO HOPPER!", stage.hotbar);
-                return false;
-            }
-        }
-        if let Some(held_info) = crate::nbt::inspect_item_with_bot(held_item, Some(bot)) {
-            if crate::nbt::is_diamond_armor(&held_info) && !crate::armor::is_complete(&held_info) {
-                error!(
-                    "FATAL DROP SAFETY VIOLATION: Hand slot #{} contains incomplete diamond armor ({} enchants: {:?})! REFUSING TO DROP INTO HOPPER!",
-                    stage.hotbar, held_info.kind, held_info.enchantments
-                );
-                return false;
-            }
-            if crate::nbt::is_anvil(&held_info) {
-                error!("FATAL DROP SAFETY VIOLATION: Hand slot #{} contains an ANVIL! REFUSING TO DROP INTO HOPPER!", stage.hotbar);
-                return false;
-            }
-            if crate::nbt::is_xp_bottle(&held_info) {
-                error!("FATAL DROP SAFETY VIOLATION: Hand slot #{} contains XP BOTTLES! REFUSING TO DROP INTO HOPPER!", stage.hotbar);
-                return false;
-            }
-        }
-    }
-
-    bot.write_packet(ServerboundPlayerAction {
-        action: Action::DropItem,
-        pos: azalea::BlockPos::new(0, 0, 0),
-        direction: azalea::core::direction::Direction::Down,
-        seq: 0,
+    // Throw exactly one item from its current slot. No staging swap, selected
+    // hand change, or client-side inventory prediction is needed.
+    bot.write_packet(ServerboundContainerClick {
+        container_id: 0,
+        state_id: gui.player_state_id,
+        slot_num: slot,
+        button_num: 0,
+        click_type: ClickType::Throw,
+        changed_slots: Default::default(),
+        carried_item: HashedStack(None),
     });
-    // Servers can accept Q without echoing its predicted slot removal. Queue
-    // a no-op refresh AFTER Q on the same connection, and confirm only from
-    // the resulting server inventory rather than deleting our cached item.
-    drops::request_inventory_refresh(bot, selected);
-    info!("Sent single-item drop from verified hotbar slot #{}; requested server inventory refresh.", stage.hotbar);
+    // Keep the server-confirmed-count check: request a snapshot if the server
+    // accepts the drop without broadcasting its predicted inventory change.
+    drops::request_inventory_refresh(bot, 0);
+    info!("Sent single-item inventory drop from verified slot #{slot}; requested server inventory refresh.");
     true
 }
-
 /// Discard only the exact book rejected by the anvil, after the server returns it.
 async fn drop_rejected_book_in_hopper(
     bot: &Client, state: &BotState, expected: &azalea::inventory::ItemStack, preferred_slot: Option<i16>,
@@ -1758,6 +1676,116 @@ async fn main() -> Result<(), anyhow::Error> {
 #[cfg(test)]
 pub(crate) mod workflow_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn book_drop_uses_original_slot_even_when_hotbar_is_full_of_armor() {
+        use azalea::inventory::{ItemStack, operations::ClickType};
+        use azalea::packet::game::SendGamePacketEvent;
+        use azalea::protocol::packets::game::{ServerboundGamePacket, ClientboundContainerSetContent};
+        use azalea_registry::builtin::ItemKind;
+        for accepted in [true, false] {
+            let bot = local_client();
+            let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let output = captured.clone();
+            bot.ecs.write().add_observer(move |event: azalea::ecs::observer::On<SendGamePacketEvent>| {
+                output.lock().unwrap().push(event.packet.clone());
+            });
+            let mut state = BotState::default();
+            state.gui = Arc::new(Mutex::new(GuiManager::new()));
+            *state.spawned.lock().await = true;
+            let book = ItemStack::new(ItemKind::EnchantedBook, 1);
+            let helmet = ItemStack::new(ItemKind::DiamondHelmet, 1);
+            let mut slots = vec![ItemStack::Empty; 46];
+            slots[21] = book.clone();
+            for slot in 36..=44 { slots[slot] = helmet.clone(); }
+            state.gui.lock().await.on_set_content(0, 17, &slots, None);
+            assert!(drop_one_inventory_item(&bot, &state, 21, &book).await);
+            bot.ecs.write().flush();
+            {
+                let packets = captured.lock().unwrap();
+                assert_eq!(packets.len(), 2);
+                assert!(matches!(&packets[0], ServerboundGamePacket::ContainerClick(p)
+                    if p.slot_num == 21 && p.button_num == 0 && p.click_type == ClickType::Throw
+                    && p.container_id == 0 && p.state_id == 17));
+                assert!(matches!(&packets[1], ServerboundGamePacket::ContainerClick(p)
+                    if p.slot_num == 36 && p.button_num == 0 && p.click_type == ClickType::Swap
+                    && p.container_id == 0 && p.state_id == 32768));
+            }
+            // No staging or optimistic deletion, even when the server is silent.
+            assert_eq!(state.gui.lock().await.player_inventory[&21], book);
+            assert_eq!(state.gui.lock().await.player_inventory[&36], helmet);
+            if accepted { slots[21] = ItemStack::Empty; }
+            handle_packet(&bot, &Arc::new(ClientboundGamePacket::ContainerSetContent(ClientboundContainerSetContent {
+                container_id: 0, state_id: 18, items: slots, carried_item: ItemStack::Empty,
+            })), &state).await;
+            let remaining = state.gui.lock().await.player_inventory.values().filter(|item| **item == book).count();
+            assert_eq!(armor::drop_status(1, remaining), if accepted {
+                armor::DropStatus::Confirmed
+            } else { armor::DropStatus::Retained });
+            assert_eq!(state.gui.lock().await.player_inventory[&36], helmet);
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_drop_accepts_completed_armor_from_its_actual_slot() {
+        use azalea::inventory::ItemStack;
+        use azalea_inventory::components::{DataComponentUnion, Lore};
+        use azalea_registry::builtin::{DataComponentKind, ItemKind};
+        for (kind, protection) in [(ItemKind::DiamondHelmet, "Protection IV"),
+            (ItemKind::DiamondChestplate, "Protection IV"),
+            (ItemKind::DiamondLeggings, "Blast Protection IV"),
+            (ItemKind::DiamondBoots, "Blast Protection IV")] {
+            let bot = local_client();
+            let mut state = BotState::default();
+            state.gui = Arc::new(Mutex::new(GuiManager::new()));
+            *state.spawned.lock().await = true;
+            let mut armor = ItemStack::new(kind, 1);
+            if let ItemStack::Present(data) = &mut armor {
+                let lore = Lore { lines: [protection, "Unbreaking III", "Mending"]
+                    .into_iter().map(azalea::FormattedText::from).collect() };
+                // Both the component key and union value are Lore.
+                unsafe { data.component_patch.unchecked_insert_component(
+                    DataComponentKind::Lore, Some(DataComponentUnion::from(lore)),
+                ); }
+            }
+            state.gui.lock().await.player_inventory.insert(33, armor.clone());
+            assert!(drop_one_inventory_item(&bot, &state, 33, &armor).await);
+            assert_eq!(state.gui.lock().await.player_inventory[&33], armor);
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_drop_preserves_protected_items_and_rejects_stale_sources() {
+        use azalea::inventory::ItemStack;
+        use azalea::packet::game::SendGamePacketEvent;
+        use azalea_registry::builtin::ItemKind;
+        let bot = local_client();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output = captured.clone();
+        bot.ecs.write().add_observer(move |event: azalea::ecs::observer::On<SendGamePacketEvent>| {
+            output.lock().unwrap().push(event.packet.clone());
+        });
+        let mut state = BotState::default();
+        state.gui = Arc::new(Mutex::new(GuiManager::new()));
+        *state.spawned.lock().await = true;
+        for kind in [ItemKind::DiamondHelmet, ItemKind::DiamondChestplate, ItemKind::DiamondLeggings,
+            ItemKind::DiamondBoots, ItemKind::Anvil, ItemKind::ExperienceBottle] {
+            let item = ItemStack::new(kind, 1);
+            state.gui.lock().await.player_inventory.insert(21, item.clone());
+            assert!(!drop_one_inventory_item(&bot, &state, 21, &item).await);
+        }
+        let book = ItemStack::new(ItemKind::EnchantedBook, 1);
+        assert!(!drop_one_inventory_item(&bot, &state, 21, &book).await);
+        let stack = ItemStack::new(ItemKind::EnchantedBook, 2);
+        state.gui.lock().await.player_inventory.insert(21, stack.clone());
+        assert!(!drop_one_inventory_item(&bot, &state, 21, &stack).await);
+        for slot in [-1, 0, 8, 45, 99] {
+            state.gui.lock().await.player_inventory.insert(slot, book.clone());
+            assert!(!drop_one_inventory_item(&bot, &state, slot, &book).await);
+        }
+        bot.ecs.write().flush();
+        assert!(captured.lock().unwrap().is_empty());
+    }
 
     pub(crate) fn local_client() -> Client {
         let mut world = azalea::ecs::world::World::new();

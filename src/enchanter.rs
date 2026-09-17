@@ -1157,7 +1157,7 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
                 .next()
         };
 
-        if let Some((armor_slot, armor_info)) = crate::armor::next_armor(&armor_slots) {
+        let find_task_for_armor = |armor_slot: i16, armor_info: &ItemInfo| -> Option<CombineTask> {
             let is_prot_piece = is_diamond_helmet(armor_info) || is_diamond_chestplate(armor_info);
             let is_blast_piece = is_diamond_leggings(armor_info) || is_diamond_boots(armor_info);
 
@@ -1184,7 +1184,7 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
 
                 if let Some((ench_name, req_level, b_slot)) = target_book {
                     return Some(CombineTask {
-                        armor_slot: *armor_slot,
+                        armor_slot,
                         book_slot: b_slot,
                         armor_desc: armor_info.kind.clone(),
                         enchant_name: ench_name,
@@ -1200,7 +1200,7 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
                 if let Some((unb_slot, b)) = find_book(&|b| is_unbreaking_3(b)) {
                     let req_level = Self::expected_combine_cost(armor_info, &b);
                     return Some(CombineTask {
-                        armor_slot: *armor_slot,
+                        armor_slot,
                         book_slot: unb_slot,
                         armor_desc: armor_info.kind.clone(),
                         enchant_name: "Unbreaking III",
@@ -1211,7 +1211,7 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
                     if let Some((comb_slot, b)) = find_book(&|b| is_unbreaking_and_mending(b)) {
                         let req_level = Self::expected_combine_cost(armor_info, &b);
                         return Some(CombineTask {
-                            armor_slot: *armor_slot,
+                            armor_slot,
                             book_slot: comb_slot,
                             armor_desc: armor_info.kind.clone(),
                             enchant_name: "Unbreaking III & Mending",
@@ -1230,7 +1230,7 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
                 if let Some((mend_slot, b)) = find_book(&|b| is_mending(b)) {
                     let req_level = Self::expected_combine_cost(armor_info, &b);
                     return Some(CombineTask {
-                        armor_slot: *armor_slot,
+                        armor_slot,
                         book_slot: mend_slot,
                         armor_desc: armor_info.kind.clone(),
                         enchant_name: "Mending",
@@ -1238,6 +1238,44 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
                     });
                 } else {
                     return None;
+                }
+            }
+
+            None
+        };
+
+        // 1. Priority 1: Strictly follow sequential order when books for the preferred piece are available
+        if let Some((armor_slot, armor_info)) = crate::armor::next_armor(&armor_slots) {
+            if let Some(task) = find_task_for_armor(*armor_slot, armor_info) {
+                return Some(task);
+            }
+        }
+
+        // 2. Priority 2: If the preferred piece cannot combine (e.g. missing its protection book),
+        // combine any other incomplete piece that CAN combine with current books to make progress
+        // and free up inventory space!
+        for kind in 0..4 {
+            let mut candidates: Vec<_> = armor_slots
+                .iter()
+                .filter(|(_, info)| crate::armor::armor_type(info) == Some(kind) && crate::armor::is_clean_armor(info) && !crate::armor::is_complete(info))
+                .collect();
+            candidates.sort_by_key(|(slot, info)| {
+                let progress = info.has_enchantment(
+                    if kind < 2 { "protection" } else { "blast_protection" },
+                    4,
+                ) as i32
+                    + info.has_enchantment("unbreaking", 3) as i32
+                    + info.has_enchantment("mending", 1) as i32;
+                (-progress, *slot)
+            });
+
+            for (armor_slot, armor_info) in candidates {
+                if let Some(task) = find_task_for_armor(*armor_slot, armor_info) {
+                    info!(
+                        "Preferred armor piece cannot combine with current books; combining alternative piece {} (slot #{}) with {} to make progress and free inventory space!",
+                        armor_info.kind, armor_slot, task.enchant_name
+                    );
+                    return Some(task);
                 }
             }
         }
@@ -2457,5 +2495,40 @@ mod tests {
         manager.rejected_inventory_slots.insert(10);
         assert!(manager.find_next_combine_task(&bot).is_none());
         assert!(!manager.has_available_book_for_current_armor(&bot));
+    }
+
+    #[test]
+    fn test_fallback_to_other_pieces_when_preferred_piece_missing_book() {
+        use azalea_registry::builtin::{DataComponentKind, ItemKind};
+        use azalea_inventory::components::{DataComponentUnion, Lore};
+
+        let bot = crate::workflow_tests::local_client();
+        let mut manager = EnchanterManager::new();
+
+        // Slot 9: Chestplate (needs Prot 4, but no Prot 4 book in inventory)
+        let chestplate = ItemStack::new(ItemKind::DiamondChestplate, 1);
+        manager.player_inventory.insert(9, chestplate);
+
+        // Slot 10: Leggings (needs Blast Prot 4, and Blast Prot 4 is available!)
+        let leggings = ItemStack::new(ItemKind::DiamondLeggings, 1);
+        manager.player_inventory.insert(10, leggings);
+
+        let mut blast_book = ItemStack::new(ItemKind::EnchantedBook, 1);
+        if let ItemStack::Present(data) = &mut blast_book {
+            let lore = Lore { lines: vec![azalea::FormattedText::from("Blast Protection IV")] };
+            unsafe {
+                data.component_patch.unchecked_insert_component(
+                    DataComponentKind::Lore,
+                    Some(DataComponentUnion::from(lore)),
+                );
+            }
+        }
+        manager.player_inventory.insert(11, blast_book);
+
+        // find_next_combine_task should combine Leggings (container slot 4) with Blast Prot IV (container slot 5)
+        let task = manager.find_next_combine_task(&bot).unwrap();
+        assert_eq!(task.armor_slot, 4); // Container slot 4 = player inventory slot 10 (Leggings)
+        assert_eq!(task.book_slot, 5);  // Container slot 5 = player inventory slot 11 (Blast Prot 4)
+        assert_eq!(task.enchant_name, "Blast Protection IV");
     }
 }
