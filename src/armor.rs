@@ -46,10 +46,11 @@ pub fn is_clean_armor(info: &ItemInfo) -> bool {
     let prior_works = (info.has_enchantment("protection", 4) || info.has_enchantment("blast_protection", 4)) as u32
         + (info.has_enchantment("unbreaking", 3) as u32)
         + (info.has_enchantment("mending", 1) as u32);
-    let max_allowed_pwp = if prior_works == 0 {
-        0
-    } else {
-        (1u32 << prior_works) - 1
+    let max_allowed_pwp = match prior_works {
+        0 => 0,
+        1 => 15,
+        2 => 31,
+        _ => 63,
     };
     info.repair_cost.unwrap_or(0) <= max_allowed_pwp
 }

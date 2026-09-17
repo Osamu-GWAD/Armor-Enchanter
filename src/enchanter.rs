@@ -1048,8 +1048,58 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
         }
     }
 
+    pub fn is_viable_book_for_armor(armor: &ItemInfo, book: &ItemInfo) -> bool {
+        let is_prot_piece = is_diamond_helmet(armor) || is_diamond_chestplate(armor);
+        let is_blast_piece = is_diamond_leggings(armor) || is_diamond_boots(armor);
+
+        let has_main_prot = if is_prot_piece {
+            armor.has_enchantment("protection", 4)
+        } else if is_blast_piece {
+            armor.has_enchantment("blast_protection", 4)
+        } else {
+            false
+        };
+        let has_unb = armor.has_enchantment("unbreaking", 3);
+        let has_mend = armor.has_enchantment("mending", 1);
+
+        let current_enchants = (has_main_prot as u32) + (has_unb as u32) + (has_mend as u32);
+        let min_armor_penalty = if current_enchants == 0 { 0 } else { (1u32 << current_enchants) - 1 };
+        let armor_pwp = armor.repair_cost.unwrap_or(0).max(min_armor_penalty);
+        let default_book_penalty = if is_unbreaking_and_mending(book) { 1 } else { 0 };
+        let book_pwp = book.repair_cost.unwrap_or(default_book_penalty);
+
+        let enchant_cost = if is_protection_4(book) {
+            4
+        } else if is_blast_protection_4(book) {
+            8
+        } else if is_unbreaking_and_mending(book) {
+            5
+        } else if is_unbreaking_3(book) {
+            3
+        } else if is_mending(book) {
+            2
+        } else {
+            1
+        };
+
+        let current_cost = armor_pwp + book_pwp + enchant_cost;
+        if current_cost >= 40 {
+            return false;
+        }
+
+        let next_armor_pwp = armor_pwp.max(book_pwp) * 2 + 1;
+        let added_enchants = if is_unbreaking_and_mending(book) { 2 } else { 1 };
+        let remaining_after = 3u32.saturating_sub(current_enchants + added_enchants);
+
+        match remaining_after {
+            0 => true,
+            1 => next_armor_pwp <= 36,
+            _ => next_armor_pwp <= 18,
+        }
+    }
+
     /// Returns the expected anvil level cost for combining an armor piece with a sacrifice book,
-    /// assuming clean items/books (zero prior-work penalty on fresh books from orders).
+    /// properly incorporating both armor and book prior-work penalties.
     pub fn expected_combine_cost(armor: &ItemInfo, book: &ItemInfo) -> u32 {
         let is_prot_piece = is_diamond_helmet(armor) || is_diamond_chestplate(armor);
         let is_blast_piece = is_diamond_leggings(armor) || is_diamond_boots(armor);
@@ -1065,11 +1115,12 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
         let has_mend = armor.has_enchantment("mending", 1);
 
         let prior_works = (has_main_prot as u32) + (has_unb as u32) + (has_mend as u32);
-        let armor_penalty = if prior_works == 0 {
+        let min_armor_penalty = if prior_works == 0 {
             0
         } else {
             (1u32 << prior_works) - 1
         };
+        let armor_penalty = armor.repair_cost.unwrap_or(0).max(min_armor_penalty);
 
         let enchant_cost = if is_protection_4(book) {
             4
@@ -1086,10 +1137,69 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
             1
         };
 
-        // If the book is an already-crafted combined book (e.g. Unb III + Mending), its clean penalty is 1
-        let book_penalty = if is_unbreaking_and_mending(book) { 1 } else { 0 };
+        let default_book_penalty = if is_unbreaking_and_mending(book) { 1 } else { 0 };
+        let book_penalty = book.repair_cost.unwrap_or(default_book_penalty);
 
         armor_penalty + book_penalty + enchant_cost
+    }
+
+    pub fn is_anvil_combine_viable(&self, server_cost: u32, bot: &Client) -> bool {
+        if server_cost >= 40 {
+            return false;
+        }
+        let armor_info = self.anvil_slots.get(&0).and_then(|i| inspect_item_with_bot(i, Some(bot)));
+        let book_info = self.anvil_slots.get(&1).and_then(|i| inspect_item_with_bot(i, Some(bot)));
+
+        match (&armor_info, &book_info) {
+            (Some(a), Some(b)) => {
+                let is_prot_piece = is_diamond_helmet(a) || is_diamond_chestplate(a);
+                let is_blast_piece = is_diamond_leggings(a) || is_diamond_boots(a);
+
+                let has_main_prot = if is_prot_piece {
+                    a.has_enchantment("protection", 4)
+                } else if is_blast_piece {
+                    a.has_enchantment("blast_protection", 4)
+                } else {
+                    false
+                };
+                let has_unb = a.has_enchantment("unbreaking", 3);
+                let has_mend = a.has_enchantment("mending", 1);
+
+                let current_enchants = (has_main_prot as u32) + (has_unb as u32) + (has_mend as u32);
+                let min_armor_penalty = if current_enchants == 0 { 0 } else { (1u32 << current_enchants) - 1 };
+                let armor_pwp = a.repair_cost.unwrap_or(0).max(min_armor_penalty);
+
+                let enchant_cost = if is_protection_4(b) {
+                    4
+                } else if is_blast_protection_4(b) {
+                    8
+                } else if is_unbreaking_and_mending(b) {
+                    5
+                } else if is_unbreaking_3(b) {
+                    3
+                } else if is_mending(b) {
+                    2
+                } else {
+                    1
+                };
+
+                let min_base_cost = armor_pwp + enchant_cost;
+                if server_cost < min_base_cost {
+                    return false;
+                }
+                let deduced_book_pwp = server_cost - min_base_cost;
+                let next_armor_pwp = armor_pwp.max(deduced_book_pwp) * 2 + 1;
+                let added_enchants = if is_unbreaking_and_mending(b) { 2 } else { 1 };
+                let remaining_after = 3u32.saturating_sub(current_enchants + added_enchants);
+
+                match remaining_after {
+                    0 => true,
+                    1 => next_armor_pwp <= 36,
+                    _ => next_armor_pwp <= 18,
+                }
+            }
+            _ => true,
+        }
     }
 
     /// Determine the next combination task based on the sequential combining sequence:
@@ -1137,7 +1247,7 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
             self.rejected_inventory_slots.contains(&inv_slot) || self.rejected_inventory_slots.contains(&slot)
         };
 
-        let find_book = |predicate: &dyn Fn(&ItemInfo) -> bool| -> Option<(i16, ItemInfo)> {
+        let find_book = |predicate: &dyn Fn(&ItemInfo) -> bool, _armor: &ItemInfo| -> Option<(i16, ItemInfo)> {
             // Priority 1: Pick known clean book that has not been rejected
             let clean = book_slots.iter()
                 .filter(|(s, b)| *s >= 30 && predicate(b) && is_clean(b) && !is_rejected(*s))
@@ -1148,7 +1258,7 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
                 return clean;
             }
             // Priority 2: Fall back to testing unrejected candidate book in anvil.
-            // If server cost exceeds clean formula, process_anvil_combines rejects it
+            // If server cost is not viable to reach God tier, process_anvil_combines rejects it
             // and it is dropped into the hopper and restocked.
             book_slots.iter()
                 .filter(|(s, b)| *s >= 30 && predicate(b) && !is_rejected(*s))
@@ -1175,10 +1285,10 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
             // STEP 1: If base protection is missing, apply it first (Prot IV: 4 lvl, Blast Prot IV: 8 lvl)
             if !has_main_prot {
                 let target_book = if is_prot_piece {
-                    find_book(&|b| is_protection_4(b))
+                    find_book(&|b| is_protection_4(b), armor_info)
                         .map(|(s, b)| ("Protection IV", Self::expected_combine_cost(armor_info, &b), s))
                 } else {
-                    find_book(&|b| is_blast_protection_4(b))
+                    find_book(&|b| is_blast_protection_4(b), armor_info)
                         .map(|(s, b)| ("Blast Protection IV", Self::expected_combine_cost(armor_info, &b), s))
                 };
 
@@ -1197,7 +1307,7 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
 
             // STEP 2: Apply Unbreaking III next (Cost: 4 lvl when Base Prot is present)
             if !has_unb {
-                if let Some((unb_slot, b)) = find_book(&|b| is_unbreaking_3(b)) {
+                if let Some((unb_slot, b)) = find_book(&|b| is_unbreaking_3(b), armor_info) {
                     let req_level = Self::expected_combine_cost(armor_info, &b);
                     return Some(CombineTask {
                         armor_slot,
@@ -1208,7 +1318,7 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
                     });
                 } else if !has_mend {
                     // Check if pre-combined Unbreaking III + Mending book is available
-                    if let Some((comb_slot, b)) = find_book(&|b| is_unbreaking_and_mending(b)) {
+                    if let Some((comb_slot, b)) = find_book(&|b| is_unbreaking_and_mending(b), armor_info) {
                         let req_level = Self::expected_combine_cost(armor_info, &b);
                         return Some(CombineTask {
                             armor_slot,
@@ -1227,7 +1337,7 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
 
             // STEP 3: Apply Mending last (Cost: 5 lvl when Base Prot + Unb III are present)
             if !has_mend {
-                if let Some((mend_slot, b)) = find_book(&|b| is_mending(b)) {
+                if let Some((mend_slot, b)) = find_book(&|b| is_mending(b), armor_info) {
                     let req_level = Self::expected_combine_cost(armor_info, &b);
                     return Some(CombineTask {
                         armor_slot,
@@ -1523,25 +1633,16 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
                 return false;
             }
 
-            let expected_cost = if let Some(ref t) = self.active_combine_task {
-                t.required_level
-            } else {
-                let armor_info = self.anvil_slots.get(&0).and_then(|i| inspect_item_with_bot(i, Some(bot)));
-                let book_info = self.anvil_slots.get(&1).and_then(|i| inspect_item_with_bot(i, Some(bot)));
-                match (armor_info, book_info) {
-                    (Some(ref a), Some(ref b)) => Self::expected_combine_cost(a, b),
-                    _ => 40,
-                }
-            };
 
-            // High XP cost rejection: if server cost exceeds expected clean cost, or >= 40 ("Too Expensive")
-            if server_cost > expected_cost || server_cost >= 40 {
+            let is_viable = self.is_anvil_combine_viable(server_cost, bot);
+
+            // High XP cost rejection: if server cost is not viable to reach God tier, or >= 40 ("Too Expensive")
+            if !is_viable || server_cost >= 40 {
                 let armor_info = self.anvil_slots.get(&0).and_then(|i| inspect_item_with_bot(i, Some(bot)));
                 let book_info = self.anvil_slots.get(&1).and_then(|i| inspect_item_with_bot(i, Some(bot)));
                 warn!(
-                    "REJECTING HIGH-COST COMBINE: Server repair cost ({} levels) exceeds expected clean cost ({} levels)! Armor: kind={}, PWP={:?}, enchants={:?}. Book: kind={}, PWP={:?}, enchants={:?}. Ejecting inputs to hotbar for hopper discard.",
+                    "REJECTING HIGH-COST COMBINE: Server repair cost ({} levels) is not viable to reach God tier! Armor: kind={}, PWP={:?}, enchants={:?}. Book: kind={}, PWP={:?}, enchants={:?}. Ejecting inputs to hotbar for hopper discard.",
                     server_cost,
-                    expected_cost,
                     armor_info.as_ref().map(|a| a.kind.as_str()).unwrap_or("Armor"),
                     armor_info.as_ref().and_then(|a| a.repair_cost),
                     armor_info.as_ref().map(|a| &a.enchantments),
@@ -1588,7 +1689,7 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
 
             // Valid cost, but current player level is too low: close anvil to throw exact XP bottles
             if server_cost > cur_lvl {
-                info!("Anvil inputs valid (Cost: {server_cost} <= Expected: {expected_cost}), but > current level ({cur_lvl}). Closing anvil to throw XP...");
+                info!("Anvil inputs valid (Cost: {server_cost}), but > current level ({cur_lvl}). Closing anvil to throw XP...");
                 self.close_anvil(bot, container_id);
                 self.xp_target = Some(server_cost);
                 return false;
@@ -1596,7 +1697,7 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
 
             // Valid cost and level suffices: collect output slot 2 via QuickMove
             if has_output2 && cur_lvl >= server_cost {
-                info!("Output slot #2 ready and level suffices (Level {cur_lvl} >= Cost {server_cost} <= Expected {expected_cost}); collecting via QuickMove...");
+                info!("Output slot #2 ready and level suffices (Level {cur_lvl} >= Cost {server_cost}); collecting via QuickMove...");
                 self.send_tracked_anvil_click(bot, container_id, 2, 0, ClickType::QuickMove);
                 self.recipe_wait_since = None;
                 self.active_combine_task = None;
@@ -1606,9 +1707,8 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
 
         // Cost and result can arrive in either order. If output slot 2 has an item and level suffices
         if has_output2 && server_cost > 0 && server_cost < 40 && cur_lvl >= server_cost {
-            let expected_cost = self.active_combine_task.as_ref().map(|t| t.required_level).unwrap_or(40);
-            if server_cost <= expected_cost {
-                info!("Output slot #2 ready and level suffices (Level {cur_lvl} >= Cost {server_cost} <= Expected {expected_cost}); collecting via QuickMove...");
+            if self.is_anvil_combine_viable(server_cost, bot) {
+                info!("Output slot #2 ready and level suffices (Level {cur_lvl} >= Cost {server_cost}); collecting via QuickMove...");
                 self.send_tracked_anvil_click(bot, container_id, 2, 0, ClickType::QuickMove);
                 self.recipe_wait_since = None;
                 self.active_combine_task = None;
