@@ -1122,21 +1122,34 @@ async fn drop_one_inventory_item(
         warn!("Drop source #{slot} or active menu changed; no drop sent.");
         return false;
     }
-    // Throw exactly one item from its current slot. No staging swap, selected
-    // hand change, or client-side inventory prediction is needed.
+
+    let empty_hotbar = if (9..=35).contains(&slot) {
+        (0..9u8).find(|&h| {
+            let s = 36 + h as i16;
+            gui.player_inventory.get(&s).map_or(true, |it| it.is_empty())
+        })
+    } else {
+        None
+    };
+
+    let (drop_slot, refresh_hotbar) = if let Some(h) = empty_hotbar {
+        EnchanterManager::swap_to_hotbar(bot, slot, h);
+        (36 + h as i16, h)
+    } else {
+        (slot, if (36..=44).contains(&slot) { (slot - 36) as u8 } else { 0 })
+    };
+
     bot.write_packet(ServerboundContainerClick {
         container_id: 0,
         state_id: gui.player_state_id,
-        slot_num: slot,
+        slot_num: drop_slot,
         button_num: 0,
         click_type: ClickType::Throw,
         changed_slots: Default::default(),
         carried_item: HashedStack(None),
     });
-    // Keep the server-confirmed-count check: request a snapshot if the server
-    // accepts the drop without broadcasting its predicted inventory change.
-    drops::request_inventory_refresh(bot, 0);
-    info!("Sent single-item inventory drop from verified slot #{slot}; requested server inventory refresh.");
+    drops::request_inventory_refresh(bot, refresh_hotbar);
+    info!("Sent single-item inventory drop from verified slot #{drop_slot} (source #{slot}); requested server inventory refresh.");
     true
 }
 /// Discard only the exact book rejected by the anvil, after the server returns it.
