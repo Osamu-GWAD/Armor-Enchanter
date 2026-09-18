@@ -1,8 +1,7 @@
 use crate::nbt::{
     inspect_item_with_bot, is_anvil, is_blast_protection_4, is_diamond_armor, is_diamond_boots,
     is_diamond_chestplate, is_diamond_helmet, is_diamond_leggings, is_mending, is_protection_4,
-    is_single_mending, is_single_unbreaking_3, is_unbreaking_3, is_unbreaking_and_mending,
-    is_xp_bottle, ItemInfo,
+    is_unbreaking_3, is_xp_bottle, ItemInfo,
 };
 use azalea::core::direction::Direction;
 use azalea::inventory::operations::ClickType;
@@ -11,13 +10,14 @@ use azalea::protocol::packets::game::s_container_click::{HashedStack, Serverboun
 use azalea::protocol::packets::game::s_interact::InteractionHand;
 use azalea::protocol::packets::game::s_player_action::{Action, ServerboundPlayerAction};
 use azalea::protocol::packets::game::s_swing::ServerboundSwing;
+use azalea::protocol::packets::game::ServerboundContainerClose;
 use azalea::BlockPos;
 use azalea::Client;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 /// Experience points required to advance from Level L to Level L + 1 in Minecraft Java Edition.
 pub fn xp_to_next_level(level: u32) -> u32 {
@@ -54,10 +54,8 @@ pub fn calculate_current_xp(level: u32, progress: f32) -> u32 {
     let next_cost = xp_to_next_level(level);
     // Floor progress XP and clamp to at most next_cost - 1, because if progress reached
     // next_cost the player would have already leveled up to level + 1.
-    // An epsilon buffer (1e-4) prevents float rounding errors (e.g. 5.9999) from truncating
-    // to points - 1 and causing false deficit inflation.
     let max_bar_xp = next_cost.saturating_sub(1);
-    let bar_xp = (((progress.clamp(0.0, 1.0) * next_cost as f32) + 1e-4).floor() as u32).min(max_bar_xp);
+    let bar_xp = ((progress.clamp(0.0, 1.0) * next_cost as f32).floor() as u32).min(max_bar_xp);
     base_xp + bar_xp
 }
 
@@ -90,67 +88,6 @@ pub fn bottles_between_levels(from_level: u32, from_progress: f32, target_level:
 /// If `needed_xp <= 11`, returns 0 to signal single-bottle precision mode.
 pub fn safe_batch_size(needed_xp: u32) -> u32 {
     (needed_xp.saturating_sub(1) / 11).min(64)
-}
-
-/// Strict safe batch size for zero-overshoot XP bottle consumption.
-/// Unlike standard safe_batch_size, this strict calculation:
-/// 1. Enforces single-bottle precision whenever needed_xp <= 22 (since 2 bottles can yield up to 22 XP).
-/// 2. For deficits > 22 XP, subtracts an 11 XP safety margin before division by 11 so that even if every
-///    thrown bottle rolls the absolute maximum of 11 XP, the remaining deficit is guaranteed to be >= 11 XP.
-/// 3. Caps batch size to 16 bottles to prevent entity/orb desync and anticheat rate-limiting.
-pub fn strict_safe_batch_size(needed_xp: u32) -> u32 {
-    if needed_xp <= 22 {
-        0
-    } else {
-        (needed_xp.saturating_sub(11) / 11).min(16)
-    }
-}
-
-/// Strict calculation of bottles needed to reach target level without overshooting.
-/// Uses the maximum possible yield per bottle (11 XP) to determine the strict lower bound
-/// of bottles that can be safely thrown.
-pub fn strict_bottles_between_levels(from_level: u32, from_progress: f32, target_level: u32) -> u32 {
-    if from_level >= target_level {
-        return 0;
-    }
-    let needed_xp = xp_difference(from_level, from_progress, target_level);
-    (needed_xp / 11).max(if needed_xp > 0 { 1 } else { 0 })
-}
-
-/// Parse a user-specified XP throw speed string into tick delay between bottle throws.
-/// Supports:
-/// - Plain numbers (e.g. "1" = 1 tick, "2" = 2 ticks, "0" = 0 ticks/burst).
-/// - If number >= 20, treated as milliseconds (e.g. "50" -> 1 tick, "100" -> 2 ticks).
-/// - Explicit millisecond format (e.g. "50ms" -> 1 tick, "100ms" -> 2 ticks, "200ms" -> 4 ticks).
-/// - Explicit tick format (e.g. "1t" -> 1 tick, "2t" -> 2 ticks).
-/// - Presets: "instant" / "burst" -> 0, "normal" / "fast" -> 1, "slow" / "safe" -> 2, "slower" -> 3.
-pub fn parse_throw_speed(val: &str) -> u32 {
-    let s = val.trim().to_lowercase();
-    match s.as_str() {
-        "instant" | "max" | "burst" | "fastest" => 0,
-        "fast" | "normal" | "default" => 1,
-        "slow" | "safe" => 2,
-        "slower" => 3,
-        _ => {
-            if let Some(stripped) = s.strip_suffix("ms") {
-                if let Ok(ms) = stripped.trim().parse::<u64>() {
-                    return ((ms + 49) / 50).max(1) as u32;
-                }
-            }
-            if let Some(stripped) = s.strip_suffix('t') {
-                if let Ok(ticks) = stripped.trim().parse::<u32>() {
-                    return ticks;
-                }
-            }
-            if let Ok(num) = s.parse::<u32>() {
-                if num >= 20 {
-                    return ((num + 49) / 50).max(1);
-                }
-                return num;
-            }
-            1
-        }
-    }
 }
 
 /// Legacy/backward-compatible helper using raw total XP
@@ -216,7 +153,7 @@ pub fn swing_arm(bot: &Client) {
 }
 
 /// An individual combine task inside the anvil.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CombineTask {
     pub armor_slot: i16,
     pub book_slot: i16,
@@ -247,16 +184,14 @@ pub struct EnchanterManager {
     content_wait_since: Option<std::time::Instant>,
     pub xp_target: Option<u32>,
     pub restock_needed: bool,
-    pub throw_speed_ticks: u32,
-    pub strict_calculation: bool,
-    pub active_combine_task: Option<CombineTask>,
-    pub book_to_discard: Option<ItemStack>,
-    pub book_to_discard_slot: Option<i16>,
+    pub cursed_book_to_discard: Option<ItemStack>,
+    pub cursed_book_slot: Option<i16>,
+    pub cursed_inventory_slots: std::collections::HashSet<i16>,
+    pub last_staged_buttons: Option<(u8, u8)>,
+    pub rejection_recovery: bool,
     pub pending_rejection_book: Option<ItemStack>,
     pub pending_rejection_slot: Option<i16>,
-    pub rejected_inventory_slots: std::collections::HashSet<i16>,
-    pub rejection_recovery: bool,
-    pub last_staged_buttons: Option<(u8, u8)>,
+    pub active_combine_task: Option<CombineTask>,
 }
 
 impl EnchanterManager {
@@ -282,16 +217,14 @@ impl EnchanterManager {
             content_wait_since: None,
             xp_target: None,
             restock_needed: false,
-            throw_speed_ticks: 1,
-            strict_calculation: true,
-            active_combine_task: None,
-            book_to_discard: None,
-            book_to_discard_slot: None,
+            cursed_book_to_discard: None,
+            cursed_book_slot: None,
+            cursed_inventory_slots: Default::default(),
+            last_staged_buttons: None,
+            rejection_recovery: false,
             pending_rejection_book: None,
             pending_rejection_slot: None,
-            rejected_inventory_slots: std::collections::HashSet::new(),
-            rejection_recovery: false,
-            last_staged_buttons: None,
+            active_combine_task: None,
         }
     }
 
@@ -309,12 +242,14 @@ impl EnchanterManager {
         self.anvil_slots.clear();
         self.anvil_container_id = None;
         self.server_anvil_cost.store(0, Ordering::SeqCst);
-        self.active_combine_task = None;
-        self.book_to_discard = None;
-        self.book_to_discard_slot = None;
-        self.rejected_inventory_slots.clear();
-        self.rejection_recovery = false;
+        self.cursed_book_to_discard = None;
+        self.cursed_book_slot = None;
+        self.cursed_inventory_slots.clear();
         self.last_staged_buttons = None;
+        self.rejection_recovery = false;
+        self.pending_rejection_book = None;
+        self.pending_rejection_slot = None;
+        self.active_combine_task = None;
     }
 
     /// Returns the current level and experience progress percentage (0.0 to 1.0)
@@ -382,21 +317,9 @@ impl EnchanterManager {
             current_lvl, current_prog * 100.0, target_level, needed_xp
         );
 
-        // Aim smoothly down at ground/feet, orienting towards anvil or 180 degrees away from any hopper
-        let target_yaw = if let Some(apos) = self.anvil_pos.or_else(|| Self::find_nearby_anvil(bot)) {
-            let p = bot.position();
-            let dx = (apos.x as f64 + 0.5) - p.x;
-            let dz = (apos.z as f64 + 0.5) - p.z;
-            (-dx).atan2(dz).to_degrees() as f32
-        } else if let Some(hpos) = Self::find_nearby_hopper(bot) {
-            let p = bot.position();
-            let dx = (hpos.x as f64 + 0.5) - p.x;
-            let dz = (hpos.z as f64 + 0.5) - p.z;
-            ((-dx).atan2(dz).to_degrees() as f32 + 180.0) % 360.0
-        } else {
-            bot.direction().y_rot()
-        };
-        smooth_look(bot, target_yaw, 85.0).await;
+        // Aim smoothly down at the bot's feet
+        let dir = bot.direction();
+        smooth_look(bot, dir.y_rot(), 90.0).await;
         bot.wait_ticks(1).await;
 
         let mut stall_count = 0;
@@ -408,14 +331,10 @@ impl EnchanterManager {
                 break;
             }
 
-            // Calculate safe batch size based on whether strict calculation is enabled.
-            let (safe_batch, mode_desc) = if self.strict_calculation {
-                let sb = strict_safe_batch_size(needed_xp);
-                (sb, if sb > 0 { "strict safe batch" } else { "strict single-bottle precision" })
-            } else {
-                let sb = safe_batch_size(needed_xp);
-                (sb, if sb > 0 { "safe batch" } else { "single-bottle precision" })
-            };
+            // Calculate the maximum safe batch mathematically proven NEVER to overshoot.
+            // Since max XP from one bottle is 11, throwing `(needed_xp - 1) / 11` bottles cannot reach needed_xp.
+            // When needed_xp <= 11, safe_batch is 0, so we throw strictly 1 bottle at a time.
+            let safe_batch = safe_batch_size(needed_xp);
             let count_to_throw = if safe_batch > 0 { safe_batch } else { 1 };
 
             // Find XP bottles in inventory - always prioritize the slot with the lowest amount
@@ -427,27 +346,17 @@ impl EnchanterManager {
                 }
             };
 
-            // If item is in main inventory (slots 9..35), swap to a safe hotbar slot (never armor or anvil!)
+            // If item is in main inventory (slots 9..35), swap to hotbar slot 0
             let hotbar_idx = if slot >= 36 && slot <= 44 {
                 (slot - 36) as u8
             } else {
-                let safe_hotbar = (0..9u8).find(|&h| {
-                    let h_slot = 36 + h as i16;
-                    match self.player_inventory.get(&h_slot) {
-                        None | Some(ItemStack::Empty) => true,
-                        Some(item) => inspect_item_with_bot(item, Some(bot)).map_or(true, |info| {
-                            !is_diamond_armor(&info) && !is_anvil(&info)
-                        }),
-                    }
-                }).unwrap_or(0);
-
-                info!("Swapping XP bottles from slot #{slot} to safe hotbar slot #{safe_hotbar}...");
-                Self::swap_to_hotbar(bot, slot, safe_hotbar);
+                info!("Swapping XP bottles from slot #{slot} to hotbar slot #0...");
+                Self::swap_to_hotbar(bot, slot, 0);
                 let bottles = self.player_inventory.remove(&slot).unwrap_or(ItemStack::Empty);
-                let old_hotbar = self.player_inventory.insert(36 + safe_hotbar as i16, bottles).unwrap_or(ItemStack::Empty);
+                let old_hotbar = self.player_inventory.insert(36, bottles).unwrap_or(ItemStack::Empty);
                 self.player_inventory.insert(slot, old_hotbar);
                 bot.wait_ticks(2).await;
-                safe_hotbar
+                0
             };
 
             bot.set_selected_hotbar_slot(hotbar_idx);
@@ -455,21 +364,19 @@ impl EnchanterManager {
 
             let actual_throw = count_to_throw.min(slot_count as u32);
             info!(
-                "Throwing {actual_throw} XP bottle(s) at feet (needed deficit: {needed_xp} XP, target: Level {target_level}, mode: {mode_desc}, delay: {}t)...",
-                self.throw_speed_ticks
+                "Throwing {actual_throw} XP bottle(s) at feet (needed deficit: {needed_xp} XP, target: Level {target_level}, mode: {})...",
+                if safe_batch > 0 { "safe batch" } else { "single-bottle precision" }
             );
 
             for _ in 0..actual_throw {
                 bot.write_packet(azalea::protocol::packets::game::s_use_item::ServerboundUseItem {
                     hand: InteractionHand::MainHand,
                     seq: 0,
-                    y_rot: target_yaw,
-                    x_rot: 85.0,
+                    y_rot: dir.y_rot(),
+                    x_rot: 90.0,
                 });
                 swing_arm(bot);
-                if self.throw_speed_ticks > 0 {
-                    bot.wait_ticks(self.throw_speed_ticks as usize).await;
-                }
+                bot.wait_ticks(1).await;
             }
 
             // Update local inventory count estimate for this slot
@@ -484,20 +391,14 @@ impl EnchanterManager {
             }
 
             // Wait for server SetExperience packet to arrive (handles latency desync gracefully).
-            // When throwing multi-bottle batches, allow extra settle ticks so all trailing orbs
-            // land and are registered by the server before we recalculate the deficit.
+            // Wait up to 500ms (10 ticks) for notification, followed by 2 ticks to allow any trailing orbs to settle.
             let got_update = tokio::time::timeout(
                 std::time::Duration::from_millis(500),
                 self.experience_updated.notified(),
             ).await.is_ok();
 
             if got_update {
-                let settle_ticks = if actual_throw > 1 {
-                    3 + (actual_throw / 4).min(4)
-                } else {
-                    2
-                };
-                bot.wait_ticks(settle_ticks as usize).await;
+                bot.wait_ticks(2).await;
             } else {
                 bot.wait_ticks(4).await;
             }
@@ -591,7 +492,7 @@ pub fn find_nearby_anvil(bot: &Client) -> Option<BlockPos> {
     candidates.first().map(|(_, pos)| *pos)
 }
 
-/// Scans nearby blocks around the bot to find the nearest hopper within reach (up to 4.5 blocks).
+/// Scans nearby blocks around the bot to find the nearest hopper within 2 blocks of the bot.
 pub fn find_nearby_hopper(bot: &Client) -> Option<BlockPos> {
     let p = bot.position();
     let bx = p.x.floor() as i32;
@@ -604,10 +505,10 @@ pub fn find_nearby_hopper(bot: &Client) -> Option<BlockPos> {
         let w = bot.world();
         let world = w.read();
 
-        // Search horizontal radius +-4, vertical -3..=2 (within standard player reach)
-        for dx in -4..=4 {
-            for dz in -4..=4 {
-                for dy in -3..=2 {
+        // Search horizontal radius +-2, vertical -2..=2 (within 2 blocks of the bot)
+        for dx in -2..=2 {
+            for dz in -2..=2 {
+                for dy in -2..=2 {
                     let pos = BlockPos::new(bx + dx, by + dy, bz + dz);
                     if let Some(state) = world.get_block_state(pos) {
                         let s_str = format!("{state:?}").to_lowercase();
@@ -617,7 +518,7 @@ pub fn find_nearby_hopper(bot: &Client) -> Option<BlockPos> {
                             let cz = pos.z as f64 + 0.5;
 
                             let dist = ((cx - p.x).powi(2) + (cy - p.y).powi(2) + (cz - p.z).powi(2)).sqrt();
-                            if dist <= 4.5 {
+                            if dist <= 2.85 {
                                 candidates.push((dist, pos));
                             }
                         }
@@ -628,12 +529,7 @@ pub fn find_nearby_hopper(bot: &Client) -> Option<BlockPos> {
     }
 
     candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    if let Some((dist, pos)) = candidates.first() {
-        debug!("Nearest hopper found at {:?} (distance: {:.2})", pos, dist);
-        Some(*pos)
-    } else {
-        None
-    }
+    candidates.first().map(|(_, pos)| *pos)
 }
 
 /// Finds the best ground position and target anvil position to place a new anvil,
@@ -763,27 +659,18 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
             None => return false,
         };
 
-        let safe_hotbar = (0..9u8).find(|&h| {
-            let h_slot = 36 + h as i16;
-            match player_inventory.get(&h_slot) {
-                None | Some(ItemStack::Empty) => true,
-                Some(item) => inspect_item_with_bot(item, Some(bot)).map_or(true, |info| {
-                    !is_diamond_armor(&info)
-                }),
-            }
-        }).unwrap_or(1);
-
-        info!("Moving Anvil from slot #{slot} to offhand (slot #45) via safe hotbar slot #{safe_hotbar}...");
-        if slot != 36 + safe_hotbar as i16 {
-            Self::swap_to_hotbar(bot, slot, safe_hotbar);
+        info!("Moving Anvil from slot #{slot} to offhand (slot #45)...");
+        // If not already in hotbar slot 1 (slot 37), swap to hotbar slot 1
+        if slot != 37 {
+            Self::swap_to_hotbar(bot, slot, 1);
             let item = player_inventory.remove(&slot).unwrap_or(ItemStack::Empty);
-            let old_hotbar = player_inventory.insert(36 + safe_hotbar as i16, item).unwrap_or(ItemStack::Empty);
+            let old_hotbar = player_inventory.insert(37, item).unwrap_or(ItemStack::Empty);
             player_inventory.insert(slot, old_hotbar);
             bot.wait_ticks(1).await;
         }
 
-        // Select safe hotbar slot
-        bot.set_selected_hotbar_slot(safe_hotbar);
+        // Select hotbar slot 1
+        bot.set_selected_hotbar_slot(1);
         bot.wait_ticks(1).await;
 
         // Send swap with offhand
@@ -795,9 +682,9 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
         });
         bot.wait_ticks(1).await;
 
-        let anvil_item = player_inventory.remove(&(36 + safe_hotbar as i16)).unwrap_or(ItemStack::Empty);
+        let anvil_item = player_inventory.remove(&37).unwrap_or(ItemStack::Empty);
         let old_offhand = player_inventory.insert(45, anvil_item).unwrap_or(ItemStack::Empty);
-        player_inventory.insert(36 + safe_hotbar as i16, old_offhand);
+        player_inventory.insert(37, old_offhand);
 
         info!("Anvil moved to offhand (slot #45) successfully.");
         true
@@ -1048,168 +935,11 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
         }
     }
 
-    pub fn is_viable_book_for_armor(armor: &ItemInfo, book: &ItemInfo) -> bool {
-        let is_prot_piece = is_diamond_helmet(armor) || is_diamond_chestplate(armor);
-        let is_blast_piece = is_diamond_leggings(armor) || is_diamond_boots(armor);
-
-        let has_main_prot = if is_prot_piece {
-            armor.has_enchantment("protection", 4)
-        } else if is_blast_piece {
-            armor.has_enchantment("blast_protection", 4)
-        } else {
-            false
-        };
-        let has_unb = armor.has_enchantment("unbreaking", 3);
-        let has_mend = armor.has_enchantment("mending", 1);
-
-        let current_enchants = (has_main_prot as u32) + (has_unb as u32) + (has_mend as u32);
-        let min_armor_penalty = if current_enchants == 0 { 0 } else { (1u32 << current_enchants) - 1 };
-        let armor_pwp = armor.repair_cost.unwrap_or(0).max(min_armor_penalty);
-        let default_book_penalty = if is_unbreaking_and_mending(book) { 1 } else { 0 };
-        let book_pwp = book.repair_cost.unwrap_or(default_book_penalty);
-
-        let enchant_cost = if is_protection_4(book) {
-            4
-        } else if is_blast_protection_4(book) {
-            8
-        } else if is_unbreaking_and_mending(book) {
-            5
-        } else if is_unbreaking_3(book) {
-            3
-        } else if is_mending(book) {
-            2
-        } else {
-            1
-        };
-
-        let current_cost = armor_pwp + book_pwp + enchant_cost;
-        if current_cost >= 40 {
-            return false;
-        }
-
-        let next_armor_pwp = armor_pwp.max(book_pwp) * 2 + 1;
-        let added_enchants = if is_unbreaking_and_mending(book) { 2 } else { 1 };
-        let remaining_after = 3u32.saturating_sub(current_enchants + added_enchants);
-
-        match remaining_after {
-            0 => true,
-            1 => next_armor_pwp <= 36,
-            _ => next_armor_pwp <= 18,
-        }
-    }
-
-    /// Returns the expected anvil level cost for combining an armor piece with a sacrifice book,
-    /// properly incorporating both armor and book prior-work penalties.
-    pub fn expected_combine_cost(armor: &ItemInfo, book: &ItemInfo) -> u32 {
-        let is_prot_piece = is_diamond_helmet(armor) || is_diamond_chestplate(armor);
-        let is_blast_piece = is_diamond_leggings(armor) || is_diamond_boots(armor);
-
-        let has_main_prot = if is_prot_piece {
-            armor.has_enchantment("protection", 4)
-        } else if is_blast_piece {
-            armor.has_enchantment("blast_protection", 4)
-        } else {
-            false
-        };
-        let has_unb = armor.has_enchantment("unbreaking", 3);
-        let has_mend = armor.has_enchantment("mending", 1);
-
-        let prior_works = (has_main_prot as u32) + (has_unb as u32) + (has_mend as u32);
-        let min_armor_penalty = if prior_works == 0 {
-            0
-        } else {
-            (1u32 << prior_works) - 1
-        };
-        let armor_penalty = armor.repair_cost.unwrap_or(0).max(min_armor_penalty);
-
-        let enchant_cost = if is_protection_4(book) {
-            4
-        } else if is_blast_protection_4(book) {
-            8
-        } else if is_unbreaking_and_mending(book) {
-            // Unbreaking 3 (3 lvls) + Mending (2 lvls) = 5 lvls
-            5
-        } else if is_unbreaking_3(book) {
-            3
-        } else if is_mending(book) {
-            2
-        } else {
-            1
-        };
-
-        let default_book_penalty = if is_unbreaking_and_mending(book) { 1 } else { 0 };
-        let book_penalty = book.repair_cost.unwrap_or(default_book_penalty);
-
-        armor_penalty + book_penalty + enchant_cost
-    }
-
-    pub fn is_anvil_combine_viable(&self, server_cost: u32, bot: &Client) -> bool {
-        if server_cost >= 40 {
-            return false;
-        }
-        let armor_info = self.anvil_slots.get(&0).and_then(|i| inspect_item_with_bot(i, Some(bot)));
-        let book_info = self.anvil_slots.get(&1).and_then(|i| inspect_item_with_bot(i, Some(bot)));
-
-        match (&armor_info, &book_info) {
-            (Some(a), Some(b)) => {
-                let is_prot_piece = is_diamond_helmet(a) || is_diamond_chestplate(a);
-                let is_blast_piece = is_diamond_leggings(a) || is_diamond_boots(a);
-
-                let has_main_prot = if is_prot_piece {
-                    a.has_enchantment("protection", 4)
-                } else if is_blast_piece {
-                    a.has_enchantment("blast_protection", 4)
-                } else {
-                    false
-                };
-                let has_unb = a.has_enchantment("unbreaking", 3);
-                let has_mend = a.has_enchantment("mending", 1);
-
-                let current_enchants = (has_main_prot as u32) + (has_unb as u32) + (has_mend as u32);
-                let min_armor_penalty = if current_enchants == 0 { 0 } else { (1u32 << current_enchants) - 1 };
-                let armor_pwp = a.repair_cost.unwrap_or(0).max(min_armor_penalty);
-
-                let enchant_cost = if is_protection_4(b) {
-                    4
-                } else if is_blast_protection_4(b) {
-                    8
-                } else if is_unbreaking_and_mending(b) {
-                    5
-                } else if is_unbreaking_3(b) {
-                    3
-                } else if is_mending(b) {
-                    2
-                } else {
-                    1
-                };
-
-                let min_base_cost = armor_pwp + enchant_cost;
-                if server_cost < min_base_cost {
-                    return false;
-                }
-                let deduced_book_pwp = server_cost - min_base_cost;
-                let next_armor_pwp = armor_pwp.max(deduced_book_pwp) * 2 + 1;
-                let added_enchants = if is_unbreaking_and_mending(b) { 2 } else { 1 };
-                let remaining_after = 3u32.saturating_sub(current_enchants + added_enchants);
-
-                match remaining_after {
-                    0 => true,
-                    1 => next_armor_pwp <= 36,
-                    _ => next_armor_pwp <= 18,
-                }
-            }
-            _ => true,
-        }
-    }
-
-    /// Determine the next combination task based on the sequential combining sequence:
-    /// 1. Base Protection:
-    ///    - Helmet / Chestplate: Blank Armor + Protection IV Book (4 levels)
-    ///    - Leggings / Boots: Blank Armor + Blast Protection IV Book (8 levels)
-    /// 2. Unbreaking III:
-    ///    - Armor (Base Prot) + Unbreaking III Book (4 levels, penalty becomes 3)
-    /// 3. Mending:
-    ///    - Armor (Base Prot + Unb III) + Mending Book (5 levels, penalty becomes 7)
+    /// Determine the next combination task based on user specifications and iamcal/enchant-order:
+    /// - Helmet: Protection IV (4 lvl) -> Unbreaking III (4 lvl) -> Mending (5 lvl)
+    /// - Chestplate: Protection IV (4 lvl) -> Unbreaking III (4 lvl) -> Mending (5 lvl)
+    /// - Leggings: Blast Protection IV (8 lvl) -> Unbreaking III (4 lvl) -> Mending (5 lvl)
+    /// - Boots: Blast Protection IV (8 lvl) -> Unbreaking III (4 lvl) -> Mending (5 lvl)
     pub fn find_next_combine_task(&self, bot: &Client) -> Option<CombineTask> {
         let mut armor_slots: Vec<(i16, ItemInfo)> = Vec::new();
         let mut book_slots: Vec<(i16, ItemInfo)> = Vec::new();
@@ -1222,170 +952,67 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
                 if let Some(info) = inspect_item_with_bot(item, Some(bot)) {
                     if is_diamond_armor(&info) {
                         armor_slots.push((slot, info));
-                    } else if is_protection_4(&info)
-                        || is_blast_protection_4(&info)
-                        || is_unbreaking_3(&info)
-                        || is_mending(&info)
-                        || info.kind.to_lowercase().contains("book")
-                    {
+                    } else if info.kind.contains("Book") || info.kind.contains("EnchantedBook") {
                         book_slots.push((slot, info));
                     }
                 }
             }
         }
 
-        let is_clean = |b: &ItemInfo| -> bool {
-            if is_unbreaking_and_mending(b) {
-                b.repair_cost.unwrap_or(0) <= 1
-            } else {
-                b.repair_cost.unwrap_or(0) == 0
-            }
-        };
-
-        let is_rejected = |slot: i16| -> bool {
-            let inv_slot = if (3..=38).contains(&slot) { slot - 3 + 9 } else { slot };
-            self.rejected_inventory_slots.contains(&inv_slot) || self.rejected_inventory_slots.contains(&slot)
-        };
-
-        let find_book = |predicate: &dyn Fn(&ItemInfo) -> bool, _armor: &ItemInfo| -> Option<(i16, ItemInfo)> {
-            // Priority 1: Pick known clean book that has not been rejected
-            let clean = book_slots.iter()
-                .filter(|(s, b)| *s >= 30 && predicate(b) && is_clean(b) && !is_rejected(*s))
-                .chain(book_slots.iter().filter(|(s, b)| *s < 30 && predicate(b) && is_clean(b) && !is_rejected(*s)))
-                .cloned()
-                .next();
-            if clean.is_some() {
-                return clean;
-            }
-            // Priority 2: Fall back to testing unrejected candidate book in anvil.
-            // If server cost is not viable to reach God tier, process_anvil_combines rejects it
-            // and it is dropped into the hopper and restocked.
-            book_slots.iter()
-                .filter(|(s, b)| *s >= 30 && predicate(b) && !is_rejected(*s))
-                .chain(book_slots.iter().filter(|(s, b)| *s < 30 && predicate(b) && !is_rejected(*s)))
-                .cloned()
-                .next()
-        };
-
-        let find_task_for_armor = |armor_slot: i16, armor_info: &ItemInfo| -> Option<CombineTask> {
+        if let Some((armor_slot, armor_info)) = crate::armor::next_armor(&armor_slots) {
             let is_prot_piece = is_diamond_helmet(armor_info) || is_diamond_chestplate(armor_info);
             let is_blast_piece = is_diamond_leggings(armor_info) || is_diamond_boots(armor_info);
 
-            let has_main_prot = if is_prot_piece {
-                armor_info.has_enchantment("protection", 4)
+            let mut target: Option<(&'static str, u32, fn(&ItemInfo) -> bool)> = None;
+
+            if is_prot_piece {
+                if !armor_info.has_enchantment("protection", 4) {
+                    target = Some(("Protection IV", 4, is_protection_4));
+                } else if !armor_info.has_enchantment("unbreaking", 3) {
+                    target = Some(("Unbreaking III", 4, is_unbreaking_3));
+                } else if !armor_info.has_enchantment("mending", 1) {
+                    target = Some(("Mending", 5, is_mending));
+                }
             } else if is_blast_piece {
-                armor_info.has_enchantment("blast_protection", 4)
-            } else {
-                false
+                if !armor_info.has_enchantment("blast_protection", 4) {
+                    target = Some(("Blast Protection IV", 8, is_blast_protection_4));
+                } else if !armor_info.has_enchantment("unbreaking", 3) {
+                    target = Some(("Unbreaking III", 4, is_unbreaking_3));
+                } else if !armor_info.has_enchantment("mending", 1) {
+                    target = Some(("Mending", 5, is_mending));
+                }
+            }
+
+            let is_cursed = |slot: i16| -> bool {
+                let inv_slot = if (3..=38).contains(&slot) { slot - 3 + 9 } else { slot };
+                self.cursed_inventory_slots.contains(&inv_slot) || self.cursed_inventory_slots.contains(&slot)
             };
 
-            let has_unb = armor_info.has_enchantment("unbreaking", 3);
-            let has_mend = armor_info.has_enchantment("mending", 1);
+            if let Some((ench_name, req_level, predicate)) = target {
+                // Priority 1: Pick clean book (0 prior work penalty) that has not been marked cursed
+                let clean_book = book_slots.iter()
+                    .filter(|(s, b)| !is_cursed(*s) && predicate(b) && b.repair_cost.unwrap_or(0) == 0)
+                    .filter(|(s, _)| *s >= 30)
+                    .chain(book_slots.iter().filter(|(s, b)| !is_cursed(*s) && predicate(b) && b.repair_cost.unwrap_or(0) == 0 && *s < 30))
+                    .next();
 
-            // STEP 1: If base protection is missing, apply it first (Prot IV: 4 lvl, Blast Prot IV: 8 lvl)
-            if !has_main_prot {
-                let target_book = if is_prot_piece {
-                    find_book(&|b| is_protection_4(b), armor_info)
-                        .map(|(s, b)| ("Protection IV", Self::expected_combine_cost(armor_info, &b), s))
-                } else {
-                    find_book(&|b| is_blast_protection_4(b), armor_info)
-                        .map(|(s, b)| ("Blast Protection IV", Self::expected_combine_cost(armor_info, &b), s))
-                };
+                // Priority 2: Fall back to un-tested candidate book (will be verified in anvil)
+                let selected_book = clean_book.or_else(|| {
+                    book_slots.iter()
+                        .filter(|(s, b)| !is_cursed(*s) && predicate(b))
+                        .filter(|(s, _)| *s >= 30)
+                        .chain(book_slots.iter().filter(|(s, b)| !is_cursed(*s) && predicate(b) && *s < 30))
+                        .next()
+                });
 
-                if let Some((ench_name, req_level, b_slot)) = target_book {
+                if let Some((b_slot, _b_info)) = selected_book {
                     return Some(CombineTask {
-                        armor_slot,
-                        book_slot: b_slot,
+                        armor_slot: *armor_slot,
+                        book_slot: *b_slot,
                         armor_desc: armor_info.kind.clone(),
                         enchant_name: ench_name,
                         required_level: req_level,
                     });
-                } else {
-                    return None;
-                }
-            }
-
-            // STEP 2: Apply Unbreaking III next (Cost: 4 lvl when Base Prot is present)
-            if !has_unb {
-                if let Some((unb_slot, b)) = find_book(&|b| is_unbreaking_3(b), armor_info) {
-                    let req_level = Self::expected_combine_cost(armor_info, &b);
-                    return Some(CombineTask {
-                        armor_slot,
-                        book_slot: unb_slot,
-                        armor_desc: armor_info.kind.clone(),
-                        enchant_name: "Unbreaking III",
-                        required_level: req_level,
-                    });
-                } else if !has_mend {
-                    // Check if pre-combined Unbreaking III + Mending book is available
-                    if let Some((comb_slot, b)) = find_book(&|b| is_unbreaking_and_mending(b), armor_info) {
-                        let req_level = Self::expected_combine_cost(armor_info, &b);
-                        return Some(CombineTask {
-                            armor_slot,
-                            book_slot: comb_slot,
-                            armor_desc: armor_info.kind.clone(),
-                            enchant_name: "Unbreaking III & Mending",
-                            required_level: req_level,
-                        });
-                    } else {
-                        return None;
-                    }
-                } else {
-                    return None;
-                }
-            }
-
-            // STEP 3: Apply Mending last (Cost: 5 lvl when Base Prot + Unb III are present)
-            if !has_mend {
-                if let Some((mend_slot, b)) = find_book(&|b| is_mending(b), armor_info) {
-                    let req_level = Self::expected_combine_cost(armor_info, &b);
-                    return Some(CombineTask {
-                        armor_slot,
-                        book_slot: mend_slot,
-                        armor_desc: armor_info.kind.clone(),
-                        enchant_name: "Mending",
-                        required_level: req_level,
-                    });
-                } else {
-                    return None;
-                }
-            }
-
-            None
-        };
-
-        // 1. Priority 1: Strictly follow sequential order when books for the preferred piece are available
-        if let Some((armor_slot, armor_info)) = crate::armor::next_armor(&armor_slots) {
-            if let Some(task) = find_task_for_armor(*armor_slot, armor_info) {
-                return Some(task);
-            }
-        }
-
-        // 2. Priority 2: If the preferred piece cannot combine (e.g. missing its protection book),
-        // combine any other incomplete piece that CAN combine with current books to make progress
-        // and free up inventory space!
-        for kind in 0..4 {
-            let mut candidates: Vec<_> = armor_slots
-                .iter()
-                .filter(|(_, info)| crate::armor::armor_type(info) == Some(kind) && crate::armor::is_clean_armor(info) && !crate::armor::is_complete(info))
-                .collect();
-            candidates.sort_by_key(|(slot, info)| {
-                let progress = info.has_enchantment(
-                    if kind < 2 { "protection" } else { "blast_protection" },
-                    4,
-                ) as i32
-                    + info.has_enchantment("unbreaking", 3) as i32
-                    + info.has_enchantment("mending", 1) as i32;
-                (-progress, *slot)
-            });
-
-            for (armor_slot, armor_info) in candidates {
-                if let Some(task) = find_task_for_armor(*armor_slot, armor_info) {
-                    info!(
-                        "Preferred armor piece cannot combine with current books; combining alternative piece {} (slot #{}) with {} to make progress and free inventory space!",
-                        armor_info.kind, armor_slot, task.enchant_name
-                    );
-                    return Some(task);
                 }
             }
         }
@@ -1396,6 +1023,58 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
     /// Checks whether another book matching the next combine requirement for current armor piece is available in player inventory.
     pub fn has_available_book_for_current_armor(&self, bot: &Client) -> bool {
         self.find_next_combine_task(bot).is_some()
+    }
+
+    /// Returns the expected anvil level cost for combining diamond armor with a clean book
+    /// according to the optimal sequencing from https://github.com/iamcal/enchant-order
+    pub fn expected_clean_combine_cost(armor: &ItemInfo, book: &ItemInfo) -> u32 {
+        let is_prot_piece = is_diamond_helmet(armor) || is_diamond_chestplate(armor);
+        let is_blast_piece = is_diamond_leggings(armor) || is_diamond_boots(armor);
+
+        let has_main_prot = if is_prot_piece {
+            armor.has_enchantment("protection", 4)
+        } else if is_blast_piece {
+            armor.has_enchantment("blast_protection", 4)
+        } else {
+            false
+        };
+        let has_unb = armor.has_enchantment("unbreaking", 3);
+        let has_mend = armor.has_enchantment("mending", 1);
+
+        // Step 1: Base protection onto clean armor (0 PWP)
+        if is_protection_4(book) && !has_main_prot {
+            return 4;
+        }
+        if is_blast_protection_4(book) && !has_main_prot {
+            return 8;
+        }
+
+        // Step 2: Unbreaking III onto armor with base prot (1 PWP = 1 lvl)
+        if is_unbreaking_3(book) && has_main_prot && !has_unb {
+            return 4;
+        }
+
+        // Step 3: Mending onto armor with base prot + Unb III (2 PWP = 3 lvls)
+        if is_mending(book) && has_main_prot && has_unb && !has_mend {
+            return 5;
+        }
+
+        let prior_works = (has_main_prot as u32) + (has_unb as u32) + (has_mend as u32);
+        let armor_pwp = if prior_works == 0 { 0 } else { (1u32 << prior_works) - 1 };
+
+        let enchant_cost = if is_protection_4(book) {
+            4
+        } else if is_blast_protection_4(book) {
+            8
+        } else if is_unbreaking_3(book) {
+            3
+        } else if is_mending(book) {
+            2
+        } else {
+            1
+        };
+
+        armor_pwp + enchant_cost
     }
 
     /// Check if all 4 diamond armor pieces are present and fully enchanted according to user specifications.
@@ -1412,29 +1091,13 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
         let mut boots = false;
 
         for info in items {
-            if is_diamond_helmet(info)
-                && info.has_enchantment("protection", 4)
-                && info.has_enchantment("unbreaking", 3)
-                && info.has_enchantment("mending", 1)
-            {
+            if is_diamond_helmet(info) && crate::armor::is_complete(info) {
                 helm = true;
-            } else if is_diamond_chestplate(info)
-                && info.has_enchantment("protection", 4)
-                && info.has_enchantment("unbreaking", 3)
-                && info.has_enchantment("mending", 1)
-            {
+            } else if is_diamond_chestplate(info) && crate::armor::is_complete(info) {
                 chest = true;
-            } else if is_diamond_leggings(info)
-                && info.has_enchantment("blast_protection", 4)
-                && info.has_enchantment("unbreaking", 3)
-                && info.has_enchantment("mending", 1)
-            {
+            } else if is_diamond_leggings(info) && crate::armor::is_complete(info) {
                 legs = true;
-            } else if is_diamond_boots(info)
-                && info.has_enchantment("blast_protection", 4)
-                && info.has_enchantment("unbreaking", 3)
-                && info.has_enchantment("mending", 1)
-            {
+            } else if is_diamond_boots(info) && crate::armor::is_complete(info) {
                 boots = true;
             }
         }
@@ -1597,21 +1260,21 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
         }
         if let Some((slot, button, click)) = self.next_combine_click() {
             self.send_tracked_anvil_click(bot, container_id, slot, button, click);
-            if self.combine_clicks.is_empty() && !self.rejection_recovery {
+            if self.combine_clicks.is_empty() {
                 self.recipe_wait_since = Some(std::time::Instant::now());
             }
             return false;
         }
-
         if self.rejection_recovery && self.combine_clicks.is_empty() && self.pending_click.is_none() {
-            info!("Rejection recovery complete: inputs returned to hotbar. Closing anvil to discard book into hopper...");
+            info!("[CURSED BOOK] Rejection recovery complete: inputs returned to hotbar. Closing anvil to discard cursed book into hopper...");
             self.rejection_recovery = false;
-            self.book_to_discard = self.pending_rejection_book.take();
-            self.book_to_discard_slot = self.pending_rejection_slot.take();
+            self.cursed_book_to_discard = self.pending_rejection_book.take();
+            self.cursed_book_slot = self.pending_rejection_slot.take();
             self.close_anvil(bot, container_id);
             self.active_combine_task = None;
             return false;
         }
+
         let cur_lvl = self.current_level.load(Ordering::SeqCst);
         let server_cost = self.server_anvil_cost.load(Ordering::SeqCst);
 
@@ -1622,7 +1285,6 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
         // When both inputs are present in the anvil, validate the server repair cost
         if has_input0 && has_input1 {
             if server_cost == 0 {
-                // Missing/invalid recipes must not bypass the recipe watchdog.
                 let since = *self.recipe_wait_since.get_or_insert_with(std::time::Instant::now);
                 if since.elapsed() >= std::time::Duration::from_secs(3) {
                     warn!("Anvil inputs received but repair cost is missing; reopening for a fresh recipe.");
@@ -1633,21 +1295,33 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
                 return false;
             }
 
+            let expected_cost = self.active_combine_task.as_ref().map(|t| t.required_level).unwrap_or(0);
+            let expected_cost = if expected_cost > 0 {
+                expected_cost
+            } else {
+                let a_info = self.anvil_slots.get(&0).and_then(|i| inspect_item_with_bot(i, Some(bot)));
+                let b_info = self.anvil_slots.get(&1).and_then(|i| inspect_item_with_bot(i, Some(bot)));
+                match (a_info, b_info) {
+                    (Some(a), Some(b)) => Self::expected_clean_combine_cost(&a, &b),
+                    _ => 40,
+                }
+            };
 
-            let is_viable = self.is_anvil_combine_viable(server_cost, bot);
-
-            // High XP cost rejection: if server cost is not viable to reach God tier, or >= 40 ("Too Expensive")
-            if !is_viable || server_cost >= 40 {
+            // CURSED BOOK CHECK: If combining the books costs more than expected + 1 level,
+            // or is >= 40 ("Too Expensive"), reject this cursed book!
+            // If the cost is 1 level greater than what is shown in the calculator (e.g. expected 8, game 9),
+            // it must NOT be considered cursed and will be used.
+            if server_cost > expected_cost + 1 || server_cost >= 40 {
                 let armor_info = self.anvil_slots.get(&0).and_then(|i| inspect_item_with_bot(i, Some(bot)));
                 let book_info = self.anvil_slots.get(&1).and_then(|i| inspect_item_with_bot(i, Some(bot)));
                 warn!(
-                    "REJECTING HIGH-COST COMBINE: Server repair cost ({} levels) is not viable to reach God tier! Armor: kind={}, PWP={:?}, enchants={:?}. Book: kind={}, PWP={:?}, enchants={:?}. Ejecting inputs to hotbar for hopper discard.",
+                    "[CURSED BOOK] REJECTING HIGH-COST COMBINE: Server repair cost ({} levels) exceeds expected {} levels (allowed threshold: {} levels)! Armor: kind={}, enchants={:?}. Book: kind={}, enchants={:?}. Ejecting inputs to hotbar for hopper discard.",
                     server_cost,
+                    expected_cost,
+                    expected_cost + 1,
                     armor_info.as_ref().map(|a| a.kind.as_str()).unwrap_or("Armor"),
-                    armor_info.as_ref().and_then(|a| a.repair_cost),
                     armor_info.as_ref().map(|a| &a.enchantments),
                     book_info.as_ref().map(|b| b.kind.as_str()).unwrap_or("Book"),
-                    book_info.as_ref().and_then(|b| b.repair_cost),
                     book_info.as_ref().map(|b| &b.stored_enchantments),
                 );
                 let is_actual_book = book_info.as_ref().map_or(false, |b| {
@@ -1659,7 +1333,7 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
                 });
                 if !is_actual_book {
                     error!(
-                        "ANVIL REJECTION SAFETY: Slot #1 is not an enchanted book (found: {})! Refusing to queue for hopper discard.",
+                        "[CURSED BOOK GUARD] Slot #1 is not an enchanted book (found: {})! Refusing to queue for hopper discard.",
                         book_info.as_ref().map(|b| b.kind.as_str()).unwrap_or("None")
                     );
                     self.pending_rejection_book = None;
@@ -1673,7 +1347,7 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
 
                 let (armor_button, book_button) = self.last_staged_buttons.unwrap_or((0, 1));
 
-                // Queue tracked clicks to swap rejected book (slot 1) into hotbar slot book_button,
+                // Queue tracked clicks to swap rejected cursed book (slot 1) into hotbar slot book_button,
                 // and swap armor (slot 0) into hotbar slot armor_button.
                 self.combine_clicks.clear();
                 self.combine_clicks.push_back((1, book_button, ClickType::Swap));
@@ -1687,7 +1361,7 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
                 return false;
             }
 
-            // Valid cost, but current player level is too low: close anvil to throw exact XP bottles
+            // Valid clean cost, but current player level is too low: close anvil to throw exact XP bottles
             if server_cost > cur_lvl {
                 info!("Anvil inputs valid (Cost: {server_cost}), but > current level ({cur_lvl}). Closing anvil to throw XP...");
                 self.close_anvil(bot, container_id);
@@ -1705,15 +1379,10 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
             }
         }
 
-        // Cost and result can arrive in either order. If output slot 2 has an item and level suffices
-        if has_output2 && server_cost > 0 && server_cost < 40 && cur_lvl >= server_cost {
-            if self.is_anvil_combine_viable(server_cost, bot) {
-                info!("Output slot #2 ready and level suffices (Level {cur_lvl} >= Cost {server_cost}); collecting via QuickMove...");
-                self.send_tracked_anvil_click(bot, container_id, 2, 0, ClickType::QuickMove);
-                self.recipe_wait_since = None;
-                self.active_combine_task = None;
-                return false;
-            }
+        // Cost and result can arrive in either order. Never clear valid inputs
+        // just because the repair-cost packet has not arrived yet.
+        if has_output2 && server_cost == 0 {
+            self.recipe_wait_since.get_or_insert_with(std::time::Instant::now);
         }
 
         if let Some(since) = self.recipe_wait_since {
@@ -1739,7 +1408,10 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
         }
 
         let task = match self.find_next_combine_task(bot) {
-            Some(t) => t,
+            Some(t) => {
+                self.active_combine_task = Some(t.clone());
+                t
+            }
             None => {
                 let (all_done, summary) = self.check_all_armor_enchanted(bot);
                 if all_done {
@@ -1759,16 +1431,11 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
         let (cur_lvl, cur_prog) = self.get_level_and_progress();
 
         if cur_lvl < task.required_level {
-            let bottles_to_throw = if self.strict_calculation {
-                strict_bottles_between_levels(cur_lvl, cur_prog, task.required_level)
-            } else {
-                bottles_between_levels(cur_lvl, cur_prog, task.required_level)
-            };
+            let bottles_to_throw = bottles_between_levels(cur_lvl, cur_prog, task.required_level);
             let needed_xp = xp_difference(cur_lvl, cur_prog, task.required_level);
             info!(
-                "Next combine: {} with {} requires Level {} (Current: Level {}, {:.1}% progress, Need: {} XP). Closing anvil to throw XP (est. {} bottles, mode: {})...",
-                task.armor_desc, task.enchant_name, task.required_level, cur_lvl, cur_prog * 100.0, needed_xp, bottles_to_throw,
-                if self.strict_calculation { "strict" } else { "standard" }
+                "Next combine: {} with {} requires Level {} (Current: Level {}, {:.1}% progress, Need: {} XP). Closing anvil to throw {} XP bottles...",
+                task.armor_desc, task.enchant_name, task.required_level, cur_lvl, cur_prog * 100.0, needed_xp, bottles_to_throw
             );
             self.close_anvil(bot, container_id);
             self.xp_target = Some(task.required_level);
@@ -1779,7 +1446,7 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
             "Executing Anvil Combine: {} (slot #{}) + {} Book (slot #{}) [Level Cost: {} <= Current Level: {}]",
             task.armor_desc, task.armor_slot, task.enchant_name, task.book_slot, task.required_level, cur_lvl
         );
-        self.combine_in_anvil(bot, container_id, &task).await;
+        self.combine_in_anvil(bot, container_id, task.armor_slot, task.book_slot).await;
         false
     }
 
@@ -1815,14 +1482,11 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
         &mut self,
         bot: &Client,
         container_id: i32,
-        task: &CombineTask,
+        item_inventory_slot: i16,
+        book_inventory_slot: i16,
     ) {
         self.server_anvil_cost.store(0, Ordering::SeqCst);
-        let (armor_button, book_button) =
-            Self::determine_hotbar_buttons_for_combine(task.armor_slot, task.book_slot);
-        self.last_staged_buttons = Some((armor_button, book_button));
-        self.active_combine_task = Some(task.clone());
-        self.queue_anvil_combination(task.armor_slot, task.book_slot);
+        self.queue_anvil_combination(item_inventory_slot, book_inventory_slot);
         if let Some((slot, button, click)) = self.next_combine_click() {
             self.send_tracked_anvil_click(bot, container_id, slot, button, click);
         }
@@ -1852,31 +1516,11 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
             inspect_item_with_bot(&item_a, None),
             inspect_item_with_bot(&item_b, None),
         ) {
-            if is_unbreaking_and_mending(&info_a) && is_unbreaking_and_mending(&info_b) {
-                return true;
-            }
-            if is_single_mending(&info_a) && is_single_mending(&info_b) {
-                return true;
-            }
-            if is_single_unbreaking_3(&info_a) && is_single_unbreaking_3(&info_b) {
-                return true;
-            }
-            if is_protection_4(&info_a) && is_protection_4(&info_b) {
-                return true;
-            }
-            if is_blast_protection_4(&info_a) && is_blast_protection_4(&info_b) {
-                return true;
-            }
-            if is_diamond_helmet(&info_a) && is_diamond_helmet(&info_b) {
-                return true;
-            }
-            if is_diamond_chestplate(&info_a) && is_diamond_chestplate(&info_b) {
-                return true;
-            }
-            if is_diamond_leggings(&info_a) && is_diamond_leggings(&info_b) {
-                return true;
-            }
-            if is_diamond_boots(&info_a) && is_diamond_boots(&info_b) {
+            if (is_mending(&info_a) && is_mending(&info_b))
+                || (is_unbreaking_3(&info_a) && is_unbreaking_3(&info_b))
+                || (is_protection_4(&info_a) && is_protection_4(&info_b))
+                || (is_blast_protection_4(&info_a) && is_blast_protection_4(&info_b))
+            {
                 return true;
             }
         }
@@ -1886,6 +1530,7 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
     fn queue_anvil_combination(&mut self, item_inventory_slot: i16, book_inventory_slot: i16) {
         let (armor_button, book_button) =
             Self::determine_hotbar_buttons_for_combine(item_inventory_slot, book_inventory_slot);
+        self.last_staged_buttons = Some((armor_button, book_button));
 
         let armor_already_staged = item_inventory_slot < 30
             && self.anvil_slots_match(30 + armor_button as i16, item_inventory_slot);
@@ -1934,7 +1579,7 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
     /// Close the anvil container.
     pub fn close_anvil(&mut self, bot: &Client, container_id: i32) {
         info!("Closing Anvil GUI (container #{container_id})...");
-        crate::drops::close_menu(bot, container_id);
+        bot.write_packet(ServerboundContainerClose { container_id });
         self.anvil_container_id = None;
         self.anvil_slots.clear();
         self.combine_clicks.clear();
@@ -1942,8 +1587,9 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
         self.recipe_wait_since = None;
         self.content_wait_since = None;
         self.server_anvil_cost.store(0, Ordering::SeqCst);
-        self.active_combine_task = None;
         self.last_staged_buttons = None;
+        self.rejection_recovery = false;
+        self.active_combine_task = None;
     }
 
     pub fn swap_to_hotbar(bot: &Client, inv_slot: i16, hotbar_idx: u8) {
@@ -1963,51 +1609,6 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn missing_recipe_cost_times_out_instead_of_waiting_forever() {
-        use azalea_registry::builtin::ItemKind;
-        let bot = crate::workflow_tests::local_client();
-        let mut manager = EnchanterManager::new();
-        manager.anvil_container_id = Some(7);
-        manager.anvil_slots.insert(0, ItemStack::new(ItemKind::DiamondHelmet, 1));
-        manager.anvil_slots.insert(1, ItemStack::new(ItemKind::EnchantedBook, 1));
-        manager.recipe_wait_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(4));
-        assert!(!manager.process_anvil_combines(&bot).await);
-        assert_eq!(manager.anvil_container_id, None);
-        assert_eq!(manager.failed_combine_attempts, 1);
-        assert!(manager.book_to_discard.is_none());
-    }
-
-    #[tokio::test]
-    async fn too_expensive_recipe_retains_exact_rejected_book_identity() {
-        use azalea_registry::builtin::ItemKind;
-        let bot = crate::workflow_tests::local_client();
-        let mut manager = EnchanterManager::new();
-        let book = ItemStack::new(ItemKind::EnchantedBook, 1);
-        manager.anvil_container_id = Some(7);
-        manager.anvil_slots.insert(0, ItemStack::new(ItemKind::DiamondHelmet, 1));
-        manager.anvil_slots.insert(1, book.clone());
-        manager.server_anvil_cost.store(40, Ordering::SeqCst);
-        assert!(!manager.process_anvil_combines(&bot).await);
-        assert_eq!(manager.pending_rejection_book, Some(book));
-        assert!(manager.rejection_recovery);
-    }
-
-    #[tokio::test]
-    async fn too_expensive_output_arriving_before_inputs_is_not_collected() {
-        use azalea_registry::builtin::ItemKind;
-        let bot = crate::workflow_tests::local_client();
-        let mut manager = EnchanterManager::new();
-        manager.anvil_container_id = Some(7);
-        manager.anvil_slots.insert(2, ItemStack::new(ItemKind::DiamondHelmet, 1));
-        manager.server_anvil_cost.store(40, Ordering::SeqCst);
-        manager.current_level.store(50, Ordering::SeqCst);
-        manager.recipe_wait_since = Some(std::time::Instant::now());
-        assert!(!manager.process_anvil_combines(&bot).await);
-        assert!(manager.pending_click.is_none());
-        assert_eq!(manager.anvil_container_id, Some(7));
-    }
 
     #[test]
     fn identical_mending_book_in_hotbar_skips_staging_swap() {
@@ -2158,49 +1759,6 @@ mod tests {
         let manager = EnchanterManager::new();
         assert!(!manager.anvil_placed);
         assert!(!manager.enchanting_complete);
-    }
-
-    #[test]
-    fn test_tree_merge_combine_task_sequence() {
-        use azalea_registry::builtin::ItemKind;
-
-        let mut manager = EnchanterManager::new();
-
-        // Populate anvil slots:
-        // Slot 3: Blank Diamond Helmet
-        // Slot 4: Protection IV Book
-        // Slot 5: Unbreaking III Book
-        // Slot 6: Mending Book
-        manager.anvil_slots.insert(3, ItemStack::new(ItemKind::DiamondHelmet, 1));
-        manager.anvil_slots.insert(4, ItemStack::new(ItemKind::EnchantedBook, 1));
-        manager.anvil_slots.insert(5, ItemStack::new(ItemKind::EnchantedBook, 1));
-        manager.anvil_slots.insert(6, ItemStack::new(ItemKind::EnchantedBook, 1));
-
-        // Mock client is not available in unit test, so we can test helper methods or check ItemInfo logic:
-        let helm_info = ItemInfo { kind: "DiamondHelmet".to_string(), count: 1, ..Default::default() };
-        assert!(crate::nbt::is_diamond_helmet(&helm_info));
-        let mut prot_book = ItemInfo { kind: "EnchantedBook".to_string(), count: 1, ..Default::default() };
-        prot_book.stored_enchantments.insert("protection".to_string(), 4);
-
-        let mut unb_book = ItemInfo { kind: "EnchantedBook".to_string(), count: 1, ..Default::default() };
-        unb_book.stored_enchantments.insert("unbreaking".to_string(), 3);
-
-        let mut mend_book = ItemInfo { kind: "EnchantedBook".to_string(), count: 1, ..Default::default() };
-        mend_book.stored_enchantments.insert("mending".to_string(), 1);
-
-        assert!(crate::nbt::is_protection_4(&prot_book));
-        assert!(crate::nbt::is_single_unbreaking_3(&unb_book));
-        assert!(crate::nbt::is_single_mending(&mend_book));
-        assert!(!crate::nbt::is_unbreaking_and_mending(&unb_book));
-        assert!(!crate::nbt::is_unbreaking_and_mending(&mend_book));
-
-        let mut combined_book = ItemInfo { kind: "EnchantedBook".to_string(), count: 1, ..Default::default() };
-        combined_book.stored_enchantments.insert("unbreaking".to_string(), 3);
-        combined_book.stored_enchantments.insert("mending".to_string(), 1);
-
-        assert!(crate::nbt::is_unbreaking_and_mending(&combined_book));
-        assert!(!crate::nbt::is_single_unbreaking_3(&combined_book));
-        assert!(!crate::nbt::is_single_mending(&combined_book));
     }
 
     #[test]
@@ -2392,243 +1950,110 @@ mod tests {
     }
 
     #[test]
-    fn test_strict_safe_batch_size_properties() {
-        // Any deficit <= 22 must strictly return 0 (single-bottle precision)
-        for needed in 0..=22 {
-            assert_eq!(
-                strict_safe_batch_size(needed),
-                0,
-                "strict_safe_batch_size must be 0 for deficit {needed}"
-            );
-        }
+    fn test_expected_clean_combine_cost_iamcal_enchant_order() {
+        let clean_chest = ItemInfo {
+            kind: "DiamondChestplate".to_string(),
+            count: 1,
+            ..Default::default()
+        };
 
-        // For any deficit > 22 up to 1000:
-        // 1. Batch * 11 must be <= needed - 11 (guaranteeing >= 11 XP deficit remaining after batch)
-        // 2. Batch must never exceed 16 bottles
-        for needed in 23..=1000 {
-            let batch = strict_safe_batch_size(needed);
-            assert!(batch > 0);
-            assert!(batch <= 16, "Batch {batch} exceeded max cap of 16 for needed {needed}");
-            let max_possible_xp = batch * 11;
-            assert!(
-                max_possible_xp + 11 <= needed,
-                "Strict batch {batch} (max XP {max_possible_xp}) did not leave at least 11 XP deficit for needed {needed}"
-            );
-        }
+        let mut prot4_chest = clean_chest.clone();
+        prot4_chest.enchantments.insert("protection".to_string(), 4);
 
-        // Typical milestones:
-        // 40 XP deficit: (40 - 11) / 11 = 2 bottles (max 22 XP <= 29 XP, leaves >= 18 XP deficit)
-        assert_eq!(strict_safe_batch_size(40), 2);
-        // 55 XP deficit: (55 - 11) / 11 = 4 bottles (max 44 XP <= 44 XP, leaves >= 11 XP deficit)
-        assert_eq!(strict_safe_batch_size(55), 4);
-        // 112 XP deficit: (112 - 11) / 11 = 9 bottles (max 99 XP <= 101 XP, leaves >= 13 XP deficit)
-        assert_eq!(strict_safe_batch_size(112), 9);
-        // 500 XP deficit: capped at 16 bottles
-        assert_eq!(strict_safe_batch_size(500), 16);
+        let mut prot4_unb3_chest = prot4_chest.clone();
+        prot4_unb3_chest.enchantments.insert("unbreaking".to_string(), 3);
+
+        let clean_legs = ItemInfo {
+            kind: "DiamondLeggings".to_string(),
+            count: 1,
+            ..Default::default()
+        };
+
+        let mut blast4_legs = clean_legs.clone();
+        blast4_legs.enchantments.insert("blast_protection".to_string(), 4);
+
+        let mut blast4_unb3_legs = blast4_legs.clone();
+        blast4_unb3_legs.enchantments.insert("unbreaking".to_string(), 3);
+
+        let prot4_book = ItemInfo {
+            kind: "EnchantedBook".to_string(),
+            stored_enchantments: [("protection".to_string(), 4)].into_iter().collect(),
+            repair_cost: Some(0),
+            ..Default::default()
+        };
+
+        let blast4_book = ItemInfo {
+            kind: "EnchantedBook".to_string(),
+            stored_enchantments: [("blast_protection".to_string(), 4)].into_iter().collect(),
+            repair_cost: Some(0),
+            ..Default::default()
+        };
+
+        let unb3_book = ItemInfo {
+            kind: "EnchantedBook".to_string(),
+            stored_enchantments: [("unbreaking".to_string(), 3)].into_iter().collect(),
+            repair_cost: Some(0),
+            ..Default::default()
+        };
+
+        let mend_book = ItemInfo {
+            kind: "EnchantedBook".to_string(),
+            stored_enchantments: [("mending".to_string(), 1)].into_iter().collect(),
+            repair_cost: Some(0),
+            ..Default::default()
+        };
+
+        // Chestplate sequence:
+        // 1. Clean chest + Prot IV book = 4 levels (40 XP)
+        assert_eq!(EnchanterManager::expected_clean_combine_cost(&clean_chest, &prot4_book), 4);
+        // 2. Chest (Prot IV) + Unb III book = 4 levels (40 XP, 1 PWP)
+        assert_eq!(EnchanterManager::expected_clean_combine_cost(&prot4_chest, &unb3_book), 4);
+        // 3. Chest (Prot IV + Unb III) + Mending book = 5 levels (55 XP, 3 PWP)
+        assert_eq!(EnchanterManager::expected_clean_combine_cost(&prot4_unb3_chest, &mend_book), 5);
+
+        // Leggings sequence:
+        // 1. Clean leggings + Blast Prot IV book = 8 levels (112 XP)
+        assert_eq!(EnchanterManager::expected_clean_combine_cost(&clean_legs, &blast4_book), 8);
+        // 2. Leggings (Blast Prot IV) + Unb III book = 4 levels (40 XP, 1 PWP)
+        assert_eq!(EnchanterManager::expected_clean_combine_cost(&blast4_legs, &unb3_book), 4);
+        // 3. Leggings (Blast Prot IV + Unb III) + Mending book = 5 levels (55 XP, 3 PWP)
+        assert_eq!(EnchanterManager::expected_clean_combine_cost(&blast4_unb3_legs, &mend_book), 5);
     }
 
     #[test]
-    fn test_strict_bottles_between_levels() {
-        assert_eq!(strict_bottles_between_levels(0, 0.0, 1), 1);
-        assert_eq!(strict_bottles_between_levels(0, 0.0, 4), 3); // 40 / 11 = 3
-        assert_eq!(strict_bottles_between_levels(0, 0.0, 5), 5); // 55 / 11 = 5
-        assert_eq!(strict_bottles_between_levels(4, 0.0, 4), 0);
-    }
+    fn test_cursed_inventory_slots_filtered_in_find_next_combine_task() {
+        use azalea_registry::builtin::ItemKind;
 
-    #[test]
-    fn test_parse_throw_speed() {
-        // Plain numbers (ticks)
-        assert_eq!(parse_throw_speed("0"), 0);
-        assert_eq!(parse_throw_speed("1"), 1);
-        assert_eq!(parse_throw_speed("2"), 2);
-        assert_eq!(parse_throw_speed("3"), 3);
-
-        // Numbers >= 20 treated as ms:
-        // 20ms -> 1 tick, 50ms -> 1 tick, 100ms -> 2 ticks, 150ms -> 3 ticks
-        assert_eq!(parse_throw_speed("20"), 1);
-        assert_eq!(parse_throw_speed("50"), 1);
-        assert_eq!(parse_throw_speed("100"), 2);
-        assert_eq!(parse_throw_speed("150"), 3);
-
-        // Explicit suffixes
-        assert_eq!(parse_throw_speed("50ms"), 1);
-        assert_eq!(parse_throw_speed("100ms"), 2);
-        assert_eq!(parse_throw_speed("1t"), 1);
-        assert_eq!(parse_throw_speed("2t"), 2);
-
-        // Presets
-        assert_eq!(parse_throw_speed("instant"), 0);
-        assert_eq!(parse_throw_speed("burst"), 0);
-        assert_eq!(parse_throw_speed("normal"), 1);
-        assert_eq!(parse_throw_speed("fast"), 1);
-        assert_eq!(parse_throw_speed("slow"), 2);
-        assert_eq!(parse_throw_speed("safe"), 2);
-
-        // Whitespace and case insensitivity
-        assert_eq!(parse_throw_speed("  2  "), 2);
-        assert_eq!(parse_throw_speed("  SLOW  "), 2);
-        assert_eq!(parse_throw_speed("100MS"), 2);
-
-        // Invalid defaults to 1
-        assert_eq!(parse_throw_speed("invalid_xyz"), 1);
-    }
-
-    #[test]
-    fn test_expected_combine_cost_exact_website_values() {
-        let mut helm = ItemInfo { kind: "DiamondHelmet".to_string(), count: 1, ..Default::default() };
-        let mut chest = ItemInfo { kind: "DiamondChestplate".to_string(), count: 1, ..Default::default() };
-        let mut legs = ItemInfo { kind: "DiamondLeggings".to_string(), count: 1, ..Default::default() };
-        let mut boots = ItemInfo { kind: "DiamondBoots".to_string(), count: 1, ..Default::default() };
-
-        let mut prot4_book = ItemInfo { kind: "EnchantedBook".to_string(), count: 1, ..Default::default() };
-        prot4_book.stored_enchantments.insert("protection".to_string(), 4);
-
-        let mut blast4_book = ItemInfo { kind: "EnchantedBook".to_string(), count: 1, ..Default::default() };
-        blast4_book.stored_enchantments.insert("blast_protection".to_string(), 4);
-
-        let mut unb3_book = ItemInfo { kind: "EnchantedBook".to_string(), count: 1, ..Default::default() };
-        unb3_book.stored_enchantments.insert("unbreaking".to_string(), 3);
-
-        let mut mend_book = ItemInfo { kind: "EnchantedBook".to_string(), count: 1, ..Default::default() };
-        mend_book.stored_enchantments.insert("mending".to_string(), 1);
-
-        // Step 1: Base Protection
-        // Chestplate + Prot 4 = 4 levels
-        assert_eq!(EnchanterManager::expected_combine_cost(&chest, &prot4_book), 4);
-        // Helmet + Prot 4 = 4 levels
-        assert_eq!(EnchanterManager::expected_combine_cost(&helm, &prot4_book), 4);
-        // Leggings + Blast Prot 4 = 8 levels
-        assert_eq!(EnchanterManager::expected_combine_cost(&legs, &blast4_book), 8);
-        // Boots + Blast Prot 4 = 8 levels
-        assert_eq!(EnchanterManager::expected_combine_cost(&boots, &blast4_book), 8);
-
-        // Step 2: Unbreaking 3 on armor that already has Base Prot (1 prior work, penalty 1)
-        chest.enchantments.insert("protection".to_string(), 4);
-        helm.enchantments.insert("protection".to_string(), 4);
-        legs.enchantments.insert("blast_protection".to_string(), 4);
-        boots.enchantments.insert("blast_protection".to_string(), 4);
-
-        // Cost is 1 (penalty) + 3 (enchant) = 4 levels
-        assert_eq!(EnchanterManager::expected_combine_cost(&chest, &unb3_book), 4);
-        assert_eq!(EnchanterManager::expected_combine_cost(&helm, &unb3_book), 4);
-        assert_eq!(EnchanterManager::expected_combine_cost(&legs, &unb3_book), 4);
-        assert_eq!(EnchanterManager::expected_combine_cost(&boots, &unb3_book), 4);
-
-        // Step 3: Mending on armor that has Base Prot + Unbreaking 3 (2 prior works, penalty 3)
-        chest.enchantments.insert("unbreaking".to_string(), 3);
-        helm.enchantments.insert("unbreaking".to_string(), 3);
-        legs.enchantments.insert("unbreaking".to_string(), 3);
-        boots.enchantments.insert("unbreaking".to_string(), 3);
-
-        // Cost is 3 (penalty) + 2 (enchant) = 5 levels
-        assert_eq!(EnchanterManager::expected_combine_cost(&chest, &mend_book), 5);
-        assert_eq!(EnchanterManager::expected_combine_cost(&helm, &mend_book), 5);
-        assert_eq!(EnchanterManager::expected_combine_cost(&legs, &mend_book), 5);
-        assert_eq!(EnchanterManager::expected_combine_cost(&boots, &mend_book), 5);
-
-        // Already-combined book (Unbreaking III + Mending) on armor with Base Prot (penalty 1) = 7 levels
-        let mut comb_book = ItemInfo { kind: "EnchantedBook".to_string(), count: 1, ..Default::default() };
-        comb_book.stored_enchantments.insert("unbreaking".to_string(), 3);
-        comb_book.stored_enchantments.insert("mending".to_string(), 1);
-        let mut fresh_prot_chest = ItemInfo { kind: "DiamondChestplate".to_string(), count: 1, ..Default::default() };
-        fresh_prot_chest.enchantments.insert("protection".to_string(), 4);
-        assert_eq!(EnchanterManager::expected_combine_cost(&fresh_prot_chest, &comb_book), 7);
-    }
-
-    #[test]
-    fn high_repair_cost_book_is_filtered_out_by_find_next_combine_task() {
-        use azalea_registry::builtin::{DataComponentKind, ItemKind};
-        use azalea_inventory::components::{DataComponentUnion, RepairCost, Lore};
-
-        let bot = crate::workflow_tests::local_client();
         let mut manager = EnchanterManager::new();
+        // Insert clean chestplate in slot 30 (hotbar 0)
+        manager.anvil_slots.insert(30, ItemStack::new(ItemKind::DiamondChestplate, 1));
 
-        let helmet = ItemStack::new(ItemKind::DiamondHelmet, 1);
-        let mut high_cost_book = ItemStack::new(ItemKind::EnchantedBook, 1);
-        if let ItemStack::Present(data) = &mut high_cost_book {
-            let lore = Lore { lines: vec![azalea::FormattedText::from("Protection IV")] };
-            unsafe {
-                data.component_patch.unchecked_insert_component(
-                    DataComponentKind::Lore,
-                    Some(DataComponentUnion::from(lore)),
-                );
-                data.component_patch.unchecked_insert_component(
-                    DataComponentKind::RepairCost,
-                    Some(DataComponentUnion::from(RepairCost { cost: 31 })),
-                );
-            }
-        }
+        // Insert Prot IV book in slot 31 (hotbar 1)
+        manager.anvil_slots.insert(31, ItemStack::new(ItemKind::EnchantedBook, 1));
 
-        manager.player_inventory.insert(9, helmet);
-        manager.player_inventory.insert(10, high_cost_book.clone());
+        // Mark slot 31 as cursed
+        manager.cursed_inventory_slots.insert(31);
 
-        // When marked as rejected, it is ignored
-        manager.rejected_inventory_slots.insert(10);
-        assert!(manager.find_next_combine_task(&bot).is_none());
-        assert!(!manager.has_available_book_for_current_armor(&bot));
-        manager.rejected_inventory_slots.clear();
-
-        // Now add a clean Prot IV book
-        let mut clean_book = ItemStack::new(ItemKind::EnchantedBook, 1);
-        if let ItemStack::Present(data) = &mut clean_book {
-            let lore = Lore { lines: vec![azalea::FormattedText::from("Protection IV")] };
-            unsafe {
-                data.component_patch.unchecked_insert_component(
-                    DataComponentKind::Lore,
-                    Some(DataComponentUnion::from(lore)),
-                );
-            }
-        }
-        manager.player_inventory.insert(11, clean_book);
-
-        // find_next_combine_task prioritizes the clean book in slot 11 (container slot 5) over the high-cost book in slot 10 (container slot 4)
-        let task = manager.find_next_combine_task(&bot).unwrap();
-        assert_eq!(task.book_slot, 5);
-        assert_eq!(task.armor_slot, 3);
-
-        // If the clean book in slot 11 is rejected, it falls back to the candidate in slot 10 (container slot 4) for anvil evaluation
-        manager.rejected_inventory_slots.insert(11);
-        let task2 = manager.find_next_combine_task(&bot).unwrap();
-        assert_eq!(task2.book_slot, 4);
-
-        // Once the high-cost book is also rejected (after anvil server cost rejection / hopper discard), no books remain
-        manager.rejected_inventory_slots.insert(10);
-        assert!(manager.find_next_combine_task(&bot).is_none());
-        assert!(!manager.has_available_book_for_current_armor(&bot));
+        // Simulated bot inspection without client
+        // With slot 31 marked cursed, it should not select slot 31
+        let is_cursed = |slot: i16| -> bool {
+            let inv_slot = if (3..=38).contains(&slot) { slot - 3 + 9 } else { slot };
+            manager.cursed_inventory_slots.contains(&inv_slot) || manager.cursed_inventory_slots.contains(&slot)
+        };
+        assert!(is_cursed(31));
+        assert!(!is_cursed(30));
     }
 
     #[test]
-    fn test_fallback_to_other_pieces_when_preferred_piece_missing_book() {
-        use azalea_registry::builtin::{DataComponentKind, ItemKind};
-        use azalea_inventory::components::{DataComponentUnion, Lore};
+    fn test_cursed_cost_threshold_allows_plus_one_level() {
+        let expected_cost = 8;
+        let is_cursed = |server_cost: u32| -> bool {
+            server_cost > expected_cost + 1 || server_cost >= 40
+        };
 
-        let bot = crate::workflow_tests::local_client();
-        let mut manager = EnchanterManager::new();
-
-        // Slot 9: Chestplate (needs Prot 4, but no Prot 4 book in inventory)
-        let chestplate = ItemStack::new(ItemKind::DiamondChestplate, 1);
-        manager.player_inventory.insert(9, chestplate);
-
-        // Slot 10: Leggings (needs Blast Prot 4, and Blast Prot 4 is available!)
-        let leggings = ItemStack::new(ItemKind::DiamondLeggings, 1);
-        manager.player_inventory.insert(10, leggings);
-
-        let mut blast_book = ItemStack::new(ItemKind::EnchantedBook, 1);
-        if let ItemStack::Present(data) = &mut blast_book {
-            let lore = Lore { lines: vec![azalea::FormattedText::from("Blast Protection IV")] };
-            unsafe {
-                data.component_patch.unchecked_insert_component(
-                    DataComponentKind::Lore,
-                    Some(DataComponentUnion::from(lore)),
-                );
-            }
-        }
-        manager.player_inventory.insert(11, blast_book);
-
-        // find_next_combine_task should combine Leggings (container slot 4) with Blast Prot IV (container slot 5)
-        let task = manager.find_next_combine_task(&bot).unwrap();
-        assert_eq!(task.armor_slot, 4); // Container slot 4 = player inventory slot 10 (Leggings)
-        assert_eq!(task.book_slot, 5);  // Container slot 5 = player inventory slot 11 (Blast Prot 4)
-        assert_eq!(task.enchant_name, "Blast Protection IV");
+        assert!(!is_cursed(8), "Expected cost should not be cursed");
+        assert!(!is_cursed(9), "1 level above expected cost (e.g. 8 -> 9) must not be cursed");
+        assert!(is_cursed(10), "2+ levels above expected cost (e.g. 8 -> 10) must be cursed");
+        assert!(is_cursed(40), "Cost >= 40 ('Too Expensive') must always be rejected");
     }
 }

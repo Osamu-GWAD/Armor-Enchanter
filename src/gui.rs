@@ -2,14 +2,14 @@ use crate::stock::{OrderListing, StockAudit};
 use crate::nbt::{
     inspect_item, inspect_item_with_bot, is_anvil, is_blast_protection_4, is_confirm_button,
     is_diamond_armor, is_diamond_boots, is_diamond_chestplate, is_diamond_helmet,
-    is_diamond_leggings, is_mending, is_protection_4, is_unbreaking_3, is_unbreaking_and_mending,
-    is_xp_bottle, is_your_orders_button, normalize_small_caps, strip_color_and_normalize, ItemInfo,
+    is_diamond_leggings, is_mending, is_protection_4, is_unbreaking_3, is_xp_bottle,
+    is_your_orders_button, normalize_small_caps, strip_color_and_normalize, ItemInfo,
 };
 
 use azalea::inventory::operations::ClickType;
 use azalea::inventory::ItemStack;
 use azalea::protocol::packets::game::s_container_click::{HashedStack, ServerboundContainerClick};
-use azalea::protocol::packets::game::ServerboundChatCommand;
+use azalea::protocol::packets::game::{ServerboundChatCommand, ServerboundContainerClose};
 use azalea::Client;
 use std::collections::HashMap;
 use tracing::{debug, error, info, warn};
@@ -305,7 +305,9 @@ impl GuiManager {
         }
         if self.current_container_id > 0 {
             info!("Closing lingering container #{} before sending command '{cmd}'...", self.current_container_id);
-            crate::drops::close_menu(bot, self.current_container_id);
+            bot.write_packet(ServerboundContainerClose {
+                container_id: self.current_container_id,
+            });
         }
         if cmd.trim() == "/order" && self.phase == WithdrawalPhase::AnvilPlacement {
             bot.set_direction(bot.direction().y_rot(), 90.0);
@@ -324,8 +326,6 @@ impl GuiManager {
     pub fn identify_order_item_name(&self, info: &ItemInfo) -> &'static str {
         if is_anvil(info) {
             "Anvil"
-        } else if is_unbreaking_and_mending(info) {
-            "Unbreaking III & Mending Book"
         } else if is_mending(info) {
             "Mending Book"
         } else if is_unbreaking_3(info) {
@@ -423,37 +423,7 @@ impl GuiManager {
         Some(item_name)
     }
 
-    /// Checks whether an item type is still required to satisfy the current withdrawal quota.
-    pub fn is_item_needed_for_quota(&self, name: &str) -> bool {
-        let n = name.trim().to_lowercase();
-        if n.contains("anvil") {
-            self.collected.anvils < self.quota.anvils_needed
-        } else if n.contains("experience") || n.contains("xp") {
-            !self.collected.has_required_xp(&self.quota)
-        } else if n.contains("mending") && n.contains("unbreaking") {
-            self.collected.mending < self.quota.mending_needed || self.collected.unbreaking_3 < self.quota.unbreaking_3_needed
-        } else if n.contains("mending") {
-            self.collected.mending < self.quota.mending_needed
-        } else if n.contains("unbreaking") {
-            self.collected.unbreaking_3 < self.quota.unbreaking_3_needed
-        } else if n.contains("blast") {
-            self.collected.blast_protection_4 < self.quota.blast_protection_4_needed
-        } else if n.contains("protection") {
-            self.collected.protection_4 < self.quota.protection_4_needed
-        } else if n.contains("helmet") {
-            self.collected.diamond_helmets < self.quota.diamond_helmets_needed
-        } else if n.contains("chestplate") {
-            self.collected.diamond_chestplates < self.quota.diamond_chestplates_needed
-        } else if n.contains("leggings") {
-            self.collected.diamond_leggings < self.quota.diamond_leggings_needed
-        } else if n.contains("boots") {
-            self.collected.diamond_boots < self.quota.diamond_boots_needed
-        } else {
-            false
-        }
-    }
-
-    pub fn verified_stock_alerts(&self) -> Vec<&'static str> {
+    fn verified_stock_alerts(&self) -> Vec<&'static str> {
         let candidates = if self.phase == WithdrawalPhase::AnvilPlacement {
             vec![("Anvil", self.collected.anvils, self.quota.anvils_needed)]
         } else if self.phase == WithdrawalPhase::ItemsRetrieval {
@@ -469,21 +439,9 @@ impl GuiManager {
                 ("Diamond Boots", self.collected.diamond_boots, self.quota.diamond_boots_needed),
             ]
         } else { vec![] };
-
-        let mut alerts: Vec<&'static str> = Vec::new();
-        for &(name, count, required) in &candidates {
-            if required == 0 || !self.is_item_needed_for_quota(name) {
-                continue;
-            }
-            let is_in_exhausted = self.exhausted_orders.iter().any(|ex| {
-                ex.eq_ignore_ascii_case(name) || (name.contains("Experience") && ex.contains("Experience"))
-            });
-            let is_audit_unavailable = self.stock_audit.confirmed_unavailable(name, count);
-            if is_in_exhausted || is_audit_unavailable {
-                alerts.push(name);
-            }
-        }
-        alerts
+        candidates.into_iter().filter_map(|(name, count, required)| {
+            (required > 0 && self.stock_audit.confirmed_unavailable(name, count)).then_some(name)
+        }).collect()
     }
 
     fn order_listing(&self, slot: i16, bot: Option<&Client>) -> Option<OrderListing> {
@@ -635,6 +593,14 @@ impl GuiManager {
                     if info.count > 0 {
                         xp_stack_slots += 1;
                     }
+                } else if is_mending(&info) {
+                    mending += info.count as u32;
+                } else if is_unbreaking_3(&info) {
+                    unb3 += info.count as u32;
+                } else if is_blast_protection_4(&info) {
+                    blast_prot4 += info.count as u32;
+                } else if is_protection_4(&info) {
+                    prot4 += info.count as u32;
                 } else if is_diamond_helmet(&info) {
                     helmets += info.count as u32;
                 } else if is_diamond_chestplate(&info) {
@@ -643,19 +609,6 @@ impl GuiManager {
                     leggings += info.count as u32;
                 } else if is_diamond_boots(&info) {
                     boots += info.count as u32;
-                } else {
-                    // Books: handle single and combined books properly
-                    if is_blast_protection_4(&info) {
-                        blast_prot4 += info.count as u32;
-                    } else if is_protection_4(&info) {
-                        prot4 += info.count as u32;
-                    }
-                    if is_unbreaking_3(&info) {
-                        unb3 += info.count as u32;
-                    }
-                    if is_mending(&info) {
-                        mending += info.count as u32;
-                    }
                 }
             }
         }
@@ -714,6 +667,14 @@ impl GuiManager {
                     if info.count > 0 {
                         xp_stack_slots += 1;
                     }
+                } else if is_mending(&info) {
+                    mending += info.count as u32;
+                } else if is_unbreaking_3(&info) {
+                    unb3 += info.count as u32;
+                } else if is_blast_protection_4(&info) {
+                    blast_prot4 += info.count as u32;
+                } else if is_protection_4(&info) {
+                    prot4 += info.count as u32;
                 } else if is_diamond_helmet(&info) {
                     helmets += info.count as u32;
                 } else if is_diamond_chestplate(&info) {
@@ -722,19 +683,6 @@ impl GuiManager {
                     leggings += info.count as u32;
                 } else if is_diamond_boots(&info) {
                     boots += info.count as u32;
-                } else {
-                    // Books: handle single and combined books properly
-                    if is_blast_protection_4(&info) {
-                        blast_prot4 += info.count as u32;
-                    } else if is_protection_4(&info) {
-                        prot4 += info.count as u32;
-                    }
-                    if is_unbreaking_3(&info) {
-                        unb3 += info.count as u32;
-                    }
-                    if is_mending(&info) {
-                        mending += info.count as u32;
-                    }
                 }
             }
         }
@@ -1012,22 +960,6 @@ impl GuiManager {
         }
     }
 
-    /// Anvil slots 3..38 mirror player menu slots 9..44. Keep this server
-    /// snapshot current during enchanting, including before drops/discards.
-    pub fn on_anvil_content(&mut self, items: &[ItemStack], bot: Option<&Client>) {
-        for (slot, item) in items.iter().enumerate().skip(3).take(36) {
-            self.player_inventory.insert((slot + 6) as i16, item.clone());
-        }
-        self.sync_collected_from_inventory(bot);
-    }
-
-    pub fn on_anvil_slot(&mut self, slot: i16, item: &ItemStack, bot: Option<&Client>) {
-        if (3..=38).contains(&slot) {
-            self.player_inventory.insert(slot + 6, item.clone());
-            self.sync_collected_from_inventory(bot);
-        }
-    }
-
     /// Update all slots when ClientboundContainerSetContent is received.
     pub fn on_set_content(&mut self, container_id: i32, state_id: u32, items: &[ItemStack], bot: Option<&Client>) {
         if container_id == 0 {
@@ -1079,7 +1011,6 @@ impl GuiManager {
     /// Update an individual slot when ClientboundContainerSetSlot is received.
     pub fn on_set_slot(&mut self, container_id: i32, state_id: u32, slot: i16, item: &ItemStack, bot: Option<&Client>) {
         if container_id == -2 {
-            self.player_state_id = state_id;
             if let Some(slot) = crate::armor::player_menu_slot(slot as u32) {
                 self.player_inventory.insert(slot, item.clone());
                 self.sync_collected_from_inventory(bot);
@@ -1113,10 +1044,8 @@ impl GuiManager {
 
             self.acknowledge_transfer();
 
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                if let Some(info) = inspect_item_with_bot(item, bot) {
-                    debug!("Slot #{slot} updated -> {} x{}", info.kind, info.count);
-                }
+            if let Some(info) = inspect_item_with_bot(item, bot) {
+                debug!("Slot #{slot} updated -> {} x{}", info.kind, info.count);
             }
         }
     }
@@ -1142,10 +1071,6 @@ impl GuiManager {
 
     /// Print detailed NBT/components for all present items in the GUI (at debug level or when diagnosing).
     pub fn log_all_slot_nbt(&self, bot: Option<&Client>) {
-        // The debug! macro skips formatting, but cannot skip work done before it.
-        if !tracing::enabled!(tracing::Level::DEBUG) {
-            return;
-        }
         debug!("=== Current GUI Item & NBT Audit ===");
         let mut sorted_slots: Vec<(&i16, &ItemStack)> = self.current_slots.iter().collect();
         sorted_slots.sort_by_key(|&(k, _)| *k);
@@ -1411,25 +1336,8 @@ impl GuiManager {
                             continue;
                         }
 
-                        let has_stackable_xp_slot = (9..=44).any(|s| {
-                            if let Some(ItemStack::Present(data)) = self.player_inventory.get(&s) {
-                                let k = format!("{:?}", data.kind).to_lowercase();
-                                (k.contains("experience") || k.contains("bottle")) && data.count < 64
-                            } else {
-                                false
-                            }
-                        });
-
-                        let cannot_collect = if is_xp_bottle(&info) {
-                            self.count_free_inventory_slots() == 0 && !has_stackable_xp_slot
-                        } else if self.phase == WithdrawalPhase::AnvilPlacement && is_anvil(&info) {
-                            false
-                        } else {
-                            self.count_free_inventory_slots() == 0
-                        };
-
-                        if cannot_collect {
-                            info!("Player inventory has 0 free slots (and no partial stack); cannot collect '{order_name}' at slot #{slot}.");
+                        if self.count_free_inventory_slots() == 0 && !is_xp_bottle(&info) && !(self.phase == WithdrawalPhase::AnvilPlacement && is_anvil(&info)) {
+                            info!("Player inventory has 0 free slots; cannot collect unstackable '{order_name}' at slot #{slot}.");
                             self.current_menu_skipped_slots.push(slot);
                             continue;
                         }
@@ -1462,19 +1370,9 @@ impl GuiManager {
         let missing = self.get_missing_quota_summary();
         info!("No unfulfilled orders matching phase {:?} found in slots 0-44 of 'Your Orders'.", self.phase);
 
-        let stock_alerts = self.verified_stock_alerts();
-
-        if !self.exhausted_orders.is_empty() || !stock_alerts.is_empty() {
+        if !self.exhausted_orders.is_empty() {
             warn!("============================================================");
-            if !self.exhausted_orders.is_empty() {
-                warn!("*** [OUT OF ITEMS] The following buy orders are currently OUT OF ITEMS on server: {:?} ***", self.exhausted_orders);
-            }
-            for &item in &stock_alerts {
-                crate::webhook::send_verified_out_of_item_alert(
-                    item,
-                    Some("Buy order is confirmed out of items on server. Please restock /order!"),
-                );
-            }
+            warn!("*** [OUT OF ITEMS] The following buy orders are currently OUT OF ITEMS on server: {:?} ***", self.exhausted_orders);
             warn!("*** Missing quota items still needed: {} ***", missing);
             warn!("============================================================");
         }
@@ -1523,9 +1421,9 @@ impl GuiManager {
         if !self.exhausted_orders.is_empty() || !self.collected.is_fulfilled(&self.quota) {
             let missing = self.get_missing_quota_summary();
             warn!("============================================================");
-            for &item in &stock_alerts {
+            for item in self.verified_stock_alerts() {
                 crate::webhook::send_verified_out_of_item_alert(item, Some(
-                    "Inventory is missing this item and buy order is out of items on server. Please restock /order!"
+                    "Inventory has zero of this item. Checked all pages of Your Orders: no matching order exists, or every matching order confirmed no items to collect."
                 ));
             }
             warn!("*** Missing items needed to proceed: {} ***", missing);
@@ -1843,11 +1741,6 @@ impl GuiManager {
             return false;
         }
 
-        // Combining uncombined Unbreaking III + Mending book is also an active combine
-        if self.collected.unbreaking_3 > 0 && self.collected.mending > 0 {
-            return true;
-        }
-
         for (&slot, item) in self.player_inventory.iter() {
             if !(9..=44).contains(&slot) {
                 continue;
@@ -1988,6 +1881,11 @@ impl GuiManager {
         legs.sort_by_key(|m| m.total());
         boots.sort_by_key(|m| m.total());
 
+        // Need sufficient XP to complete anvil combines:
+        let has_sufficient_xp = self.collected.xp_bottles >= 10
+            || self.collected.xp_stacks > 0
+            || bot.map_or(false, |b| b.experience().level >= 4);
+
         for s in (1..=max_possible_sets).rev() {
             let mut req_prot_4 = 0;
             let mut req_blast_4 = 0;
@@ -2016,15 +1914,7 @@ impl GuiManager {
             }
 
             let total_combines_needed = req_prot_4 + req_blast_4 + req_unb_3 + req_mending;
-            let has_sufficient_xp = if total_combines_needed == 0 {
-                true
-            } else {
-                self.collected.xp_stacks > 0
-                    || self.collected.xp_bottles >= (s as u32 * 16)
-                    || bot.map_or(false, |b| b.experience().level >= (15 * s as u32))
-            };
-
-            if !has_sufficient_xp {
+            if total_combines_needed > 0 && !has_sufficient_xp {
                 continue;
             }
 
@@ -2506,11 +2396,7 @@ impl GuiManager {
         let mut count = 0;
         for item in self.player_inventory.values() {
             if let Some(info) = inspect_item_with_bot(item, bot) {
-                if (is_diamond_helmet(&info) && info.has_enchantment("protection", 4) && info.has_enchantment("unbreaking", 3) && info.has_enchantment("mending", 1))
-                    || (is_diamond_chestplate(&info) && info.has_enchantment("protection", 4) && info.has_enchantment("unbreaking", 3) && info.has_enchantment("mending", 1))
-                    || (is_diamond_leggings(&info) && info.has_enchantment("blast_protection", 4) && info.has_enchantment("unbreaking", 3) && info.has_enchantment("mending", 1))
-                    || (is_diamond_boots(&info) && info.has_enchantment("blast_protection", 4) && info.has_enchantment("unbreaking", 3) && info.has_enchantment("mending", 1))
-                {
+                if crate::armor::is_complete(&info) {
                     count += 1;
                 }
             }
@@ -2555,7 +2441,9 @@ impl GuiManager {
     pub fn close_current_gui(&mut self, bot: &Client) {
         self.clear_watchdog();
         if self.current_container_id > 0 {
-            crate::drops::close_menu(bot, self.current_container_id);
+            bot.write_packet(ServerboundContainerClose {
+                container_id: self.current_container_id,
+            });
             self.current_container_id = 0;
             self.current_slots.clear();
         }
@@ -2630,32 +2518,6 @@ impl GuiManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn anvil_updates_refresh_player_cache_without_copying_inputs_or_output() {
-        use azalea_registry::builtin::ItemKind;
-        let mut gui = GuiManager::new();
-        let helmet = ItemStack::new(ItemKind::DiamondHelmet, 1);
-        let book = ItemStack::new(ItemKind::EnchantedBook, 1);
-        gui.player_inventory.insert(9, book.clone());
-        gui.player_inventory.insert(45, helmet.clone());
-        let mut items = vec![ItemStack::Empty; 39];
-        items[0] = helmet.clone();
-        items[1] = book.clone();
-        items[2] = helmet.clone();
-        items[38] = book.clone();
-        gui.on_anvil_content(&items, None);
-        assert_eq!(gui.player_inventory[&9], ItemStack::Empty);
-        assert_eq!(gui.player_inventory[&44], book);
-        assert_eq!(gui.player_inventory[&45], helmet);
-        assert!(!gui.player_inventory.contains_key(&6));
-        gui.on_anvil_slot(3, &helmet, None);
-        gui.on_anvil_slot(38, &ItemStack::Empty, None);
-        gui.on_anvil_slot(1, &book, None);
-        assert_eq!(gui.player_inventory[&9], helmet);
-        assert_eq!(gui.player_inventory[&44], ItemStack::Empty);
-        assert!(!gui.player_inventory.contains_key(&7));
-    }
 
     #[test]
     fn stock_alerts_require_fresh_orders_and_zero_actual_inventory() {
@@ -3224,58 +3086,4 @@ mod tests {
         // Note: complete sets is still 0 because chestplate, leggings, boots are missing
         assert_eq!(gui.count_craftable_god_sets(None), 0);
     }
-
-    #[test]
-    fn test_count_craftable_god_sets_fails_with_low_level_and_zero_bottles() {
-        let mut gui = GuiManager::new();
-        gui.phase = WithdrawalPhase::ItemsRetrieval;
-        gui.collected.anvils = 1;
-        gui.collected.diamond_helmets = 2;
-        gui.collected.diamond_chestplates = 2;
-        gui.collected.diamond_leggings = 2;
-        gui.collected.diamond_boots = 2;
-        gui.collected.mending = 8;
-        gui.collected.unbreaking_3 = 8;
-        gui.collected.protection_4 = 4;
-        gui.collected.blast_protection_4 = 4;
-        gui.collected.xp_bottles = 0;
-        gui.collected.xp_stacks = 0;
-
-        // With 0 XP bottles and 0 stacks, count_craftable_god_sets should be 0 even if armor and books are present
-        assert_eq!(gui.count_craftable_god_sets(None), 0);
-    }
-
-    #[test]
-    fn test_verified_stock_alerts_includes_exhausted_orders() {
-        let mut gui = GuiManager::new();
-        gui.phase = WithdrawalPhase::ItemsRetrieval;
-        gui.quota.xp_stacks_needed = 4;
-        gui.collected.xp_bottles = 0;
-        gui.collected.xp_stacks = 0;
-
-        // Order is recorded in exhausted_orders
-        gui.exhausted_orders.push("Experience Bottles".to_string());
-
-        let alerts = gui.verified_stock_alerts();
-        assert!(alerts.contains(&"Experience Bottles"), "Should include exhausted XP bottles");
-    }
-
-    #[test]
-    fn test_is_item_needed_for_quota() {
-        let mut gui = GuiManager::new();
-        gui.quota.xp_stacks_needed = 4;
-        gui.collected.xp_bottles = 0;
-        assert!(gui.is_item_needed_for_quota("Experience Bottles"));
-        assert!(gui.is_item_needed_for_quota("XP Bottles"));
-
-        gui.collected.xp_bottles = 256;
-        assert!(!gui.is_item_needed_for_quota("Experience Bottles"));
-
-        gui.quota.mending_needed = 8;
-        gui.collected.mending = 4;
-        assert!(gui.is_item_needed_for_quota("Mending Book"));
-        gui.collected.mending = 8;
-        assert!(!gui.is_item_needed_for_quota("Mending Book"));
-    }
 }
-

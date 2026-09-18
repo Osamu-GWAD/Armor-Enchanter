@@ -76,19 +76,22 @@ impl ItemInfo {
                 return true;
             }
 
-            let roman = match min_level {
-                2 => &["ii", "2", "ⅱ"][..],
-                3 => &["iii", "3", "ⅲ"][..],
-                4 => &["iv", "4", "ⅳ"][..],
-                5 => &["v", "5", "ⅴ"][..],
-                _ => &[][..],
-            };
-            roman.iter().any(|&r| t_lower.contains(r))
+            let tokens: Vec<&str> = t_lower.split(|c: char| !c.is_alphanumeric() && c != 'ⅱ' && c != 'ⅲ' && c != 'ⅳ' && c != 'ⅴ').collect();
+            match min_level {
+                2 => tokens.iter().any(|&t| t == "ii" || t == "2" || t == "ⅱ"),
+                3 => tokens.iter().any(|&t| t == "iii" || t == "3" || t == "ⅲ"),
+                4 => tokens.iter().any(|&t| t == "iv" || t == "4" || t == "ⅳ"),
+                5 => tokens.iter().any(|&t| t == "v" || t == "5" || t == "ⅴ"),
+                _ => false,
+            }
         };
 
-        if let Some(ref name) = self.custom_name {
-            if matches_text(name) {
-                return true;
+        // Custom name is checked only for books (e.g. "Protection IV Book"), NEVER for armor
+        if self.kind.contains("Book") {
+            if let Some(ref name) = self.custom_name {
+                if matches_text(name) {
+                    return true;
+                }
             }
         }
 
@@ -98,11 +101,8 @@ impl ItemInfo {
             }
         }
 
-        if let Some(ref dbg) = self.raw_debug {
-            if matches_text(dbg) {
-                return true;
-            }
-        }
+        // NOTE: NEVER check self.raw_debug here! raw_debug contains raw component
+        // debug representations which caused false-positive matches on unenchanted armor.
 
         false
     }
@@ -270,18 +270,11 @@ fn extract_from_components(val: &Value, info: &mut ItemInfo) {
                     parse_enchantment_map(v, &mut info.enchantments);
                 }
                 "repair_cost" => {
-                    if let Some(num) = v.as_u64() {
+                    if let Some(num) = v.as_i64() {
                         info.repair_cost = Some(num as u32);
-                    }
-                }
-                "custom_data" => {
-                    if let Value::Object(cd_map) = v {
-                        for (k, v) in cd_map {
-                            if k.eq_ignore_ascii_case("repaircost") {
-                                if let Some(num) = v.as_u64() {
-                                    info.repair_cost = Some(num as u32);
-                                }
-                            }
+                    } else if let Value::Object(obj) = v {
+                        if let Some(num) = obj.get("cost").and_then(|c| c.as_i64()) {
+                            info.repair_cost = Some(num as u32);
                         }
                     }
                 }
@@ -465,18 +458,6 @@ pub fn is_mending(info: &ItemInfo) -> bool {
         || info.lore.iter().any(|l| l.to_lowercase().contains("book"));
     (is_book || info.kind.to_lowercase().contains("paper"))
         && info.has_enchantment("mending", 1)
-}
-
-pub fn is_unbreaking_and_mending(info: &ItemInfo) -> bool {
-    is_unbreaking_3(info) && is_mending(info)
-}
-
-pub fn is_single_unbreaking_3(info: &ItemInfo) -> bool {
-    is_unbreaking_3(info) && !is_mending(info)
-}
-
-pub fn is_single_mending(info: &ItemInfo) -> bool {
-    is_mending(info) && !is_unbreaking_3(info)
 }
 
 pub fn is_protection_4(info: &ItemInfo) -> bool {

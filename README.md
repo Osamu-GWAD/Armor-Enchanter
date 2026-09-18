@@ -29,15 +29,11 @@ An autonomous, high-performance Minecraft enchanting bot built in Rust with [Aza
   - Throws bottles in rapid, authentic streams (1 tick per throw) with `ServerboundSwing` arm animations, reaching required levels in under 1 second.
 
 - **Optimal Anvil Sequencing ([iamcal/enchant-order](https://github.com/iamcal/enchant-order))**:
-  - Tree-merge sequence minimizing prior work penalties and cumulative level costs:
-    - **Book Merge**: Unbreaking III (book) + Mending (book) $\to$ (Unbreaking III + Mending) book (2 lvl)
-    - **Base Armor Merge**:
-      - **Helmet**: Blank Helmet + Protection IV (4 lvl)
-      - **Chestplate**: Blank Chestplate + Protection IV (4 lvl)
-      - **Leggings**: Blank Leggings + Blast Protection IV (8 lvl)
-      - **Boots**: Blank Boots + Blast Protection IV (8 lvl)
-    - **Final Tree Merge**: Armor (with Prot IV / Blast Prot IV) + (Unbreaking III + Mending) book (7 lvl)
-  - Result: Fully enchanted armor piece with Prior Work Penalty of only 2 (3 levels) instead of 3 (7 levels).
+  - Sequences combines to minimize prior work penalties and cumulative level costs:
+    - **Helmet**: Protection IV (4 lvl) $\to$ Unbreaking III (4 lvl) $\to$ Mending (5 lvl)
+    - **Chestplate**: Protection IV (4 lvl) $\to$ Unbreaking III (4 lvl) $\to$ Mending (5 lvl)
+    - **Leggings**: Blast Protection IV (8 lvl) $\to$ Unbreaking III (4 lvl) $\to$ Mending (5 lvl)
+    - **Boots**: Blast Protection IV (8 lvl) $\to$ Unbreaking III (4 lvl) $\to$ Mending (5 lvl)
 
 - **Anti-Cheat Resilient & Humanized Interactions**:
   - **Smooth View Interpolation**: Mimics human mouse rotation using a cosine ease-in-out curve ($\alpha = \frac{1 - \cos(\pi t)}{2}$) over 2–6 ticks, eliminating abrupt aim snapping while keeping rotations responsive.
@@ -103,7 +99,7 @@ cargo run --release -- --microsoft player1@outlook.com
 
 - Withdraw two helmets, chestplates, leggings, and boots from `/order`, plus the books and XP listed above. The eight armor pieces, 24 books, and four XP stacks fit the 36 inventory slots after placing the anvil.
 - Finish enchanting the helmet, then chestplate, leggings, and boots. A missing piece or required book returns the unfinished set to restocking. Duplicate armor does not take priority over the next type.
-- Once all four pieces are complete, aim at a hopper within 4.5 blocks and drop exactly one helmet, chestplate, leggings, and boots, in that order. Each item is thrown directly from its verified inventory slot, and each drop waits for the server to report one fewer piece before advancing. Inventory entries are never optimistically deleted to confirm drops.
+- Once all four pieces are complete, aim at a hopper within two blocks and drop exactly one helmet, chestplate, leggings, and boots, in that order. Each drop waits for the server to report one fewer piece before advancing. No hotbar swaps or optimistic inventory deletion are used for drops.
 - Immediately enchant and drop the second stocked set in the same order. Inventory cleaning and `/order` restocking run after both sets, or when supplies are missing, rather than after every set.
 - Anvil and drop workers wake on server inventory updates. Opening the anvil releases its state lock immediately after interaction, allowing screen packets to be processed without a fixed post-interaction delay. Timeouts and per-item acknowledgements remain in place; live throughput has not been benchmarked.
 - A missing hopper or unconfirmed drop retains the sequence and reconnects for reconciliation. Pending drop bookkeeping survives automatic reconnects within the same account process. It is not saved across a process restart.
@@ -154,70 +150,6 @@ cargo run --release -- --account 0
 ```bash
 cargo test
 ```
-
-### Drop confirmation
-
-Completed armor and rejected books use the direct inventory-slot throw from
-commit `53b7303`, with exact-item and protected-item checks immediately before
-sending. There is no hotbar staging or hand selection. This also works when every
-hotbar slot contains protected armor. The bot waits up to ten seconds for a server
-inventory decrease. An inventory decrease does not prove hopper pickup.
-
-After the drop, the bot requests a full server inventory snapshot with a same-slot
-hotbar swap (a no-op) and a mismatched menu state ID. This handles servers that
-accept a drop without echoing the slot removal. The cache is updated from the
-server's response; sending the drop itself never counts as confirmation.
-
-Anvil contents update the player inventory cache while the menu is open, and
-closing a menu also updates Azalea's active container. High-cost books are tracked
-by their full item data; an unrelated book is never substituted for a rejected one.
-
-### Unsigned chat
-
-Chat signing is disabled on every connection. The bot does not request player
-chat certificates; outgoing chat and commands are unsigned. Microsoft/Minecraft
-authentication for joining online-mode servers remains enabled. Servers that
-require signed chat may reject unsigned messages.
-
-### GameTick lag warnings
-
-Azalea targets one game tick every 50 ms. A `GameTick is more than 10 ticks behind`
-warning means the local scheduler has accumulated roughly half a second of lag
-and discarded overdue ticks to avoid a catch-up burst. It does not measure server TPS.
-
-The bot requests a view distance of 2 chunks instead of Azalea's default of 8,
-reducing chunk/entity traffic where the server honors that setting. All enchanting
-interactions are nearby. Override with `--view-distance 8` or `VIEW_DISTANCE=8`
-if needed (accepted range: 2–32). Multi-account launches forward the setting.
-
-Every 30 seconds, `Local scheduler timing` reports executed `local_tps`, the
-number of ticks and updates, `max_update_ms`, and `max_tick_gap_ms`. The update
-measurement spans the outer schedule from First to Last; it excludes GameTick
-and time waiting for the ECS lock or for the thread to run. Large update times
-point to work within that schedule; long tick gaps with fast updates require
-checking GameTick work, other local tasks, lock contention, and host load.
-The warning alone does not identify which of those caused the lag. Tick-lag
-warnings do not automatically reconnect or alter the 20-TPS simulation.
-
-Console logging is initialized with a dedicated worker and a bounded 4096-line queue. If
-the terminal stalls and fills that queue, new log lines are dropped instead of
-blocking game ticks. The worker guard remains alive until normal shutdown to
-flush queued output. Debug-only item audits are skipped when debug logging is
-disabled, and the fallback GUI watchdog runs every 100 ms; packet-driven actions
-still wake on server updates. Development builds also optimize the encryption
-and decompression dependencies, as Azalea's workspace profile is not inherited.
-
-Repeated out-of-view chunk warnings are sampled (the first four, then every
-thousandth). The timing report includes the number suppressed in that interval;
-other warnings and errors remain visible. This limits log noise when the server
-sends chunks beyond the requested view distance. Azalea's default logging feature
-is disabled so it does not install a second subscriber over the background logger.
-
-Rebuild with `cargo build --release --locked` and use `run.bat` or `run_all.bat`.
-If warnings persist, compare one account against all accounts and profile CPU
-usage during chunk loading and inventory updates. These changes remove known
-sources of overhead and blocking; a live run is needed to confirm the cause of
-any particular warning.
 
 ---
 

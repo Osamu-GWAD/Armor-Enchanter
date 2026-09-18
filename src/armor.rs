@@ -29,30 +29,22 @@ pub fn armor_type(info: &ItemInfo) -> Option<usize> {
 }
 
 pub fn is_complete(info: &ItemInfo) -> bool {
+    // Completely unenchanted items (empty enchantments AND empty lore) can NEVER be complete!
+    if info.enchantments.is_empty() && info.lore.is_empty() {
+        return false;
+    }
+    // A complete God armor piece requires at least 3 distinct enchantments
+    if info.enchantments.len() < 3 && info.lore.len() < 3 {
+        return false;
+    }
     armor_type(info).is_some_and(|kind| {
-        info.has_enchantment(
-            if kind < 2 {
-                "protection"
-            } else {
-                "blast_protection"
-            },
-            4,
-        ) && info.has_enchantment("unbreaking", 3)
-            && info.has_enchantment("mending", 1)
+        let has_prot = if kind < 2 {
+            info.has_enchantment("protection", 4) && !info.has_enchantment("blast_protection", 1)
+        } else {
+            info.has_enchantment("blast_protection", 4)
+        };
+        has_prot && info.has_enchantment("unbreaking", 3) && info.has_enchantment("mending", 1)
     })
-}
-
-pub fn is_clean_armor(info: &ItemInfo) -> bool {
-    let prior_works = (info.has_enchantment("protection", 4) || info.has_enchantment("blast_protection", 4)) as u32
-        + (info.has_enchantment("unbreaking", 3) as u32)
-        + (info.has_enchantment("mending", 1) as u32);
-    let max_allowed_pwp = match prior_works {
-        0 => 0,
-        1 => 15,
-        2 => 31,
-        _ => 63,
-    };
-    info.repair_cost.unwrap_or(0) <= max_allowed_pwp
 }
 
 /// Pick one piece of each type per set. Finish the current type before moving on,
@@ -61,7 +53,7 @@ pub fn next_armor(items: &[(i16, ItemInfo)]) -> Option<&(i16, ItemInfo)> {
     for kind in 0..4 {
         let mut candidates: Vec<_> = items
             .iter()
-            .filter(|(_, info)| armor_type(info) == Some(kind) && is_clean_armor(info))
+            .filter(|(_, info)| armor_type(info) == Some(kind))
             .collect();
         if candidates.iter().any(|(_, info)| is_complete(info)) {
             continue;
@@ -258,5 +250,33 @@ mod tests {
         assert_eq!(player_menu_slot(39), Some(5));
         assert_eq!(player_menu_slot(40), Some(45));
         assert_eq!(player_menu_slot(41), None);
+    }
+
+    #[test]
+    fn unenchanted_or_incomplete_armor_is_never_complete_and_cannot_be_dropped() {
+        for kind in 0..4 {
+            let unenchanted = piece(kind, false);
+            assert!(!is_complete(&unenchanted));
+            assert!(drop_plan(&[(9, unenchanted)], 0).is_none());
+        }
+
+        // Test with raw debug string that contains enchantment keywords
+        let mut fake_chest = piece(1, false);
+        fake_chest.raw_debug = Some("DataComponentPatch { [Enchantments: protection 4, unbreaking 3, mending 1] }".to_string());
+        assert!(!is_complete(&fake_chest), "Raw debug string must NEVER trick is_complete into returning true");
+        assert!(!fake_chest.has_enchantment("protection", 4));
+        assert!(!fake_chest.has_enchantment("unbreaking", 3));
+        assert!(!fake_chest.has_enchantment("mending", 1));
+
+        // Test with partial combines
+        let mut partial_chest = piece(1, false);
+        partial_chest.enchantments.insert("protection".to_string(), 4);
+        assert!(!is_complete(&partial_chest), "Single enchant is not complete");
+
+        partial_chest.enchantments.insert("unbreaking".to_string(), 3);
+        assert!(!is_complete(&partial_chest), "Missing mending is not complete");
+
+        partial_chest.enchantments.insert("mending".to_string(), 1);
+        assert!(is_complete(&partial_chest), "All 3 target enchants present must be complete");
     }
 }

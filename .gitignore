@@ -1,4 +1,6 @@
-/target
+/target/
 .env
 *.exe
-*.zip
+*.pdb
+*.log
+.cargo-lock
