@@ -6,11 +6,21 @@ use std::fmt::Debug;
 use uuid::Uuid;
 
 /// An account authenticated via a pre-existing Minecraft access token (e.g., from Xbox/Mojang login).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CustomTokenAccount {
     pub username: String,
     pub uuid: Uuid,
     pub access_token: String,
+}
+
+impl Debug for CustomTokenAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CustomTokenAccount")
+            .field("username", &self.username)
+            .field("uuid", &self.uuid)
+            .field("access_token", &"[redacted]")
+            .finish()
+    }
 }
 
 impl AccountTrait for CustomTokenAccount {
@@ -58,8 +68,8 @@ impl AccountTrait for CustomTokenAccount {
 
             match &res {
                 Ok(_) => tracing::info!("Mojang sessionserver join successful!"),
-                Err(e) => {
-                    tracing::error!("Mojang sessionserver join failed: {e:?}");
+                Err(_) => {
+                    tracing::error!("Mojang sessionserver join failed.");
                     tracing::error!("NOTE: 'ForbiddenOperation' means your MC_TOKEN has expired or is invalid.");
                     tracing::error!("Please generate a fresh access token from your launcher/auth script and update MC_TOKEN in .env!");
                 }
@@ -126,17 +136,7 @@ impl CustomTokenAccount {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             if exp <= now {
-                let expired_mins_ago = (now - exp) / 60;
-                tracing::error!(
-                    "❌ ERROR: The provided MC_TOKEN expired ~{} minute(s) ago! (exp: {}, now: {}).",
-                    expired_mins_ago, exp, now
-                );
-                tracing::error!(
-                    "❌ Mojang sessionserver will reject connection with 'ForbiddenOperation'."
-                );
-                tracing::error!(
-                    "❌ Please generate a fresh access token or configure MICROSOFT_EMAIL in .env."
-                );
+                anyhow::bail!("MC_TOKEN has expired; generate a fresh token or configure MICROSOFT_EMAIL");
             } else {
                 let remaining_mins = (exp - now) / 60;
                 tracing::info!("MC_TOKEN is valid for ~{} more minute(s).", remaining_mins);
@@ -188,31 +188,65 @@ impl CustomTokenAccount {
 }
 
 /// Configured representation of a Minecraft account before connection.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum AccountConfig {
     Microsoft(String),
     Token(String),
     Offline(String),
 }
 
+impl Debug for AccountConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Microsoft(email) => f.debug_tuple("Microsoft").field(email).finish(),
+            Self::Token(_) => f.debug_tuple("Token").field(&"[redacted]").finish(),
+            Self::Offline(name) => f.debug_tuple("Offline").field(name).finish(),
+        }
+    }
+}
+
+// Pass the parent's exact account without putting token credentials in process arguments.
+pub const CHILD_ACCOUNT_KIND_ENV: &str = "RELIABILITY_CHILD_ACCOUNT_KIND";
+pub const CHILD_ACCOUNT_VALUE_ENV: &str = "RELIABILITY_CHILD_ACCOUNT_VALUE";
+
 impl AccountConfig {
     pub fn description(&self) -> String {
         match self {
             AccountConfig::Microsoft(email) => format!("Microsoft ({email})"),
-            AccountConfig::Token(token) => {
-                if let Ok(acc) = CustomTokenAccount::from_jwt(token) {
-                    format!("Token (Profile: {}, UUID: {})", acc.username, acc.uuid)
-                } else {
-                    let preview = if token.len() > 16 {
-                        format!("{}...", &token[..16])
-                    } else {
-                        token.clone()
-                    };
-                    format!("Token ({preview})")
-                }
-            }
+            AccountConfig::Token(_) => "Token (configured)".to_string(),
             AccountConfig::Offline(name) => format!("Offline ({name})"),
         }
+    }
+
+    pub fn child_env_parts(&self) -> (&'static str, &str) {
+        match self {
+            AccountConfig::Microsoft(value) => ("microsoft", value),
+            AccountConfig::Token(value) => ("token", value),
+            AccountConfig::Offline(value) => ("offline", value),
+        }
+    }
+
+    fn from_child_env_parts(kind: &str, value: String) -> anyhow::Result<Self> {
+        if value.trim().is_empty() {
+            anyhow::bail!("Child account credential is empty");
+        }
+        match kind {
+            "microsoft" => Ok(Self::Microsoft(value)),
+            "token" => Ok(Self::Token(value)),
+            "offline" => Ok(Self::Offline(value)),
+            _ => anyhow::bail!("Unknown child account kind"),
+        }
+    }
+}
+
+pub fn child_account_from_env() -> anyhow::Result<Option<AccountConfig>> {
+    use std::env::VarError;
+    let kind = std::env::var(CHILD_ACCOUNT_KIND_ENV);
+    let value = std::env::var(CHILD_ACCOUNT_VALUE_ENV);
+    match (kind, value) {
+        (Err(VarError::NotPresent), Err(VarError::NotPresent)) => Ok(None),
+        (Ok(kind), Ok(value)) => AccountConfig::from_child_env_parts(&kind, value).map(Some),
+        _ => anyhow::bail!("Incomplete or invalid child account configuration"),
     }
 }
 
@@ -224,7 +258,14 @@ pub fn discover_accounts(
 ) -> Vec<AccountConfig> {
     let mut list = Vec::new();
 
-    // Priority 1: Explicit CLI Microsoft email
+    // Explicit CLI credentials precede environment accounts, with offline override first.
+    if let Some(name) = cli_offline {
+        if !name.trim().is_empty() {
+            list.push(AccountConfig::Offline(name.trim().to_string()));
+        }
+    }
+
+    // Explicit CLI Microsoft email
     if let Some(email) = cli_microsoft {
         if !email.trim().is_empty() {
             list.push(AccountConfig::Microsoft(email.trim().to_string()));
@@ -300,13 +341,6 @@ pub fn discover_accounts(
         }
     }
 
-    // Priority 7: Explicit CLI Offline username
-    if let Some(name) = cli_offline {
-        if !name.trim().is_empty() {
-            list.push(AccountConfig::Offline(name.trim().to_string()));
-        }
-    }
-
     // Remove duplicates while preserving order
     let mut unique = Vec::new();
     for acc in list {
@@ -322,44 +356,40 @@ pub fn discover_accounts(
     unique
 }
 
-/// Select an account from the discovered list using selector flag or env var (index or email/name).
-pub fn select_account(accounts: &[AccountConfig], selector: Option<&str>) -> AccountConfig {
+/// Select a configured account by zero-based index or email/name.
+pub fn select_account(accounts: &[AccountConfig], selector: Option<&str>) -> anyhow::Result<AccountConfig> {
     if accounts.is_empty() {
-        return AccountConfig::Offline("EnchanterBot".to_string());
+        anyhow::bail!("No accounts are configured");
     }
 
     if let Some(sel) = selector {
         let trimmed = sel.trim();
-        // Check if numeric index (e.g. 0, 1, 2)
+        // Indices shown in startup logs are zero-based.
         if let Ok(idx) = trimmed.parse::<usize>() {
             if idx < accounts.len() {
-                return accounts[idx].clone();
-            } else if idx > 0 && (idx - 1) < accounts.len() {
-                return accounts[idx - 1].clone();
+                return Ok(accounts[idx].clone());
             }
+            anyhow::bail!("Account index {idx} is out of range (0..{})", accounts.len());
         }
 
         // Check if matches email or description
         for acc in accounts {
             match acc {
                 AccountConfig::Microsoft(email) if email.eq_ignore_ascii_case(trimmed) => {
-                    return acc.clone();
+                    return Ok(acc.clone());
                 }
                 AccountConfig::Offline(name) if name.eq_ignore_ascii_case(trimmed) => {
-                    return acc.clone();
+                    return Ok(acc.clone());
                 }
                 _ => {}
             }
         }
 
-        // Direct email provided
-        if trimmed.contains('@') {
-            return AccountConfig::Microsoft(trimmed.to_string());
-        }
+        anyhow::bail!("Account selector does not match a configured account");
     }
 
     // Default to first account
-    accounts[0].clone()
+    Ok(accounts[0].clone())
 }
 
 fn get_minecraft_cache_file() -> std::path::PathBuf {
@@ -476,7 +506,10 @@ pub async fn authenticate_account(config: AccountConfig) -> Result<Account, anyh
                     Ok(custom_acc.into_azalea_account())
                 }
                 Err(e) => {
-                    tracing::error!("Failed to parse token payload: {e}");
+                    // Malformed JWT-like tokens must not silently become opaque accounts.
+                    if token.split('.').count() >= 3 || token.starts_with("eyJ") {
+                        return Err(anyhow::anyhow!("Invalid or expired JWT access token: {e}"));
+                    }
                     tracing::info!("Creating account with raw token string...");
                     Ok(CustomTokenAccount::new("AzaleaBot", Uuid::new_v4(), token).into_azalea_account())
                 }
@@ -495,14 +528,38 @@ mod tests {
 
     #[test]
     fn test_parse_jwt_token() {
-        let token = "eyJraWQiOiIwNDkxODEiLCJhbGciOiJSUzI1NiJ9.eyJ4dWlkIjoiMjUzNTQwODk0NTU4OTY3NyIsImFnZyI6IkFkdWx0Iiwic3ViIjoiZDk1ZDQ4ZTAtZTk5Ny00ZGMyLTg1ZmItODNjMDg0YTQwNDYzIiwiYXV0aCI6IlhCT1giLCJucyI6ImRlZmF1bHQiLCJyb2xlcyI6W10sImlzcyI6ImF1dGhlbnRpY2F0aW9uIiwiZmxhZ3MiOlsibXVsdGlwbGF5ZXIiXSwicHJvZmlsZXMiOnsibWMiOiIyOTNkMTQyMC0wYWZlLTQyOTUtODI5Ni04OTYwMTA3ZWEzMWMifSwicG1pZCI6ImM2ODdmZWM1LTQzYTYtNTMwMS1iMzgzLWJlZjI1OGM2NzVjZSIsInBsYXRmb3JtIjoiUENfTEFVTkNIRVIiLCJ0aWQiOiJFOTlCMCIsInBmZCI6W3sidHlwZSI6Im1jIiwiaWQiOiIyOTNkMTQyMC0wYWZlLTQyOTUtODI5Ni04OTYwMTA3ZWEzMWMiLCJuYW1lIjoiVG91ZlRvdWZfNjQ3OTUwIn1dLCJ4aWQiOiIyNTM1NDA4OTQ1NTg5Njc3IiwibmJmIjoxNzg4ODA3MDMwLCJleHAiOjE3ODg4OTM0MzAsImlhdCI6MTc4ODgwNzAzMCwiYWlkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDQwMmI1MzI4In0.CHY2gbpgyLR3j0l8UHWXL7J9JvHYXgOQxupmBnNKfAjgyg73XWRyexy8XDR4iBQ10QcYaXbDamEEFql-5C8r_bsnNlxzjz9q0VJzm7EsjewJyWJZxsk58fH-qpexTdm_42iRYppWP5ye4mUK8smaoJ7vCBLu1HjTNerBpCHUXWhvbSoqrgBoQFtvOdMJeS88FPPGO9OT28ejYyKTaUmmbDCZK4_wcmMo7e9cqAYSLUp578xqMrwIf3mFE3qcQS9gWbFE7u1dLMZBzoARDCO-lnU-JguRyinuQvAfHD_ODd4vCxpLJPnf7Up4es2AeWTAgNPHk_dMdBNhjvvwAVmiUA";
-        let account = CustomTokenAccount::from_jwt(token).expect("Failed to parse JWT");
-        assert_eq!(account.username, "ToufTouf_647950");
-        assert_eq!(account.uuid, Uuid::parse_str("293d1420-0afe-4295-8296-8960107ea31c").unwrap());
-
+        let expected_uuid = Uuid::parse_str("293d1420-0afe-4295-8296-8960107ea31c").unwrap();
+        let payload = serde_json::json!({
+            "pfd": [{"name": "TestUser", "id": expected_uuid.to_string()}]
+        });
+        let token = format!(
+            "e30.{}.unused-signature",
+            URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes())
+        );
+        let account = CustomTokenAccount::from_jwt(&token).expect("Failed to parse JWT");
+        assert_eq!(account.username, "TestUser");
+        assert_eq!(account.uuid, expected_uuid);
         let azalea_acc = account.into_azalea_account();
-        println!("azalea_acc: {:?}", azalea_acc);
-        println!("azalea_acc.access_token: {:?}", azalea_acc.access_token());
+        assert!(azalea_acc.access_token().is_some());
+    }
+
+    #[tokio::test]
+    async fn expired_jwt_is_rejected() {
+        let payload = serde_json::json!({"exp": 1u64});
+        let token = format!(
+            "e30.{}.unused-signature",
+            URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes())
+        );
+        let error = CustomTokenAccount::from_jwt(&token).unwrap_err();
+        assert!(error.to_string().contains("expired"));
+        assert!(authenticate_account(AccountConfig::Token(token)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn malformed_jwt_is_not_used_as_an_opaque_token() {
+        assert!(authenticate_account(AccountConfig::Token("e30.invalid.signature".into())).await.is_err());
+        assert!(authenticate_account(AccountConfig::Token("opaque-token".into())).await.is_ok());
+        assert!(authenticate_account(AccountConfig::Token("opaque.token".into())).await.is_ok());
     }
 
     #[test]
@@ -514,20 +571,49 @@ mod tests {
         ];
 
         // Test index 0
-        let sel0 = select_account(&accounts, Some("0"));
+        let sel0 = select_account(&accounts, Some("0")).unwrap();
         assert_eq!(sel0, AccountConfig::Microsoft("user1@outlook.com".to_string()));
 
         // Test index 1
-        let sel1 = select_account(&accounts, Some("1"));
+        let sel1 = select_account(&accounts, Some("1")).unwrap();
         assert_eq!(sel1, AccountConfig::Microsoft("user2@outlook.com".to_string()));
 
         // Test by email
-        let sel_email = select_account(&accounts, Some("user2@outlook.com"));
+        let sel_email = select_account(&accounts, Some("user2@outlook.com")).unwrap();
         assert_eq!(sel_email, AccountConfig::Microsoft("user2@outlook.com".to_string()));
 
         // Test default
-        let sel_default = select_account(&accounts, None);
+        let sel_default = select_account(&accounts, None).unwrap();
         assert_eq!(sel_default, AccountConfig::Microsoft("user1@outlook.com".to_string()));
+        assert!(select_account(&accounts, Some("3")).is_err());
+        assert!(select_account(&accounts, Some("unknown")).is_err());
+        assert!(select_account(&accounts, Some("other@outlook.com")).is_err());
+        assert!(select_account(&accounts, Some(" ")).is_err());
+        assert!(select_account(&[], None).is_err());
+    }
+
+    #[test]
+    fn explicit_cli_offline_precedes_environment_accounts() {
+        let accounts = discover_accounts(None, None, Some("CliOffline"));
+        assert_eq!(accounts[0], AccountConfig::Offline("CliOffline".to_string()));
+        assert_eq!(select_account(&accounts, None).unwrap(), accounts[0]);
+    }
+
+    #[test]
+    fn child_account_round_trip_preserves_account_type_and_credential() {
+        for account in [
+            AccountConfig::Microsoft("user@outlook.com".to_string()),
+            AccountConfig::Token("opaque-token-value".to_string()),
+            AccountConfig::Offline("OfflineBot".to_string()),
+        ] {
+            let (kind, value) = account.child_env_parts();
+            assert_eq!(AccountConfig::from_child_env_parts(kind, value.to_string()).unwrap(), account);
+        }
+        assert!(AccountConfig::from_child_env_parts("token", String::new()).is_err());
+        assert!(AccountConfig::from_child_env_parts("unknown", "secret".to_string()).is_err());
+        let token = AccountConfig::Token("opaque-token-value".to_string());
+        assert!(!token.description().contains("opaque-token-value"));
+        assert!(!format!("{token:?}").contains("opaque-token-value"));
     }
 
     #[test]

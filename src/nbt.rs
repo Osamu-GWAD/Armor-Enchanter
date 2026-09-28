@@ -43,51 +43,71 @@ impl ItemInfo {
             })
         };
 
-        if check_map(&self.enchantments) || check_map(&self.stored_enchantments) {
+        if check_map(&self.enchantments)
+            || (is_book_or_paper(self) && check_map(&self.stored_enchantments))
+        {
             return true;
         }
 
-        // Also fallback to checking lore, custom name, and raw debug/components,
-        // as many SMP servers (like DonutSMP) store enchantments as formatted text in lore / name!
+        // Some servers display book enchantments in lore instead of stored components.
+        // Require an enchantment label at the start of the line and keep its
+        // displayed level attached to it. Descriptions such as "No Mending"
+        // and levels belonging to another enchantment are not proof.
+        // Armor must be verified from applied enchantment components, since lore
+        // is freely editable and cannot prove that the enchantment is active.
+        if !is_book_or_paper(self) {
+            return false;
+        }
         let matches_text = |text: &str| {
-            let t_lower = normalize_small_caps(&text.to_lowercase());
-            let is_blast = t_lower.contains("blast");
-            let is_fire = t_lower.contains("fire");
-            let is_proj = t_lower.contains("projectile") || t_lower.contains("proj");
+            let normalized = normalize_small_caps(&text.to_lowercase());
+            let tokens: Vec<&str> = normalized
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|token| !token.is_empty())
+                .collect();
+            tokens.iter().enumerate().any(|(index, token)| {
+                if index != 0 && !(index == 1 && tokens[0] == "minecraft") {
+                    return false;
+                }
+                let level_index = if pattern == "protection" {
+                    if *token != "protection"
+                        || (index > 0
+                            && matches!(tokens[index - 1], "blast" | "fire" | "projectile" | "proj"))
+                    {
+                        return false;
+                    }
+                    index + 1
+                } else if matches!(pattern.as_str(), "blast_protection" | "blast protect" | "blast") {
+                    if *token == "blastprotection" {
+                        index + 1
+                    } else if *token == "blast"
+                        && tokens.get(index + 1).is_some_and(|next| matches!(*next, "protection" | "protect" | "prot"))
+                    {
+                        index + 2
+                    } else {
+                        return false;
+                    }
+                } else if *token == pattern.strip_prefix("minecraft:").unwrap_or(&pattern) {
+                    index + 1
+                } else {
+                    return false;
+                };
 
-            let has_base = if pattern == "protection" {
-                t_lower.contains("protection") && !is_blast && !is_fire && !is_proj
-            } else if pattern == "blast_protection" || pattern == "blast protect" || pattern == "blast" {
-                t_lower.contains("blast")
-            } else if pattern == "unbreaking" {
-                t_lower.contains("unbreaking")
-            } else if pattern == "mending" {
-                t_lower.contains("mending")
-            } else {
-                let pat_clean = pattern.strip_prefix("minecraft:").unwrap_or(&pattern).replace('_', " ");
-                t_lower.contains(&pattern) || t_lower.contains(&pat_clean)
-            };
-
-            if !has_base {
-                return false;
-            }
-
-            if min_level <= 1 {
-                return true;
-            }
-
-            let tokens: Vec<&str> = t_lower.split(|c: char| !c.is_alphanumeric() && c != 'ⅱ' && c != 'ⅲ' && c != 'ⅳ' && c != 'ⅴ').collect();
-            match min_level {
-                2 => tokens.iter().any(|&t| t == "ii" || t == "2" || t == "ⅱ"),
-                3 => tokens.iter().any(|&t| t == "iii" || t == "3" || t == "ⅲ"),
-                4 => tokens.iter().any(|&t| t == "iv" || t == "4" || t == "ⅳ"),
-                5 => tokens.iter().any(|&t| t == "v" || t == "5" || t == "ⅴ"),
-                _ => false,
-            }
+                let level_index = if tokens.get(level_index).is_some_and(|next| matches!(*next, "level" | "lvl")) {
+                    level_index + 1
+                } else {
+                    level_index
+                };
+                match &tokens[level_index..] {
+                    [] | ["book"] => min_level <= 1,
+                    [level] | [level, "book"] => parse_displayed_level(level)
+                        .is_some_and(|level| level >= min_level),
+                    _ => false,
+                }
+            })
         };
 
         // Custom name is checked only for books (e.g. "Protection IV Book"), NEVER for armor
-        if self.kind.contains("Book") {
+        if matches!(self.kind.to_ascii_lowercase().as_str(), "book" | "enchantedbook") {
             if let Some(ref name) = self.custom_name {
                 if matches_text(name) {
                     return true;
@@ -105,6 +125,17 @@ impl ItemInfo {
         // debug representations which caused false-positive matches on unenchanted armor.
 
         false
+    }
+}
+
+fn parse_displayed_level(token: &str) -> Option<u32> {
+    match token {
+        "i" => Some(1),
+        "ii" => Some(2),
+        "iii" => Some(3),
+        "iv" => Some(4),
+        "v" => Some(5),
+        _ => token.parse::<u32>().ok(),
     }
 }
 
@@ -443,68 +474,46 @@ fn parse_enchantment_map(val: &Value, target: &mut HashMap<String, u32>) {
 // ---------------------------------------------------------
 
 pub fn is_unbreaking_3(info: &ItemInfo) -> bool {
-    let is_book = info.kind.contains("EnchantedBook")
-        || info.kind.contains("Book")
-        || info.custom_name.as_deref().unwrap_or("").to_lowercase().contains("book")
-        || info.lore.iter().any(|l| l.to_lowercase().contains("book"));
-    (is_book || info.kind.to_lowercase().contains("paper"))
-        && info.has_enchantment("unbreaking", 3)
+    is_book_or_paper(info) && info.has_enchantment("unbreaking", 3)
 }
 
 pub fn is_mending(info: &ItemInfo) -> bool {
-    let is_book = info.kind.contains("EnchantedBook")
-        || info.kind.contains("Book")
-        || info.custom_name.as_deref().unwrap_or("").to_lowercase().contains("book")
-        || info.lore.iter().any(|l| l.to_lowercase().contains("book"));
-    (is_book || info.kind.to_lowercase().contains("paper"))
-        && info.has_enchantment("mending", 1)
+    is_book_or_paper(info) && info.has_enchantment("mending", 1)
 }
 
 pub fn is_protection_4(info: &ItemInfo) -> bool {
-    let is_book = info.kind.contains("EnchantedBook")
-        || info.kind.contains("Book")
-        || info.custom_name.as_deref().unwrap_or("").to_lowercase().contains("book")
-        || info.lore.iter().any(|l| l.to_lowercase().contains("book"));
-    (is_book || info.kind.to_lowercase().contains("paper"))
+    is_book_or_paper(info)
         && !info.has_enchantment("blast_protection", 1)
         && info.has_enchantment("protection", 4)
 }
 
 pub fn is_blast_protection_4(info: &ItemInfo) -> bool {
-    let is_book = info.kind.contains("EnchantedBook")
-        || info.kind.contains("Book")
-        || info.custom_name.as_deref().unwrap_or("").to_lowercase().contains("book")
-        || info.lore.iter().any(|l| l.to_lowercase().contains("book"));
-    (is_book || info.kind.to_lowercase().contains("paper"))
+    is_book_or_paper(info)
         && (info.has_enchantment("blast_protection", 4) || info.has_enchantment("blast protect", 4))
+}
+
+fn is_book_or_paper(info: &ItemInfo) -> bool {
+    matches!(info.kind.to_ascii_lowercase().as_str(), "book" | "enchantedbook" | "paper")
 }
 
 pub fn is_diamond_helmet(info: &ItemInfo) -> bool {
     let k = info.kind.to_lowercase();
-    let name = info.custom_name.as_deref().unwrap_or("").to_lowercase();
-    (k.contains("diamond") || name.contains("diamond"))
-        && (k.contains("helmet") || name.contains("helmet"))
+    k == "diamondhelmet" || k == "diamond_helmet"
 }
 
 pub fn is_diamond_chestplate(info: &ItemInfo) -> bool {
     let k = info.kind.to_lowercase();
-    let name = info.custom_name.as_deref().unwrap_or("").to_lowercase();
-    (k.contains("diamond") || name.contains("diamond"))
-        && (k.contains("chestplate") || name.contains("chestplate") || k.contains("chest") || name.contains("chest"))
+    k == "diamondchestplate" || k == "diamond_chestplate"
 }
 
 pub fn is_diamond_leggings(info: &ItemInfo) -> bool {
     let k = info.kind.to_lowercase();
-    let name = info.custom_name.as_deref().unwrap_or("").to_lowercase();
-    (k.contains("diamond") || name.contains("diamond"))
-        && (k.contains("leggings") || name.contains("leggings") || k.contains("legs") || name.contains("legs"))
+    k == "diamondleggings" || k == "diamond_leggings"
 }
 
 pub fn is_diamond_boots(info: &ItemInfo) -> bool {
     let k = info.kind.to_lowercase();
-    let name = info.custom_name.as_deref().unwrap_or("").to_lowercase();
-    (k.contains("diamond") || name.contains("diamond"))
-        && (k.contains("boots") || name.contains("boots"))
+    k == "diamondboots" || k == "diamond_boots"
 }
 
 pub fn is_diamond_armor(info: &ItemInfo) -> bool {
@@ -516,19 +525,7 @@ pub fn is_diamond_armor(info: &ItemInfo) -> bool {
 
 pub fn is_xp_bottle(info: &ItemInfo) -> bool {
     let k = info.kind.to_lowercase();
-    let name = info.custom_name.as_deref().unwrap_or("").to_lowercase();
-    let in_lore = info.lore.iter().any(|l| {
-        let ll = l.to_lowercase();
-        ll.contains("bottle") || ll.contains("experience") || ll.contains("enchanting")
-    });
-    k.contains("experiencebottle")
-        || k.contains("experience_bottle")
-        || k.contains("expbottle")
-        || k.contains("exp_bottle")
-        || name.contains("bottle")
-        || name.contains("enchanting")
-        || name.contains("experience")
-        || in_lore
+    matches!(k.as_str(), "experiencebottle" | "experience_bottle" | "expbottle" | "exp_bottle")
 }
 
 pub fn is_anvil(info: &ItemInfo) -> bool {
@@ -805,6 +802,93 @@ mod tests {
             ..Default::default()
         };
         assert!(is_unbreaking_3(&book_with_unicode), "Should match Unbreaking III with Unicode Roman numeral");
+    }
+
+    #[test]
+    fn displayed_level_must_belong_to_the_enchantment() {
+        let info = ItemInfo {
+            kind: "Book".to_string(),
+            count: 1,
+            lore: vec![
+                "Protection I, Unbreaking IV".to_string(),
+                "Unbreaking III".to_string(),
+                "Mending".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert!(!info.has_enchantment("protection", 4));
+        assert!(!info.has_enchantment("unbreaking", 4));
+
+        let stronger = ItemInfo {
+            lore: vec!["Protection V".to_string()],
+            ..info
+        };
+        assert!(stronger.has_enchantment("protection", 4));
+
+        let negated = ItemInfo {
+            kind: "Book".to_string(),
+            lore: vec!["No Mending".to_string()],
+            ..Default::default()
+        };
+        assert!(!negated.has_enchantment("mending", 1));
+
+        for misleading in ["Mending 0", "Mending unavailable"] {
+            let book = ItemInfo {
+                kind: "Book".to_string(),
+                lore: vec![misleading.to_string()],
+                ..Default::default()
+            };
+            assert!(!book.has_enchantment("mending", 1));
+        }
+    }
+
+    #[test]
+    fn armor_lore_does_not_prove_applied_enchantments() {
+        let info = ItemInfo {
+            kind: "DiamondHelmet".to_string(),
+            count: 1,
+            lore: vec![
+                "Protection IV".to_string(),
+                "Unbreaking III".to_string(),
+                "Mending".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert!(!info.has_enchantment("protection", 4));
+        assert!(!crate::armor::is_complete(&info));
+    }
+
+    #[test]
+    fn item_kind_cannot_be_spoofed_by_custom_name_or_lore() {
+        let renamed = ItemInfo {
+            kind: "Dirt".to_string(),
+            count: 1,
+            custom_name: Some("Diamond Helmet XP Bottle Mending Book".to_string()),
+            lore: vec![
+                "Protection IV".to_string(),
+                "Unbreaking III".to_string(),
+                "Mending".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert!(!is_diamond_helmet(&renamed));
+        assert!(!is_mending(&renamed));
+        assert!(!is_xp_bottle(&renamed));
+        assert!(!crate::armor::is_complete(&renamed));
+
+        let actual_helmet = ItemInfo {
+            kind: "DiamondHelmet".to_string(),
+            custom_name: Some("A very different name".to_string()),
+            ..Default::default()
+        };
+        assert!(is_diamond_helmet(&actual_helmet));
+
+        let mut stored_only_helmet = actual_helmet;
+        stored_only_helmet.stored_enchantments.insert("protection".to_string(), 4);
+        stored_only_helmet.stored_enchantments.insert("unbreaking".to_string(), 3);
+        stored_only_helmet.stored_enchantments.insert("mending".to_string(), 1);
+        assert!(!stored_only_helmet.has_enchantment("protection", 4));
+        assert!(!crate::armor::is_complete(&stored_only_helmet));
     }
 }
 

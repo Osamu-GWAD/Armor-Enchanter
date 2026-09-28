@@ -20,6 +20,12 @@ pub struct StockAudit {
 
 impl StockAudit {
     pub fn start_scan(&mut self) {
+        self.empty.clear();
+        self.continue_scan();
+    }
+
+    /// Reopening after Collect continues the audit while other listings are checked.
+    pub fn continue_scan(&mut self) {
         self.pages.clear();
         self.selected = None;
         self.collect_since = None;
@@ -59,17 +65,14 @@ impl StockAudit {
     pub fn is_empty(&self, page: usize, listing: &OrderListing) -> bool {
         self.empty.iter().any(|(p, entry, time)| {
             *p == page
-                && entry.slot == listing.slot
-                && entry.name == listing.name
-                && (entry.icon.is_empty() == listing.icon.is_empty())
+                && entry == listing
                 && time.elapsed() < Duration::from_secs(45)
         })
     }
 
-    pub fn collection_finished(&mut self, empty: bool) {
-        if empty {
-            self.confirm_empty();
-        }
+    /// A successful claim can empty its screen; only an explicit no-items reply
+    /// proves the selected listing was empty.
+    pub fn collection_finished(&mut self) {
         self.selected = None;
         self.collect_since = None;
     }
@@ -122,17 +125,29 @@ mod tests {
     }
 
     #[test]
-    fn empty_collect_screen_confirms_stock_and_success_cancels_pending_chat() {
+    fn explicit_no_items_response_confirms_stock_and_success_cancels_pending_chat() {
         let mut audit = StockAudit::default();
         audit.observe_page(0, vec![listing(1)], false);
         audit.select(0, listing(1));
         audit.collect_requested();
-        audit.collection_finished(true);
+        assert!(audit.confirm_empty().is_some());
         assert!(audit.confirmed_unavailable("Experience Bottles", 0));
         assert!(audit.confirm_empty().is_none());
         audit.select(0, listing(2));
         audit.collect_requested();
-        audit.collection_finished(false);
+        audit.collection_finished();
+        assert!(audit.confirm_empty().is_none());
+    }
+
+    #[test]
+    fn successful_claim_does_not_mark_its_listing_empty() {
+        let mut audit = StockAudit::default();
+        audit.observe_page(0, vec![listing(1)], false);
+        audit.select(0, listing(1));
+        audit.collect_requested();
+        audit.collection_finished();
+        assert!(!audit.is_empty(0, &listing(1)));
+        assert!(!audit.confirmed_unavailable("Experience Bottles", 0));
         assert!(audit.confirm_empty().is_none());
     }
 
@@ -183,7 +198,7 @@ mod tests {
     }
 
     #[test]
-    fn unrequested_chat_stale_evidence_and_changed_listings_cannot_alert() {
+    fn unrequested_chat_and_new_scan_cannot_reuse_empty_evidence() {
         let mut audit = StockAudit::default();
         audit.select(0, listing(1));
         assert!(audit.confirm_empty().is_none());
@@ -191,12 +206,39 @@ mod tests {
         assert!(audit.confirm_empty().is_some());
         audit.observe_page(0, vec![listing(1)], false);
         assert!(audit.confirmed_unavailable("Experience Bottles", 0));
+        audit.start_scan();
+        audit.observe_page(0, vec![listing(1)], false);
+        assert!(!audit.confirmed_unavailable("Experience Bottles", 0));
+    }
+
+    #[test]
+    fn continuing_scan_skips_only_the_exact_empty_listing() {
+        use azalea_registry::builtin::ItemKind;
+        let mut audit = StockAudit::default();
+        let first = OrderListing {
+            icon: ItemStack::new(ItemKind::ExperienceBottle, 1),
+            ..listing(1)
+        };
+        let second = OrderListing { slot: 2, ..first.clone() };
+        audit.select(0, first.clone());
+        audit.collect_requested();
+        assert_eq!(audit.confirm_empty().as_deref(), Some("Experience Bottles"));
+        audit.continue_scan();
+        audit.observe_page(0, vec![first.clone(), second.clone()], false);
+        assert!(audit.is_empty(0, &first));
+        assert!(!audit.is_empty(0, &second));
+        assert!(!audit.confirmed_unavailable("Experience Bottles", 0));
+
+        let changed = OrderListing {
+            icon: ItemStack::new(ItemKind::ExperienceBottle, 2),
+            ..first.clone()
+        };
+        audit.observe_page(0, vec![changed.clone()], false);
+        assert!(!audit.is_empty(0, &changed));
+        assert!(!audit.confirmed_unavailable("Experience Bottles", 0));
         audit.empty[0].2 = Instant::now() - Duration::from_secs(46);
-        assert!(!audit.confirmed_unavailable("Experience Bottles", 0));
-        audit.empty[0].2 = Instant::now();
-        let mut changed = listing(1);
-        changed.icon = ItemStack::new(azalea_registry::builtin::ItemKind::ExperienceBottle, 1);
-        audit.observe_page(0, vec![changed], false);
-        assert!(!audit.confirmed_unavailable("Experience Bottles", 0));
+        assert!(!audit.is_empty(0, &first));
+        audit.continue_scan();
+        assert!(audit.empty.is_empty());
     }
 }

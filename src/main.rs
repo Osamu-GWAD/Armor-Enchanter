@@ -5,11 +5,12 @@ pub mod enchanter;
 pub mod gui;
 pub mod nbt;
 pub mod webhook;
+mod xp;
 
 use azalea::app::PluginGroup;
 use azalea::prelude::*;
 use azalea::protocol::packets::game::{ClientboundGamePacket, ServerboundContainerClose};
-use azalea::{Client, Event};
+use azalea::{BlockPos, Client, Event};
 use clap::Parser;
 use enchanter::{smooth_look, swing_arm, EnchanterManager};
 use gui::{GuiManager, OrderWorkflowState, WithdrawalPhase, WithdrawalQuota};
@@ -22,7 +23,7 @@ use tracing_subscriber::FmtSubscriber;
 static GLOBAL_QUOTA: OnceLock<WithdrawalQuota> = OnceLock::new();
 static GLOBAL_ORDER_TARGET: OnceLock<String> = OnceLock::new();
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about = "Minecraft Auto-Enchanter Bot with Token Support & GUI Automation", long_about = None)]
 struct Args {
     /// Server address to connect to (e.g., donutsmp.net)
@@ -37,7 +38,7 @@ struct Args {
     #[arg(short, long, env = "MC_TOKEN", hide_env_values = true)]
     token: Option<String>,
 
-    /// Username for offline-mode authentication (if no token is provided)
+    /// Offline username; takes priority over other credentials unless an account is selected
     #[arg(long)]
     offline: Option<String>,
 
@@ -45,7 +46,7 @@ struct Args {
     #[arg(long)]
     microsoft: Option<String>,
 
-    /// Account index or identifier to select when multiple accounts are configured in .env (e.g. 0, 1, email, or "all")
+    /// Zero-based account index or configured email/name (or "all")
     #[arg(short, long, env = "ACCOUNT")]
     account: Option<String>,
 
@@ -105,6 +106,7 @@ struct BotState {
     spawned: Arc<Mutex<bool>>,
     order_sent: Arc<Mutex<bool>>,
     inventory_updated: Arc<Notify>,
+    xp_inventory: Arc<Mutex<xp::ServerInventory>>,
     experience_updated: Arc<Notify>,
     current_level: Arc<std::sync::atomic::AtomicU32>,
     experience_progress_milli: Arc<std::sync::atomic::AtomicU32>,
@@ -112,10 +114,58 @@ struct BotState {
     server_anvil_cost: Arc<std::sync::atomic::AtomicU32>,
     maintenance_active: Arc<std::sync::atomic::AtomicBool>,
     is_enchanting: Arc<std::sync::atomic::AtomicBool>,
+    verified_base_hopper: Arc<Mutex<Option<BlockPos>>>,
 }
 
 // Each account runs in its own process. Preserve transactions across reconnects.
 static SESSION_GUI: OnceLock<Arc<Mutex<GuiManager>>> = OnceLock::new();
+static SESSION_BASE_HOPPER: OnceLock<Arc<Mutex<Option<BlockPos>>>> = OnceLock::new();
+static FATAL_BASE_CONFIG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static EXPLICIT_BASE_HOPPER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn configured_base_hopper() -> anyhow::Result<Option<BlockPos>> {
+    fn read(name: &str) -> anyhow::Result<Option<String>> {
+        match std::env::var(name) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!("{name} must contain valid Unicode"),
+        }
+    }
+    parse_base_hopper_coordinates([
+        read("BASE_HOPPER_X")?,
+        read("BASE_HOPPER_Y")?,
+        read("BASE_HOPPER_Z")?,
+    ])
+}
+
+fn parse_base_hopper_coordinates(coordinates: [Option<String>; 3]) -> anyhow::Result<Option<BlockPos>> {
+    if coordinates.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    if coordinates.iter().any(Option::is_none) {
+        anyhow::bail!("Set all of BASE_HOPPER_X, BASE_HOPPER_Y, and BASE_HOPPER_Z together");
+    }
+    let parse = |index: usize| -> anyhow::Result<i32> {
+        coordinates[index].as_deref().unwrap().trim().parse::<i32>()
+            .map_err(|_| anyhow::anyhow!("{} must be an integer", ["BASE_HOPPER_X", "BASE_HOPPER_Y", "BASE_HOPPER_Z"][index]))
+    };
+    Ok(Some(BlockPos::new(parse(0)?, parse(1)?, parse(2)?)))
+}
+
+fn verified_hopper_in_reach(bot: &Client, anchor: &BlockPos) -> bool {
+    let pos = bot.position();
+    let dx = anchor.x as f64 + 0.5 - pos.x;
+    let dy = anchor.y as f64 + 0.5 - pos.y;
+    let dz = anchor.z as f64 + 0.5 - pos.z;
+    if (dx * dx + dy * dy + dz * dz).sqrt() > 2.85 {
+        return false;
+    }
+    let world_handle = bot.world();
+    let world = world_handle.read();
+    world.get_block_state(anchor.clone())
+        .map(|state| format!("{state:?}").to_ascii_lowercase().contains("hopper"))
+        .unwrap_or(false)
+}
 
 impl Default for BotState {
     fn default() -> Self {
@@ -144,6 +194,7 @@ impl Default for BotState {
             spawned: Arc::new(Mutex::new(false)),
             order_sent: Arc::new(Mutex::new(false)),
             inventory_updated: Arc::new(Notify::new()),
+            xp_inventory: Arc::new(Mutex::new(xp::ServerInventory::default())),
             experience_updated,
             current_level,
             experience_progress_milli,
@@ -151,6 +202,8 @@ impl Default for BotState {
             server_anvil_cost,
             maintenance_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             is_enchanting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            verified_base_hopper: SESSION_BASE_HOPPER
+                .get_or_init(|| Arc::new(Mutex::new(None))).clone(),
         }
     }
 }
@@ -197,71 +250,31 @@ async fn handle(bot: Client, event: Event, state: BotState) -> Result<(), anyhow
                     info!("Waiting 30 ticks (~1.5s) for server spawn cooldown before sending commands...");
                     bot_clone.wait_ticks(30).await;
 
-                    // Teleport to player base using /home 1 so block interactions (anvil) are in non-protected territory
-                    let initial_pos = bot_clone.position();
-                    info!("Initial spawn position: {:?}", initial_pos);
+                    let current_pos = bot_clone.position();
+                    info!("Bot position on spawn: {:?}", current_pos);
 
-                    let mut at_base = {
-                        let mut ench = state_clone.enchanter.lock().await;
-                        ench.check_if_anvil_placed(&bot_clone).await || EnchanterManager::find_nearby_hopper(&bot_clone).is_some()
+                    let known_hopper = state_clone.verified_base_hopper.lock().await.clone();
+                    let base_hopper = if let Some(ref anchor) = known_hopper {
+                        verified_hopper_in_reach(&bot_clone, anchor).then(|| anchor.clone())
+                    } else {
+                        EnchanterManager::find_nearby_hopper(&bot_clone)
                     };
 
-                    if !at_base {
-                        for attempt in 1..=15 {
-                            info!("Teleporting to base via /home 1 (attempt {attempt}/15)...");
-                            state_clone.maintenance_active.store(false, std::sync::atomic::Ordering::SeqCst);
-                            gui::send_command(&bot_clone, "/home 1");
-                            bot_clone.wait_ticks(30).await; // 1.5s for teleport settle
-
-                            let current_pos = bot_clone.position();
-                            let dist = (current_pos - initial_pos).length();
-                            let base_blocks = {
-                                let mut ench = state_clone.enchanter.lock().await;
-                                ench.check_if_anvil_placed(&bot_clone).await || EnchanterManager::find_nearby_hopper(&bot_clone).is_some()
-                            };
-
-                            if dist > 5.0 || base_blocks {
-                                info!("Arrived at base! Position after /home 1: {:?} (distance from spawn: {:.1})", current_pos, dist);
-                                at_base = true;
-                                break;
-                            }
-
-                            if state_clone.maintenance_active.load(std::sync::atomic::Ordering::SeqCst) {
-                                warn!("Destination area in maintenance; waiting 10 seconds before retrying /home 1...");
-                                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                            } else {
-                                if attempt >= 3 && attempt % 2 == 1 {
-                                    info!("Trying fallback '/home' command (attempt {attempt}/15)...");
-                                    gui::send_command(&bot_clone, "/home");
-                                    bot_clone.wait_ticks(30).await;
-                                    let pos2 = bot_clone.position();
-                                    if (pos2 - initial_pos).length() > 5.0 {
-                                        info!("Arrived at base via /home! Position: {:?}", pos2);
-                                        at_base = true;
-                                        break;
-                                    }
-                                }
-                                bot_clone.wait_ticks(40).await;
-                            }
+                    if let Some(hopper_pos) = base_hopper {
+                        info!("Verified base hopper at {:?}", hopper_pos);
+                        if known_hopper.is_none() {
+                            *state_clone.verified_base_hopper.lock().await = Some(hopper_pos);
                         }
+                    } else {
+                        info!("No nearby hopper found; operating from current position.");
                     }
-
-                    if !at_base {
-                        error!("Could not teleport to base (/home 1 failed or destination in maintenance). Current position: {:?}.", bot_clone.position());
-                        error!("Aborting startup to prevent withdrawing items in an unsafe/protected location. Disconnecting...");
-                        bot_clone.disconnect();
-                        return;
-                    }
-
-                    let current_pos = bot_clone.position();
-                    info!("Verified at base position: {:?}", current_pos);
 
                     let resume_drop = {
                         let gui = state_clone.gui.lock().await;
                         gui.next_drop > 0 || gui.pending_drop.is_some()
                             || gui.count_completed_max_sets(Some(&bot_clone)) > 0
                     };
-                    if resume_drop && !drop_enchanted_armor_in_hopper(&bot_clone, &state_clone).await {
+                    if resume_drop && !deposit_enchanted_armor_in_hopper(&bot_clone, &state_clone).await {
                         bot_clone.disconnect();
                         return;
                     }
@@ -289,22 +302,22 @@ async fn handle(bot: Client, event: Event, state: BotState) -> Result<(), anyhow
                         crate::enchanter::EnchanterManager::ensure_anvils_in_offhand(&bot_clone, &mut gui.player_inventory).await;
                     }
 
-                    let anvil_count = {
+                    let (anvil_count, required_anvils) = {
                         let gui = state_clone.gui.lock().await;
-                        gui.player_inventory.values().filter_map(|item| {
+                        let count = gui.player_inventory.values().filter_map(|item| {
                             inspect_item_with_bot(item, Some(&bot_clone))
                                 .filter(|info| is_anvil(info))
                                 .map(|info| info.count as u32)
-                        }).sum::<u32>()
+                        }).sum::<u32>();
+                        (count, gui.quota.anvils_needed)
                     };
 
-                    info!("Initial base check: placed anvil = {anvil_placed}, inventory anvil count = {anvil_count}");
+                    info!("Initial base check: placed anvil = {anvil_placed}, inventory anvil count = {anvil_count}, quota = {required_anvils}");
 
-                    if anvil_count < 2 {
-                        info!("Bot has {anvil_count} anvil(s) (< 2, or anvil == 1). Starting Phase 1: Anvil Placement (looking down at feet & withdrawing Anvil from /order)...");
+                    if anvil_count < required_anvils {
+                        info!("Bot has {anvil_count}/{required_anvils} anvil(s). Starting Phase 1: Anvil Placement (looking down at feet & withdrawing Anvil from /order)...");
                         let mut gui = state_clone.gui.lock().await;
                         gui.phase = WithdrawalPhase::AnvilPlacement;
-                        gui.anvil_stack_dropped = false;
                     } else if anvil_placed {
                         info!("Anvil is already placed on the ground and bot has {anvil_count} anvils! Proceeding to Phase 2: Items Retrieval.");
                         let mut gui = state_clone.gui.lock().await;
@@ -463,6 +476,8 @@ async fn handle(bot: Client, event: Event, state: BotState) -> Result<(), anyhow
                 let mut gui = state.gui.lock().await;
                 gui.state = OrderWorkflowState::Spawned;
                 gui.current_container_id = 0;
+                gui.hopper_active = false;
+                gui.hopper_container_id = None;
                 gui.action_in_progress = false;
                 gui.current_slots.clear();
                 gui.player_inventory.clear();
@@ -480,6 +495,20 @@ async fn handle_packet(bot: &Client, packet: &Arc<ClientboundGamePacket>, state:
         ClientboundGamePacket::OpenScreen(p) => {
             let title = p.title.to_string();
             let clean_title = title.to_lowercase();
+
+            {
+                let mut gui = state.gui.lock().await;
+                if gui.hopper_active {
+                    if p.menu_type == azalea_registry::builtin::MenuKind::Hopper {
+                        gui.on_open_screen(p.container_id, &title);
+                        gui.hopper_container_id = Some(p.container_id);
+                    } else {
+                        bot.write_packet(ServerboundContainerClose { container_id: p.container_id });
+                    }
+                    state.inventory_updated.notify_one();
+                    return;
+                }
+            }
 
             if clean_title.contains("repair") || clean_title.contains("anvil") || clean_title.contains("name") {
                 let mut ench = state.enchanter.lock().await;
@@ -509,7 +538,7 @@ async fn handle_packet(bot: &Client, packet: &Arc<ClientboundGamePacket>, state:
                 let mut gui = state.gui.lock().await;
                 gui.on_set_content(p.container_id, p.state_id, &p.items, Some(bot));
 
-                if p.container_id > 0 {
+                if p.container_id > 0 && !gui.hopper_active {
                     let is_enchanting = state.is_enchanting.load(std::sync::atomic::Ordering::SeqCst);
                     if !gui.is_fulfilling_target && (is_enchanting || gui.phase == WithdrawalPhase::Done || gui.state == OrderWorkflowState::WithdrawalComplete) {
                         bot.write_packet(ServerboundContainerClose { container_id: p.container_id });
@@ -532,7 +561,7 @@ async fn handle_packet(bot: &Client, packet: &Arc<ClientboundGamePacket>, state:
             let should_pump = {
                 let mut gui = state.gui.lock().await;
                 gui.on_set_slot(p.container_id, p.state_id, p.slot as i16, &p.item_stack, Some(bot));
-                container_id > 0 && container_id == gui.current_container_id && !gui.awaiting_response
+                container_id > 0 && container_id == gui.current_container_id && !gui.awaiting_response && !gui.hopper_active
             };
 
             if should_pump {
@@ -602,6 +631,7 @@ async fn handle_packet(bot: &Client, packet: &Arc<ClientboundGamePacket>, state:
                 let mut gui = state.gui.lock().await;
                 if gui.current_container_id == p.container_id {
                     gui.current_container_id = 0;
+                    gui.hopper_container_id = None;
                     gui.current_slots.clear();
                     gui.record_action_sent(None, None);
                 }
@@ -616,6 +646,8 @@ async fn handle_packet(bot: &Client, packet: &Arc<ClientboundGamePacket>, state:
         }
         _ => {}
     }
+    // Publish only after the normal caches have received the same server packet.
+    state.xp_inventory.lock().await.observe(packet.as_ref());
     state.inventory_updated.notify_one();
 }
 
@@ -628,18 +660,18 @@ async fn pump_gui_actions(bot_clone: Client, state_clone: BotState, expected: Op
     if expected.is_some_and(|(id, epoch)| g.current_container_id != id || g.gui_action_epoch != epoch) {
         return;
     }
-    if g.current_container_id == 0 || g.current_slots.is_empty() || g.awaiting_response { return; }
+    if g.hopper_active || g.current_container_id == 0 || g.current_slots.is_empty() || g.awaiting_response { return; }
     let was_selling = g.state == OrderWorkflowState::SellingInventory;
     let done = g.process_gui_actions(&bot_clone).await;
     if was_selling { return; }
 
     // Check if Phase 1 (AnvilPlacement) completed
-    if g.phase == WithdrawalPhase::AnvilPlacement && (g.anvil_stack_dropped || g.collected.anvils >= 2) {
+    if g.phase == WithdrawalPhase::AnvilPlacement && g.anvil_withdrawal_complete() {
         g.phase = WithdrawalPhase::ItemsRetrieval;
         g.state = OrderWorkflowState::WaitingForNextOrder;
-        info!("Phase 1 completed: Anvil stack handled! Ensuring anvils in offhand...");
-        crate::enchanter::EnchanterManager::ensure_anvils_in_offhand(&bot_clone, &mut g.player_inventory).await;
+        info!("Phase 1 completed: Anvil inventory quota confirmed! Ensuring anvils in offhand...");
         g.close_current_gui(&bot_clone);
+        crate::enchanter::EnchanterManager::ensure_anvils_in_offhand(&bot_clone, &mut g.player_inventory).await;
         let player_inv = g.player_inventory.clone();
         drop(g);
 
@@ -657,17 +689,16 @@ async fn pump_gui_actions(bot_clone: Client, state_clone: BotState, expected: Op
             if placed {
                 info!("Anvil verified placed in world! Ready for Phase 2.");
             } else {
-                warn!("Warning: Anvil placement verification failed after withdrawal! Checking /home 1...");
-                gui::send_command(&bot_clone, "/home 1");
-                bot_clone.wait_ticks(30).await;
+                warn!("Warning: Anvil placement verification failed after withdrawal! Retrying placement...");
+                bot_clone.wait_ticks(10).await;
                 let placed2 = {
                     let mut ench = state_clone.enchanter.lock().await;
                     ench.place_anvil(&bot_clone, &player_inv).await
                 };
                 if placed2 {
-                    info!("Anvil verified placed successfully after /home 1! Ready for Phase 2.");
+                    info!("Anvil verified placed successfully! Ready for Phase 2.");
                 } else {
-                    warn!("Anvil placement could not be verified after /home 1; proceeding to items retrieval.");
+                    warn!("Anvil placement could not be verified; proceeding to items retrieval.");
                 }
             }
         } else {
@@ -750,13 +781,12 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
                 });
 
                 if has_anvil {
-                    warn!("Player has an anvil in inventory but placement failed. Running /home 1 and retrying placement...");
-                    gui::send_command(&bot_ench, "/home 1");
-                    bot_ench.wait_ticks(30).await;
+                    warn!("Player has an anvil in inventory but placement failed. Retrying placement...");
+                    bot_ench.wait_ticks(10).await;
                     let mut ench = state_clone.enchanter.lock().await;
                     let placed2 = ench.place_anvil(&bot_ench, &player_inv).await;
                     if !placed2 {
-                        error!("Anvil placement still failed after /home 1. Disconnecting bot to prevent loop.");
+                        error!("Anvil placement still failed. Disconnecting bot to prevent loop.");
                         state_clone.is_enchanting.store(false, std::sync::atomic::Ordering::SeqCst);
                         bot_ench.disconnect();
                         return;
@@ -830,7 +860,6 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
                             bot_ench.wait_ticks(2).await;
                             let mut gui = state_clone.gui.lock().await;
                             gui.phase = WithdrawalPhase::AnvilPlacement;
-                            gui.anvil_stack_dropped = false;
                             gui.state = OrderWorkflowState::Spawned;
                             gui.prepare_to_send_command(&bot_ench, "/order");
                             return;
@@ -869,21 +898,18 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
 
                 if let Some(ref cursed_book) = discard_item {
                     info!("[CURSED BOOK] Discarding cursed book into hopper...");
-                    let dropped = drop_cursed_book_in_hopper(&bot_ench, &state_clone, cursed_book, discard_slot).await;
+                    let dropped = deposit_cursed_book_in_hopper(&bot_ench, &state_clone, cursed_book, discard_slot).await;
                     if dropped {
                         info!("[CURSED BOOK] Successfully discarded cursed book into hopper.");
                     } else {
                         warn!("[CURSED BOOK] Failed to confirm cursed book left inventory.");
-                    }
-                    if let Some(slot) = discard_slot {
-                        let mut ench = state_clone.enchanter.lock().await;
-                        ench.cursed_inventory_slots.insert(slot);
                     }
                     // Check if another book for this armor piece is already available in inventory
                     let gui_inv = state_clone.gui.lock().await.player_inventory.clone();
                     let has_another_book = {
                         let mut ench = state_clone.enchanter.lock().await;
                         ench.player_inventory = gui_inv;
+                        ench.record_book_disposal(cursed_book, dropped);
                         ench.has_available_book_for_current_armor(&bot_ench)
                     };
                     if has_another_book {
@@ -898,28 +924,18 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
                 }
 
                 if let Some(target) = xp_target {
-                    // The worker shares XP atomics, while packet handlers retain access
-                    // to the main enchanter inventory and can process XP updates promptly.
-                    let mut worker = EnchanterManager::new();
-                    worker.player_inventory = state_clone.enchanter.lock().await.player_inventory.clone();
-                    worker.current_level = state_clone.current_level.clone();
-                    worker.experience_progress_milli = state_clone.experience_progress_milli.clone();
-                    worker.total_experience = state_clone.total_experience.clone();
-                    worker.experience_updated = state_clone.experience_updated.clone();
-                    worker.throw_exact_xp_bottles(&bot_ench, target).await;
-                    {
-                        let mut ench = state_clone.enchanter.lock().await;
-                        ench.player_inventory = worker.player_inventory.clone();
-                    }
-                    {
-                        let mut gui = state_clone.gui.lock().await;
-                        gui.player_inventory = worker.player_inventory.clone();
-                        gui.sync_collected_from_inventory(Some(&bot_ench));
-                    }
-                    if worker.get_level_and_progress().0 < target {
-                        warn!("XP could not reach level {target}; returning to inventory reconciliation.");
-                        info!("Checking /order for XP bottles before considering an out-of-stock alert.");
-                        break;
+                    match xp::throw_bottles(&bot_ench, &state_clone, target).await {
+                        xp::Outcome::Reached => {}
+                        xp::Outcome::OutOfBottles => {
+                            warn!("Server inventory has no XP bottles; returning to orders for restocking.");
+                            break;
+                        }
+                        xp::Outcome::Unconfirmed => {
+                            warn!("XP action was not confirmed; reconnecting to reconcile inventory.");
+                            state_clone.is_enchanting.store(false, std::sync::atomic::Ordering::SeqCst);
+                            bot_ench.disconnect();
+                            return;
+                        }
                     }
                 }
 
@@ -945,10 +961,10 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
             }
             bot_ench.wait_ticks(2).await;
 
-            // 6. Drop enchanted armor into the nearest hopper within 2 blocks
+            // 6. Transfer enchanted armor through the nearest hopper GUI
             let ready = state_clone.enchanter.lock().await.check_all_armor_enchanted(&bot_ench).0;
-            if ready && !drop_enchanted_armor_in_hopper(&bot_ench, &state_clone).await {
-                error!("Drop not confirmed; retaining current set for recovery.");
+            if ready && !deposit_enchanted_armor_in_hopper(&bot_ench, &state_clone).await {
+                error!("Hopper transfer not confirmed; retaining current set for recovery.");
                 state_clone.is_enchanting.store(false, std::sync::atomic::Ordering::SeqCst);
                 bot_ench.disconnect();
                 return;
@@ -986,22 +1002,21 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
             let mut ench = state_clone.enchanter.lock().await;
             ench.reset_for_next_batch();
         }
-        let anvil_count = {
+        let (anvil_count, required_anvils) = {
             let mut gui = state_clone.gui.lock().await;
             gui.reset_and_sync_inventory(Some(&bot_ench));
             crate::enchanter::EnchanterManager::ensure_anvils_in_offhand(&bot_ench, &mut gui.player_inventory).await;
-            gui.collected.anvils
+            (gui.collected.anvils, gui.quota.anvils_needed)
         };
 
-        if anvil_count < 2 {
-            info!("Bot has {anvil_count} anvil(s) (< 2, or anvil == 1). Looking completely down at feet (pitch: 90.0) and running /order...");
+        if anvil_count < required_anvils {
+            info!("Bot has {anvil_count}/{required_anvils} anvil(s). Looking completely down at feet (pitch: 90.0) and running /order...");
             crate::enchanter::smooth_look(&bot_ench, bot_ench.direction().y_rot(), 90.0).await;
             bot_ench.set_direction(bot_ench.direction().y_rot(), 90.0);
             bot_ench.wait_ticks(2).await;
 
             let mut gui = state_clone.gui.lock().await;
             gui.phase = WithdrawalPhase::AnvilPlacement;
-            gui.anvil_stack_dropped = false;
             gui.state = OrderWorkflowState::Spawned;
             gui.prepare_to_send_command(&bot_ench, "/order");
         } else {
@@ -1016,239 +1031,196 @@ async fn trigger_enchanting_routine(bot: &Client, state: &BotState) {
 }
 
 /// Discard only the exact cursed book rejected by the anvil, after the server returns it to inventory.
-async fn drop_cursed_book_in_hopper(
+/// Open a real hopper menu and wait for its full server inventory snapshot.
+async fn open_hopper(bot: &Client, state: &BotState) -> bool {
+    use azalea::inventory::ItemStack;
+    use azalea_registry::builtin::ItemKind;
+
+    let Some(hopper_pos) = EnchanterManager::find_nearby_hopper(bot) else {
+        error!("No hopper within 2 blocks; keeping items in inventory.");
+        return false;
+    };
+    {
+        let mut gui = state.gui.lock().await;
+        gui.close_current_gui(bot);
+        gui.hopper_active = true;
+        // Never select XP, armor, or a placeable item to open the hopper.
+        let safe_hotbar = (0..9u8).find(|h| matches!(gui.player_inventory.get(&(36 + *h as i16)), Some(ItemStack::Empty)))
+            .or_else(|| (0..9u8).find(|h| matches!(gui.player_inventory.get(&(36 + *h as i16)),
+                Some(ItemStack::Present(data)) if data.kind == ItemKind::EnchantedBook || data.kind == ItemKind::Book)));
+        let Some(hotbar) = safe_hotbar else {
+            warn!("No empty or book hotbar slot available to open the hopper safely.");
+            return false;
+        };
+        bot.set_selected_hotbar_slot(hotbar);
+    }
+    let pos = bot.position();
+    let dx = hopper_pos.x as f64 + 0.5 - pos.x;
+    let dz = hopper_pos.z as f64 + 0.5 - pos.z;
+    let dy = hopper_pos.y as f64 + 0.5 - (pos.y + 1.62);
+    smooth_look(bot, (-dx).atan2(dz).to_degrees() as f32,
+        (-dy).atan2((dx * dx + dz * dz).sqrt()).to_degrees() as f32).await;
+    bot.wait_ticks(1).await;
+    bot.block_interact(hopper_pos);
+    swing_arm(bot);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if !*state.spawned.lock().await { return false; }
+        {
+            let gui = state.gui.lock().await;
+            if gui.hopper_container_id == Some(gui.current_container_id)
+                && gui.current_container_id > 0 && gui.open_container_size == 5
+                && gui.current_slots.len() == 41 {
+                return true;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            warn!("Hopper GUI did not open with valid contents; keeping items in inventory.");
+            return false;
+        }
+        wait_for_inventory_update(state, std::time::Duration::from_millis(100)).await;
+    }
+}
+
+async fn close_hopper(bot: &Client, state: &BotState) {
+    let mut gui = state.gui.lock().await;
+    gui.close_current_gui(bot);
+    gui.hopper_active = false;
+}
+
+/// Send one shift-click only after checking both player and hopper slot namespaces.
+fn transfer_hopper_item(bot: &Client, gui: &mut GuiManager, slot: i16, expected: &azalea::inventory::ItemStack) -> bool {
+    use azalea::entity::inventory::Inventory;
+    use azalea::inventory::{ItemStack, operations::ClickType};
+    let Some(menu_slot) = gui.hopper_transfer_slot(slot, expected, Some(bot)) else {
+        warn!("Hopper or source item changed; refusing an unsafe transfer from slot #{slot}.");
+        return false;
+    };
+    if !bot.get_component::<Inventory>().is_some_and(|inv|
+        inv.id == gui.current_container_id && inv.carried == ItemStack::Empty) {
+        warn!("Hopper is not the active menu or the cursor holds an item; refusing transfer.");
+        return false;
+    }
+    gui.click_slot(bot, menu_slot, ClickType::QuickMove);
+    true
+}
+
+async fn deposit_cursed_book_in_hopper(
     bot: &Client,
     state: &BotState,
     expected: &azalea::inventory::ItemStack,
     preferred_slot: Option<i16>,
 ) -> bool {
-    use azalea::inventory::operations::ClickType;
     use azalea::inventory::ItemStack;
-    use azalea::protocol::packets::game::s_container_click::{HashedStack, ServerboundContainerClick};
     use azalea_registry::builtin::ItemKind;
-
     if !matches!(expected, ItemStack::Present(data) if data.count == 1 && data.kind == ItemKind::EnchantedBook) {
-        error!("[CURSED BOOK GUARD] Item to discard is not a single enchanted book; refusing to discard it.");
+        error!("[CURSED BOOK GUARD] Refusing to deposit anything except the rejected enchanted book.");
         return false;
     }
-    if let Some(info) = crate::nbt::inspect_item_with_bot(expected, Some(bot)) {
-        if crate::nbt::is_diamond_armor(&info) || crate::nbt::is_anvil(&info) || crate::nbt::is_xp_bottle(&info) {
-            error!("[CURSED BOOK GUARD] CRITICAL SAFETY: Refusing to discard non-book item {} in drop_cursed_book_in_hopper!", info.kind);
-            return false;
-        }
-    }
-    state.gui.lock().await.close_current_gui(bot);
-    let Some(hopper_pos) = EnchanterManager::find_nearby_hopper(bot) else {
-        error!("Cannot drop cursed book: no hopper within 2 blocks!");
-        return false;
-    };
-    let pos = bot.position();
-    let dx = hopper_pos.x as f64 + 0.5 - pos.x;
-    let dz = hopper_pos.z as f64 + 0.5 - pos.z;
-    let dy = hopper_pos.y as f64 + 0.8 - (pos.y + 1.62);
-    smooth_look(bot, (-dx).atan2(dz).to_degrees() as f32,
-        (-dy).atan2((dx * dx + dz * dz).sqrt()).to_degrees() as f32).await;
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let (slot, before) = loop {
-        if !*state.spawned.lock().await { return false; }
-        {
-            let gui = state.gui.lock().await;
-            if let Some(pref) = preferred_slot {
-                if gui.player_inventory.get(&pref) == Some(expected) {
-                    let total = (9..=44).filter(|s| gui.player_inventory.get(s) == Some(expected)).count();
-                    break (pref, total);
-                }
-            }
-            let matching: Vec<_> = (36..=44).chain(9..=35).filter(|slot| gui.player_inventory.get(slot) == Some(expected)).collect();
-            if let Some(&slot) = matching.first() { break (slot, matching.len()); }
-        }
-        if std::time::Instant::now() >= deadline {
-            warn!("The cursed book was not returned to inventory; refusing to substitute another item.");
-            return false;
-        }
-        wait_for_inventory_update(state, std::time::Duration::from_millis(100)).await;
-    };
-
-    // DROP SAFETY VERIFICATION: Ensure the slot truly contains a book and NOT armor or other essentials
-    {
-        let gui = state.gui.lock().await;
-        let item_opt = gui.player_inventory.get(&slot);
-        let inspected = item_opt.and_then(|i| crate::nbt::inspect_item_with_bot(i, Some(bot)));
-        match inspected {
-            Some(ref info) => {
-                if crate::nbt::is_diamond_armor(info) || crate::nbt::is_anvil(info) || crate::nbt::is_xp_bottle(info) {
-                    error!("[CURSED BOOK GUARD] Slot #{slot} is not a book (found: {})! Refusing to throw into hopper!", info.kind);
-                    return false;
-                }
-                if info.count != 1 {
-                    error!("[CURSED BOOK GUARD] Slot #{slot} has count {} > 1! Refusing to throw into hopper!", info.count);
-                    return false;
-                }
-            }
-            None => {
-                error!("[CURSED BOOK GUARD] Slot #{slot} is empty or uninspectable! Refusing to throw into hopper!");
+    let result = async {
+        if !open_hopper(bot, state).await { return false; }
+        let (before, slot, container_id) = {
+            let mut gui = state.gui.lock().await;
+            let matching: Vec<_> = (9..=44).filter(|slot| gui.player_inventory.get(slot) == Some(expected)).collect();
+            let slot = preferred_slot.filter(|s| matching.contains(s)).or_else(|| matching.first().copied());
+            let Some(slot) = slot else {
+                warn!("Rejected book was not returned to inventory; refusing to substitute another item.");
                 return false;
-            }
-        }
-
-        info!("[CURSED BOOK] Dropping cursed book from slot #{slot} into hopper...");
-        bot.write_packet(ServerboundContainerClick {
-            container_id: 0,
-            state_id: gui.player_state_id,
-            slot_num: slot,
-            button_num: 0,
-            click_type: ClickType::Throw,
-            changed_slots: Default::default(),
-            carried_item: HashedStack(None),
-        });
-    }
-    swing_arm(bot);
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        wait_for_inventory_update(state, std::time::Duration::from_millis(100)).await;
-        if !*state.spawned.lock().await { return false; }
-        let gui = state.gui.lock().await;
-        let remaining = (9..=44).filter(|slot| gui.player_inventory.get(slot) == Some(expected)).count();
-        if armor::drop_status(before, remaining) == armor::DropStatus::Confirmed {
-            info!("[CURSED BOOK] Server confirmed cursed book left player inventory into hopper.");
-            return true;
-        }
-        if std::time::Instant::now() >= deadline {
-            warn!("Cursed book drop was not confirmed by server (before={before}, remaining={remaining}).");
-            return false;
-        }
-    }
-}
-
-/// Drop exactly one set in armor order, using server inventory updates as acknowledgement.
-/// The cursor and pending count survive automatic reconnects in SESSION_GUI.
-async fn drop_enchanted_armor_in_hopper(bot: &Client, state: &BotState) -> bool {
-    use azalea::inventory::operations::ClickType;
-    use azalea::protocol::packets::game::s_container_click::{HashedStack, ServerboundContainerClick};
-
-    {
-        let mut gui = state.gui.lock().await;
-        gui.close_current_gui(bot);
-        gui.state = OrderWorkflowState::WithdrawalComplete;
-    }
-
-    let Some(hopper_pos) = EnchanterManager::find_nearby_hopper(bot) else {
-        error!("No hopper within 2 blocks. Keeping this set until a hopper is available.");
-        return false;
-    };
-    let pos = bot.position();
-    let dx = hopper_pos.x as f64 + 0.5 - pos.x;
-    let dz = hopper_pos.z as f64 + 0.5 - pos.z;
-    let dy = hopper_pos.y as f64 + 0.8 - (pos.y + 1.62);
-    smooth_look(bot, (-dx).atan2(dz).to_degrees() as f32,
-        (-dy).atan2((dx * dx + dz * dz).sqrt()).to_degrees() as f32).await;
-
-    loop {
-        if !*state.spawned.lock().await { return false; }
-        let mut gui = state.gui.lock().await;
-        // Never reconcile against an empty cache while reconnecting.
-        if !(9..=44).all(|slot| gui.player_inventory.contains_key(&slot)) {
-            warn!("Waiting for a full player inventory before dropping armor.");
-            return false;
-        }
-        let items: Vec<_> = gui.player_inventory.iter()
-            .filter(|(slot, _)| (9..=44).contains(*slot))
-            .filter_map(|(&slot, item)| crate::nbt::inspect_item_with_bot(item, Some(bot)).map(|info| (slot, info)))
-            .collect();
-        let count_type = |kind| items.iter().filter(|(_, info)| armor::armor_type(info) == Some(kind)
-            && armor::is_complete(info)).map(|(_, info)| info.count as usize).sum::<usize>();
-        if let Some((kind, before)) = gui.pending_drop {
-            let remaining = count_type(kind);
-            if armor::drop_status(before, remaining) == armor::DropStatus::Confirmed {
-                gui.next_drop = kind + 1;
-                gui.pending_drop = None;
-            } else if armor::drop_status(before, remaining) == armor::DropStatus::Retained {
-                // Fresh reconnect snapshot shows the item was retained; retry this type.
-                gui.pending_drop = None;
-            } else {
-                error!("Ambiguous drop inventory change; retaining the current sequence.");
-                return false;
-            }
-        }
-        if gui.next_drop == 4 {
-            gui.next_drop = 0;
-            info!("Server confirmed all four drops: helmet, chestplate, leggings, boots.");
-            return true;
-        }
-        let kind = gui.next_drop;
-        let Some(plan) = armor::drop_plan(&items, kind) else {
-            warn!("Remaining set is incomplete; refusing to skip {}.", armor::TYPES[kind]);
-            return false;
+            };
+            if !transfer_hopper_item(bot, &mut gui, slot, expected) { return false; }
+            (matching.len(), slot, gui.current_container_id)
         };
-        let slot = plan[0];
-
-        // CRITICAL DROP SAFETY GUARD: Strict verification that the slot about to be dropped
-        // contains the intended complete diamond armor piece, and NEVER unenchanted armor, XP bottles, books, or anvils!
-        let target_item = gui.player_inventory.get(&slot);
-        let inspected = target_item.and_then(|i| crate::nbt::inspect_item_with_bot(i, Some(bot)));
-        match inspected {
-            Some(ref info) => {
-                if !armor::is_complete(info) || armor::armor_type(info) != Some(kind) {
-                    error!(
-                        "CRITICAL DROP SAFETY VIOLATION: Slot #{slot} is NOT a complete {}! Found: {} (enchants: {:?}, lore: {:?}). REFUSING TO DROP UNENCHANTED ARMOR!",
-                        armor::TYPES[kind], info.kind, info.enchantments, info.lore
-                    );
-                    gui.next_drop = 0;
-                    gui.pending_drop = None;
-                    return false;
-                }
-                info!(
-                    "Dropping verified complete {} from slot #{slot} (enchants: {:?}) into hopper...",
-                    armor::TYPES[kind], info.enchantments
-                );
-            }
-            None => {
-                error!("CRITICAL DROP SAFETY VIOLATION: Slot #{slot} is empty or uninspectable! REFUSING TO DROP!");
-                gui.next_drop = 0;
-                gui.pending_drop = None;
-                return false;
-            }
-        }
-
-        let before = count_type(kind);
-        gui.pending_drop = Some((kind, before));
-        // Throw directly from the inventory slot. Hotbar swaps would invalidate
-        // later slots and can drop a different item when a swap is rejected.
-        bot.write_packet(ServerboundContainerClick {
-            container_id: 0,
-            state_id: gui.player_state_id,
-            slot_num: slot,
-            button_num: 0, // exactly one item
-            click_type: ClickType::Throw,
-            changed_slots: Default::default(),
-            carried_item: HashedStack(None),
-        });
-        drop(gui);
-        swing_arm(bot);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             wait_for_inventory_update(state, std::time::Duration::from_millis(100)).await;
             if !*state.spawned.lock().await { return false; }
-            let mut gui = state.gui.lock().await;
-            let remaining: usize = gui.player_inventory.iter()
-                .filter(|(slot, _)| (9..=44).contains(*slot))
-                .filter_map(|(_, item)| crate::nbt::inspect_item_with_bot(item, Some(bot)))
-                .filter(|info| armor::armor_type(info) == Some(kind) && armor::is_complete(info))
-                .map(|info| info.count as usize).sum();
-            if armor::drop_status(before, remaining) == armor::DropStatus::Confirmed {
-                gui.next_drop = kind + 1;
-                gui.pending_drop = None;
-                info!("Confirmed {} left the player inventory.", armor::TYPES[kind]);
-                break;
+            let gui = state.gui.lock().await;
+            if gui.hopper_container_id != Some(container_id) { return false; }
+            let remaining = (9..=44).filter(|slot| gui.player_inventory.get(slot) == Some(expected)).count();
+            if armor::drop_status(before, remaining) == armor::DropStatus::Confirmed
+                && gui.current_slots.get(&(slot - 4)) == Some(&ItemStack::Empty) {
+                info!("[CURSED BOOK] Server confirmed transfer through the hopper GUI.");
+                return true;
             }
             if std::time::Instant::now() >= deadline {
-                warn!("{} drop was not acknowledged. Retaining pending drop for reconnect reconciliation.", armor::TYPES[kind]);
+                warn!("Cursed book transfer was not confirmed; hopper may be full or inaccessible.");
                 return false;
             }
         }
-    }
+    }.await;
+    close_hopper(bot, state).await;
+    result
+}
+
+/// Deposit exactly one set in armor order. Pending counts survive reconnects.
+async fn deposit_enchanted_armor_in_hopper(bot: &Client, state: &BotState) -> bool {
+    let result = async {
+        if !open_hopper(bot, state).await { return false; }
+        loop {
+            if !*state.spawned.lock().await { return false; }
+            let mut gui = state.gui.lock().await;
+            if !(9..=44).all(|slot| gui.player_inventory.contains_key(&slot)) { return false; }
+            let items: Vec<_> = gui.player_inventory.iter()
+                .filter(|(slot, _)| (9..=44).contains(*slot))
+                .filter_map(|(&slot, item)| crate::nbt::inspect_item_with_bot(item, Some(bot)).map(|info| (slot, info)))
+                .collect();
+            let count_type = |kind| items.iter().filter(|(_, info)| armor::armor_type(info) == Some(kind)
+                && armor::is_complete(info)).map(|(_, info)| info.count as usize).sum::<usize>();
+            if let Some((kind, before)) = gui.pending_drop {
+                match armor::drop_status(before, count_type(kind)) {
+                    armor::DropStatus::Confirmed => { gui.next_drop = kind + 1; gui.pending_drop = None; }
+                    armor::DropStatus::Retained => { gui.pending_drop = None; }
+                    armor::DropStatus::Ambiguous => {
+                        error!("Ambiguous transfer inventory change; retaining the current sequence.");
+                        return false;
+                    }
+                }
+            }
+            if gui.next_drop == 4 {
+                gui.next_drop = 0;
+                info!("Server confirmed all four hopper transfers: helmet, chestplate, leggings, boots.");
+                return true;
+            }
+            let kind = gui.next_drop;
+            let Some(plan) = armor::drop_plan(&items, kind) else {
+                warn!("Remaining set is incomplete; refusing to skip {}.", armor::TYPES[kind]);
+                return false;
+            };
+            let slot = plan[0];
+            let expected = gui.player_inventory[&slot].clone();
+            let before = count_type(kind);
+            let container_id = gui.current_container_id;
+            if !transfer_hopper_item(bot, &mut gui, slot, &expected) { return false; }
+            gui.pending_drop = Some((kind, before));
+            info!("Transferring completed {} through hopper GUI from player slot #{slot}.", armor::TYPES[kind]);
+            drop(gui);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                wait_for_inventory_update(state, std::time::Duration::from_millis(100)).await;
+                if !*state.spawned.lock().await { return false; }
+                let mut gui = state.gui.lock().await;
+                if gui.hopper_container_id != Some(container_id) { return false; }
+                let remaining: usize = gui.player_inventory.iter()
+                    .filter(|(slot, _)| (9..=44).contains(*slot))
+                    .filter_map(|(_, item)| crate::nbt::inspect_item_with_bot(item, Some(bot)))
+                    .filter(|info| armor::armor_type(info) == Some(kind) && armor::is_complete(info))
+                    .map(|info| info.count as usize).sum();
+                if armor::drop_status(before, remaining) == armor::DropStatus::Confirmed
+                    && gui.current_slots.get(&(slot - 4)) == Some(&azalea::inventory::ItemStack::Empty) {
+                    gui.next_drop = kind + 1;
+                    gui.pending_drop = None;
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    warn!("{} hopper transfer was not acknowledged (full or inaccessible hopper); retaining pending transfer for reconnect reconciliation.", armor::TYPES[kind]);
+                    return false;
+                }
+            }
+        }
+    }.await;
+    close_hopper(bot, state).await;
+    result
 }
 
 #[allow(dead_code)]
@@ -1417,6 +1389,9 @@ async fn main() -> Result<(), anyhow::Error> {
         .expect("Failed to set tracing subscriber");
 
     let args = Args::parse();
+    let base_hopper = configured_base_hopper()?;
+    EXPLICIT_BASE_HOPPER.store(base_hopper.is_some(), std::sync::atomic::Ordering::SeqCst);
+    SESSION_BASE_HOPPER.get_or_init(|| Arc::new(Mutex::new(base_hopper)));
 
     info!("Starting Minecraft Enchanter Bot...");
     info!("Target Server: {}:{}", args.server, args.port);
@@ -1428,19 +1403,22 @@ async fn main() -> Result<(), anyhow::Error> {
         warn!("⚠️ The bot will default to offline mode unless credentials are provided via CLI arguments.");
     }
 
-    // Discover all accounts from CLI flags and .env (supporting multi-account)
-    let discovered_accounts = auth::discover_accounts(
-        args.token.as_deref(),
-        args.microsoft.as_deref(),
-        args.offline.as_deref(),
-    );
+    // Children use the exact parent-selected account, independent of inherited ACCOUNT=all
+    // or a different account discovery order in the executable's working directory.
+    let child_account = auth::child_account_from_env()?;
+    let discovered_accounts = if let Some(ref account) = child_account {
+        vec![account.clone()]
+    } else {
+        auth::discover_accounts(args.token.as_deref(), args.microsoft.as_deref(), args.offline.as_deref())
+    };
 
     info!("Discovered {} configured account(s):", discovered_accounts.len());
     for (i, acc) in discovered_accounts.iter().enumerate() {
         info!("  [{i}] {}", acc.description());
     }
 
-    let run_all = args.all || args.account.as_deref().map(|s| s.eq_ignore_ascii_case("all")).unwrap_or(false);
+    let run_all = child_account.is_none()
+        && (args.all || args.account.as_deref().map(|s| s.eq_ignore_ascii_case("all")).unwrap_or(false));
 
     if run_all && discovered_accounts.len() > 1 {
         info!("============================================================");
@@ -1458,7 +1436,9 @@ async fn main() -> Result<(), anyhow::Error> {
             if let Some(ref dir) = exe_dir {
                 cmd.current_dir(dir);
             }
-            cmd.arg("--account").arg(i.to_string());
+            let (kind, value) = acc.child_env_parts();
+            cmd.env(auth::CHILD_ACCOUNT_KIND_ENV, kind);
+            cmd.env(auth::CHILD_ACCOUNT_VALUE_ENV, value);
             cmd.arg("--server").arg(&args.server);
             cmd.arg("--port").arg(args.port.to_string());
             cmd.arg("--order-target").arg(&args.order_target);
@@ -1504,7 +1484,13 @@ async fn main() -> Result<(), anyhow::Error> {
         return Ok(());
     }
 
-    let selected_account = auth::select_account(&discovered_accounts, args.account.as_deref());
+    let selected_account = if let Some(account) = child_account {
+        account
+    } else {
+        // "all" with one configured account still selects that account.
+        let selector = if run_all { None } else { args.account.as_deref() };
+        auth::select_account(&discovered_accounts, selector)?
+    };
     info!("Selected account: {}", selected_account.description());
 
     if let auth::AccountConfig::Offline(ref name) = selected_account {
@@ -1552,6 +1538,10 @@ async fn main() -> Result<(), anyhow::Error> {
             .start(account.clone(), address.clone())
             .await;
 
+        if FATAL_BASE_CONFIG.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("Base hopper could not be verified. Check configured BASE_HOPPER_X/Y/Z coordinates and the /home 1 destination, or set all three coordinates if the bot starts at its base hopper.");
+        }
+
         warn!("Connection closed or reset by server. Waiting 12 seconds before reconnecting to let proxy cache clear...");
         tokio::time::sleep(tokio::time::Duration::from_secs(12)).await;
     }
@@ -1561,6 +1551,95 @@ async fn main() -> Result<(), anyhow::Error> {
 #[cfg(test)]
 mod workflow_tests {
     use super::*;
+
+    #[test]
+    fn base_hopper_coordinates_must_be_complete_and_numeric() {
+        assert!(parse_base_hopper_coordinates([None, None, None]).unwrap().is_none());
+        assert!(parse_base_hopper_coordinates([Some("1".into()), None, Some("3".into())]).is_err());
+        assert!(parse_base_hopper_coordinates([Some("1".into()), Some("bad".into()), Some("3".into())]).is_err());
+        let pos = parse_base_hopper_coordinates([
+            Some("1".into()), Some("-64".into()), Some("3".into())
+        ]).unwrap().unwrap();
+        assert_eq!((pos.x, pos.y, pos.z), (1, -64, 3));
+    }
+
+    #[tokio::test]
+    async fn hopper_packets_stay_open_during_enchanting_and_use_quick_move() {
+        use azalea::entity::inventory::Inventory;
+        use azalea::inventory::{ItemStack, operations::ClickType};
+        use azalea::protocol::packets::game::{ClientboundOpenScreen, ClientboundContainerSetContent,
+            ClientboundContainerSetSlot, ClientboundContainerClose, ServerboundGamePacket};
+        use azalea_registry::builtin::{ItemKind, MenuKind};
+        let packets = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = packets.clone();
+        let mut app = azalea::app::App::new();
+        app.add_plugins(azalea::inventory::InventoryPlugin);
+        app.world_mut().add_observer(move |event: azalea::ecs::prelude::On<azalea::packet::game::SendGamePacketEvent>| {
+            observed.lock().unwrap().push(event.packet.clone());
+        });
+        let entity = app.world_mut().spawn(Inventory { id: 7, ..Default::default() }).id();
+        let world = std::mem::take(app.world_mut());
+        let bot = Client::new(entity, Arc::new(world.into()));
+        let state = BotState { gui: Arc::new(Mutex::new(GuiManager::new())), ..Default::default() };
+        state.is_enchanting.store(true, std::sync::atomic::Ordering::SeqCst);
+        {
+            let mut gui = state.gui.lock().await;
+            gui.hopper_active = true;
+            gui.state = OrderWorkflowState::WithdrawalComplete;
+        }
+        handle_packet(&bot, &Arc::new(ClientboundGamePacket::OpenScreen(ClientboundOpenScreen {
+            container_id: 7, menu_type: MenuKind::Hopper, title: "Custom name".into(),
+        })), &state).await;
+        let book = ItemStack::new(ItemKind::EnchantedBook, 1);
+        let xp = ItemStack::new(ItemKind::ExperienceBottle, 64);
+        let mut items = vec![ItemStack::Empty; 41];
+        items[5] = book.clone();
+        items[32] = xp.clone();
+        handle_packet(&bot, &Arc::new(ClientboundGamePacket::ContainerSetContent(ClientboundContainerSetContent {
+            container_id: 7, state_id: 12, items, carried_item: ItemStack::Empty,
+        })), &state).await;
+        {
+            let mut gui = state.gui.lock().await;
+            assert_eq!(gui.hopper_container_id, Some(7));
+            assert!(!transfer_hopper_item(&bot, &mut gui, 36, &xp));
+            assert!(transfer_hopper_item(&bot, &mut gui, 9, &book));
+            // A click alone cannot claim success, including when the hopper is full.
+            assert_eq!(gui.player_inventory.get(&9), Some(&book));
+            assert_eq!(gui.current_slots.get(&5), Some(&book));
+        }
+        bot.ecs.write().flush();
+        {
+            let packets = packets.lock().unwrap();
+            assert_eq!(packets.len(), 1);
+            let ServerboundGamePacket::ContainerClick(click) = &packets[0] else { panic!("expected a container click"); };
+            assert_eq!(click.container_id, 7);
+            assert_eq!(click.state_id, 12);
+            assert_eq!(click.slot_num, 5);
+            assert_eq!(click.click_type, ClickType::QuickMove);
+        }
+        handle_packet(&bot, &Arc::new(ClientboundGamePacket::ContainerSetSlot(ClientboundContainerSetSlot {
+            container_id: 7, state_id: 13, slot: 5, item_stack: ItemStack::Empty,
+        })), &state).await;
+        {
+            let gui = state.gui.lock().await;
+            assert_eq!(gui.player_inventory.get(&9), Some(&ItemStack::Empty));
+            assert_eq!(gui.player_inventory.get(&36), Some(&xp));
+        }
+        close_hopper(&bot, &state).await;
+        bot.ecs.write().flush();
+        assert_eq!(bot.component::<Inventory>().id, 0);
+        assert!(!state.gui.lock().await.hopper_active);
+
+        // A menu merely named Hopper must not be accepted as a real hopper.
+        state.gui.lock().await.hopper_active = true;
+        handle_packet(&bot, &Arc::new(ClientboundGamePacket::OpenScreen(ClientboundOpenScreen {
+            container_id: 8, menu_type: MenuKind::Generic9x3, title: "Hopper".into(),
+        })), &state).await;
+        assert_eq!(state.gui.lock().await.hopper_container_id, None);
+        handle_packet(&bot, &Arc::new(ClientboundGamePacket::ContainerClose(ClientboundContainerClose {
+            container_id: 8,
+        })), &state).await;
+    }
 
     #[tokio::test]
     async fn inventory_updates_wake_worker_without_waiting_for_poll_timeout() {

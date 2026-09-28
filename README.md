@@ -1,6 +1,6 @@
 # Armor-Enchanter
 
-An autonomous, high-performance Minecraft enchanting bot built in Rust with [Azalea](https://github.com/azalea-rs/azalea). Designed for high-efficiency SMP automation (such as `donutsmp.net`), Armor-Enchanter claims required items from `/order`, places an anvil, dynamically calculates and throws the exact amount of XP required for each combine, and assembles fully enchanted diamond armor sets in optimal anvil order to minimize repair costs.
+An autonomous Minecraft enchanting bot built in Rust with [Azalea](https://github.com/azalea-rs/azalea). Armor-Enchanter claims required items from `/order`, places an anvil, calculates the XP deficit for each combine, throws bottles in server-confirmed batches, and assembles fully enchanted diamond armor sets in anvil order that minimizes repair costs.
 
 ---
 
@@ -12,7 +12,7 @@ An autonomous, high-performance Minecraft enchanting bot built in Rust with [Aza
     - 2× Diamond Helmet, 2× Diamond Chestplate, 2× Diamond Leggings, 2× Diamond Boots, collecting both pieces from each order together
     - 8× Unbreaking III, 8× Mending, 4× Blast Protection IV, 4× Protection IV enchanted books (24 books total)
     - 4× Stacks of Bottles o' Enchanting (256 bottles total; partial stacks count by bottle quantity)
-    - 1× Anvil (retrieved and placed in Phase 1 before Phase 2 item retrieval, leaving all 36 slots free)
+    - 2× Anvils (one placed in Phase 1 and one carried in the offhand, leaving all 36 main inventory slots free)
 
 - **Automated `/sell` Inventory Cleaning**:
   - Upon spawn and between batches, automatically scans player inventory slots (9..=44).
@@ -26,7 +26,7 @@ An autonomous, high-performance Minecraft enchanting bot built in Rust with [Aza
     - Total level XP: $\text{TotalXP}(L) = \begin{cases} L^2 + 6L & 0 \le L \le 16 \\ 2.5L^2 - 40.5L + 360 & 17 \le L \le 31 \\ 4.5L^2 - 162.5L + 2220 & L \ge 32 \end{cases}$
     - Exact deficit from Level $X$ (with progress) to Level $Y$: $\Delta\text{XP} = \text{TotalXP}(Y) - \text{true\_current\_xp}$
     - Bottles needed: $\lceil \Delta\text{XP} / 6.8 \rceil$ (average 7.0 XP per bottle with variance safety margin)
-  - Throws bottles in rapid, authentic streams (1 tick per throw) with `ServerboundSwing` arm animations, reaching required levels in under 1 second.
+  - Throws bottles at its feet in bounded batches (1 tick per throw) with `ServerboundSwing` animations. Each batch waits for server-confirmed bottle consumption and XP gain; timing depends on server responses.
 
 - **Optimal Anvil Sequencing ([iamcal/enchant-order](https://github.com/iamcal/enchant-order))**:
   - Sequences combines to minimize prior work penalties and cumulative level costs:
@@ -46,14 +46,16 @@ An autonomous, high-performance Minecraft enchanting bot built in Rust with [Aza
 
 ## Level-to-Level XP Reference
 
-| Transition | $\Delta\text{XP}$ Deficit | Bottles Required | Expected XP Output | First-Throw Attainment |
-| :--- | :---: | :---: | :---: | :---: |
-| **Level 0 $\to$ Level 4** | 40 XP | **6 bottles** | 42 XP | 100% |
-| **Level 0 $\to$ Level 5** | 55 XP | **9 bottles** | 63 XP | 100% |
-| **Level 0 $\to$ Level 8** | 112 XP | **17 bottles** | 119 XP | 100% |
-| **Level 4 $\to$ Level 8** | 72 XP | **11 bottles** | 77 XP | 100% |
-| **Level 8 $\to$ Level 13** | 135 XP | **20 bottles** | 140 XP | 100% |
-| **Level 0 $\to$ Level 13** | 247 XP | **37 bottles** | 259 XP | 100% |
+| Transition | $\Delta\text{XP}$ Deficit | Estimated Bottles | Expected XP Output |
+| :--- | :---: | :---: | :---: |
+| **Level 0 $\to$ Level 4** | 40 XP | **6 bottles** | 42 XP |
+| **Level 0 $\to$ Level 5** | 55 XP | **9 bottles** | 63 XP |
+| **Level 0 $\to$ Level 8** | 112 XP | **17 bottles** | 119 XP |
+| **Level 4 $\to$ Level 8** | 72 XP | **11 bottles** | 77 XP |
+| **Level 8 $\to$ Level 13** | 135 XP | **20 bottles** | 140 XP |
+| **Level 0 $\to$ Level 13** | 247 XP | **37 bottles** | 259 XP |
+
+These bottle counts are estimates, not guaranteed amounts for reaching the target level. The bot throws safe batches, checks server-reported XP, and uses more bottles as needed.
 
 ---
 
@@ -82,7 +84,7 @@ MC_TOKEN=eyJraWQiOi...
 ### Switching Accounts
 Switch accounts easily via command line arguments or the `ACCOUNT` environment variable:
 ```bash
-# By index (0-indexed or 1-indexed)
+# By zero-based index (0 is the first account)
 cargo run --release -- --account 0
 cargo run --release -- --account 1
 
@@ -97,22 +99,32 @@ cargo run --release -- --microsoft player1@outlook.com
 
 ## Serial armor workflow and recovery
 
-- Withdraw two helmets, chestplates, leggings, and boots from `/order`, plus the books and XP listed above. The eight armor pieces, 24 books, and four XP stacks fit the 36 inventory slots after placing the anvil.
+- Withdraw two helmets, chestplates, leggings, and boots from `/order`, plus the books and XP listed above. The eight armor pieces, 24 books, and four XP stacks fill the 36 main inventory slots after one anvil is placed; the second anvil is carried in the offhand.
 - Finish enchanting the helmet, then chestplate, leggings, and boots. A missing piece or required book returns the unfinished set to restocking. Duplicate armor does not take priority over the next type.
-- Once all four pieces are complete, aim at a hopper within two blocks and drop exactly one helmet, chestplate, leggings, and boots, in that order. Each drop waits for the server to report one fewer piece before advancing. No hotbar swaps or optimistic inventory deletion are used for drops.
-- Immediately enchant and drop the second stocked set in the same order. Inventory cleaning and `/order` restocking run after both sets, or when supplies are missing, rather than after every set.
-- Anvil and drop workers wake on server inventory updates. Opening the anvil releases its state lock immediately after interaction, allowing screen packets to be processed without a fixed post-interaction delay. Timeouts and per-item acknowledgements remain in place; live throughput has not been benchmarked.
-- A missing hopper or unconfirmed drop retains the sequence and reconnects for reconciliation. Pending drop bookkeeping survives automatic reconnects within the same account process. It is not saved across a process restart.
+- Once all four pieces are complete, open a hopper within two blocks and shift-click exactly one helmet, chestplate, leggings, and boots into its GUI, in that order. Each transfer waits for the server to empty the source slot and report one fewer piece before advancing. Rejected enchanted books use the same hopper GUI; XP bottles are excluded.
+- Immediately enchant and deposit the second stocked set in the same order. Inventory cleaning and `/order` restocking run after both sets, or when supplies are missing, rather than after every set.
+- Anvil and hopper workers wake on server inventory updates. Opening the anvil releases its state lock immediately after interaction, allowing screen packets to be processed without a fixed post-interaction delay. Timeouts and per-item acknowledgements remain in place; live throughput has not been benchmarked.
+- A missing/full hopper or unconfirmed transfer retains the sequence and reconnects for reconciliation. Pending transfer bookkeeping survives automatic reconnects within the same account process. It is not saved across a process restart.
 - Inventory withdrawal snapshots are handed to the enchanter before it starts. Anvil transfers wait for source and inventory changes; direct player-inventory packets update the same caches.
 - GUI watchdog recovery refreshes stalled screens. Full sets are required before successful completion; missing books or XP cannot mark an incomplete set complete.
 
-Set `/home 1` at your enchanting area with an accessible anvil (or space to place one) and a hopper within two blocks. The bot drops toward the hopper; server inventory acknowledgement confirms that an item left the player, not that the hopper collected it. Position the hopper to catch the thrown items and leave storage space available.
+Anvil withdrawal throws one anvil at a time straight down at the bot's feet and waits for the server to confirm pickup. It advances only after the inventory meets the anvil quota. If pickup is unconfirmed after 10 seconds, it pauses without throwing more; return the missing anvil to the bot's inventory to resume. A hopper beneath the drop can still collect the item.
 
-The active workflow drops armor locally. `ORDER_TARGET_NAME` is retained for the legacy buyer-order routine and is not the destination used by this workflow.
+Rejected books are tracked by item identity after failed disposal, not by slot number. Successful disposal removes that rejection, so replacement books and unrelated hotbar slots remain usable.
 
-Local tests cover sequencing and inventory reconciliation. Live server behavior and hopper capture have not been tested.
+XP handling first requests a fresh server player-inventory snapshot. Hotbar swaps require confirmation of both slots before use, and outstanding throw requests never decrement the stored inventory count. Delayed or partial consumption remains at the server-reported count. Unconfirmed actions stop XP use and reconnect for reconciliation after a five-second timeout; only confirmed absence of bottles sends the bot back to restock.
 
-Discord out-of-stock alerts require both zero inventory for the item and a completed scan of Your Orders. The bot checks additional matching orders and subsequent pages before alerting. A low batch count, XP shortfall, GUI timeout, or an unverified order does not trigger a webhook. Empty-order responses expire after 45 seconds and duplicate alerts retain the 120-second cooldown. Tests do not send Discord messages.
+Set `/home 1` at your enchanting area with an accessible anvil (or space to place one) and a hopper within two blocks. The bot opens the hopper GUI and transfers items directly into it. Keep space available in the hopper or its connected storage. XP bottles are used at the bot's feet to gain enchanting levels; they are never included in hopper deposits.
+
+Startup sends `/home 1` and verifies the nearby hopper before withdrawing items. On a first run without a configured base location, it must observe movement of more than five blocks to establish that hopper as its base; automatic reconnects remember the verified hopper within the same process. If the bot may first log in already at the base, set `BASE_HOPPER_X`, `BASE_HOPPER_Y`, and `BASE_HOPPER_Z` in `.env` to the hopper's exact block coordinates. Set all three values together.
+
+Book/order identification can use displayed enchantment text, but armor completion requires applied enchantment components. Servers exposing armor enchantments only as lore need an authoritative verification path before those pieces can be marked complete.
+
+The active workflow deposits armor in the local hopper. `ORDER_TARGET_NAME` is retained for the legacy buyer-order routine and is not the destination used by this workflow.
+
+Local tests cover sequencing and inventory reconciliation. Live server hopper transfers have not been tested.
+
+Discord out-of-stock alerts require both zero inventory for the item and a completed scan of Your Orders. The bot checks additional matching orders and subsequent pages before alerting. A low batch count, XP shortfall, GUI timeout, or an unverified order does not trigger a webhook. Empty-order responses expire after 45 seconds. Set `DISCORD_WEBHOOK_URL` in `.env` to enable alerts; successful alerts have a 120-second cooldown per item, while failed sends can retry. Tests do not send Discord messages.
 
 ---
 
@@ -126,6 +138,7 @@ Discord out-of-stock alerts require both zero inventory for the item and a compl
    ```env
    ACCOUNTS=your_email@outlook.com
    ORDER_TARGET_NAME=zn6h
+   DISCORD_WEBHOOK_URL=
    ```
 
 ---
@@ -157,7 +170,8 @@ cargo test
 
 - `src/main.rs`: Entry point, Azalea client lifecycle, server event loop, and single-task enchanting workflow.
 - `src/armor.rs`: Shared armor ordering, completion checks, drop planning, and inventory slot mapping.
-- `src/enchanter.rs`: Core anvil state machine, level-to-level XP math, rapid bottle thrower, arm animations, smooth rotation, and combine scheduler.
+- `src/enchanter.rs`: Core anvil state machine, level-to-level XP math, arm animations, smooth rotation, and combine scheduler.
+- `src/xp.rs`: Server-confirmed XP inventory, hotbar swaps, bounded bottle-use batches, and acknowledgement timeouts.
 - `src/gui.rs`: Container window tracking, order item inspection, and slot click packet interactions.
 - `src/nbt.rs`: NBT parsing utilities for item identification and enchantment verification.
 - `src/auth.rs`: Minecraft session authentication and token resolution.

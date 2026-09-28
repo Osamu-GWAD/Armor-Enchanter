@@ -132,6 +132,13 @@ struct PendingDelivery {
     confirm_sent: bool,
 }
 
+#[derive(Debug, Clone)]
+struct PendingAnvilPickup {
+    inventory_before: u32,
+    sent_at: std::time::Instant,
+    warned: bool,
+}
+
 pub struct GuiManager {
     pub state: OrderWorkflowState,
     pub phase: WithdrawalPhase,
@@ -147,10 +154,10 @@ pub struct GuiManager {
     pub current_order_slot: Option<i16>,
     pub exhausted_orders: Vec<String>,
     stock_audit: StockAudit,
+    resume_order_scan: bool,
     order_page: usize,
     page_turn_pending: bool,
     pub collect_clicked_in_submenu: bool,
-    pub last_exhausted_check: Option<std::time::Instant>,
     pub target_delivering_armor: Option<TargetArmorType>,
     pub action_in_progress: bool,
     pub current_menu_skipped_slots: Vec<i16>,
@@ -169,6 +176,8 @@ pub struct GuiManager {
     pub target_sets_to_deliver: usize,
     pub next_drop: usize,
     pub pending_drop: Option<(usize, usize)>,
+    pub hopper_active: bool,
+    pub hopper_container_id: Option<i32>,
     pub player_state_id: u32,
     pub target_delivered_helmets: usize,
     pub target_delivered_chestplates: usize,
@@ -179,7 +188,7 @@ pub struct GuiManager {
     last_progress_time: std::time::Instant,
     scheduled_command: Option<(std::time::Instant, String)>,
     pub last_command_sent_time: Option<std::time::Instant>,
-    pub anvil_stack_dropped: bool,
+    pending_anvil_pickup: Option<PendingAnvilPickup>,
 }
 
 /// Sends a command to the server using the plain, unsigned ServerboundChatCommand packet.
@@ -211,10 +220,10 @@ impl GuiManager {
             current_order_slot: None,
             exhausted_orders: Vec::new(),
             stock_audit: StockAudit::default(),
+            resume_order_scan: false,
             order_page: 0,
             page_turn_pending: false,
             collect_clicked_in_submenu: false,
-            last_exhausted_check: None,
             target_delivering_armor: None,
             action_in_progress: false,
             current_menu_skipped_slots: Vec::new(),
@@ -233,6 +242,8 @@ impl GuiManager {
             target_sets_to_deliver: 0,
             next_drop: 0,
             pending_drop: None,
+            hopper_active: false,
+            hopper_container_id: None,
             player_state_id: 0,
             target_delivered_helmets: 0,
             target_delivered_chestplates: 0,
@@ -243,7 +254,7 @@ impl GuiManager {
             last_progress_time: std::time::Instant::now(),
             scheduled_command: None,
             last_command_sent_time: None,
-            anvil_stack_dropped: false,
+            pending_anvil_pickup: None,
         }
     }
 
@@ -274,7 +285,15 @@ impl GuiManager {
         if cmd.trim() == "/order" {
             self.order_page = 0;
             self.page_turn_pending = false;
-            self.stock_audit.start_scan();
+            // Immediate post-Collect reopens share an audit; restock retries
+            // start a new pass and recheck every previously empty listing.
+            if self.resume_order_scan {
+                self.stock_audit.continue_scan();
+            } else {
+                self.stock_audit.start_scan();
+                self.exhausted_orders.clear();
+            }
+            self.resume_order_scan = false;
         }
         self.scheduled_command = None;
         self.last_action_time = Some(std::time::Instant::now());
@@ -409,15 +428,16 @@ impl GuiManager {
     /// Records that an order has 0 items to collect upon receiving server chat notification,
     /// logs prominent out-of-stock messages detailing which items are affected,
     pub fn record_no_items_to_collect(&mut self, bot: &Client) -> Option<String> {
-        let item_name = self.stock_audit.confirm_empty()
-            .or_else(|| self.target_order_type.clone())
-            .or_else(|| self.last_collecting_order_name.clone())?;
+        // Stale or unrelated chat must not close the current GUI.
+        let item_name = self.stock_audit.confirm_empty()?;
         if !self.exhausted_orders.contains(&item_name) {
             self.exhausted_orders.push(item_name.clone());
         }
         info!("The selected order for '{item_name}' is empty. Checking other orders and inventory before alerting.");
+        self.resume_order_scan = true;
         self.close_current_gui(bot);
         self.target_order_type = None;
+        self.last_collecting_order_name = None;
         self.collect_clicked_in_submenu = false;
         self.state = OrderWorkflowState::WaitingForNextOrder;
         Some(item_name)
@@ -463,7 +483,7 @@ impl GuiManager {
     pub fn is_order_needed(&self, info: &ItemInfo) -> (bool, &'static str) {
         match self.phase {
             WithdrawalPhase::AnvilPlacement => {
-                if is_anvil(info) && (self.collected.anvils < 2 || !self.anvil_stack_dropped) {
+                if is_anvil(info) && self.pending_anvil_pickup.is_none() && self.collected.anvils < self.quota.anvils_needed {
                     (true, "Anvil")
                 } else {
                     (false, "")
@@ -570,6 +590,8 @@ impl GuiManager {
     /// Performs an exact inventory count and resets collected state from the current inventory.
     pub fn reset_and_sync_inventory(&mut self, bot: Option<&Client>) {
         self.stock_audit = StockAudit::default();
+        self.resume_order_scan = false;
+        self.exhausted_orders.clear();
         self.order_page = 0;
         self.page_turn_pending = false;
         let mut anvils = 0;
@@ -614,6 +636,7 @@ impl GuiManager {
         }
 
         self.collected.anvils = anvils;
+        self.reconcile_anvil_pickup();
         self.collected.mending = mending;
         self.collected.unbreaking_3 = unb3;
         self.collected.protection_4 = prot4;
@@ -690,6 +713,7 @@ impl GuiManager {
         let prev = self.collected.clone();
 
         self.collected.anvils = anvils;
+        self.reconcile_anvil_pickup();
         self.collected.mending = mending;
         self.collected.unbreaking_3 = unb3;
         self.collected.protection_4 = prot4;
@@ -891,7 +915,7 @@ impl GuiManager {
         self.open_container_size = 0;
         self.collect_clicked_in_submenu = false;
 
-        if !self.is_fulfilling_target && self.state == OrderWorkflowState::WithdrawalComplete {
+        if self.hopper_active || (!self.is_fulfilling_target && self.state == OrderWorkflowState::WithdrawalComplete) {
             info!("Ignoring GUI open transition because WithdrawalComplete is already reached.");
             return;
         }
@@ -1055,11 +1079,16 @@ impl GuiManager {
             if self.current_slots.get(&slot).is_some_and(|item| item != source)
                 && &self.player_inventory != inventory
             {
+                if self.state == OrderWorkflowState::InCollectDeliveryMenu {
+                    if let Some(ref order_type) = self.target_order_type {
+                        self.exhausted_orders.retain(|x| x != order_type);
+                    }
+                }
                 self.clear_watchdog();
                 self.last_progress_time = std::time::Instant::now();
             }
         }
-        if self.last_click_type == Some(ClickType::Throw) {
+        if self.pending_anvil_pickup.is_none() && self.last_click_type == Some(ClickType::Throw) {
             if let Some(slot) = self.last_clicked_slot {
                 if self.current_slots.get(&slot).map(|s| matches!(s, ItemStack::Empty)).unwrap_or(true) {
                     self.clear_watchdog();
@@ -1106,6 +1135,7 @@ impl GuiManager {
 
     /// Perform the next automated action in the current GUI.
     pub async fn process_gui_actions(&mut self, bot: &Client) -> bool {
+        if self.pending_anvil_pickup.is_some() { return false; }
         if !self.is_fulfilling_target && (self.state == OrderWorkflowState::WithdrawalComplete
             || (self.phase == WithdrawalPhase::Done
                 && self.state != OrderWorkflowState::SellingInventory
@@ -1174,7 +1204,7 @@ impl GuiManager {
         self.sync_collected_from_inventory(Some(bot));
 
         let phase_fulfilled = match self.phase {
-            WithdrawalPhase::AnvilPlacement => self.anvil_stack_dropped || self.collected.anvils >= self.quota.anvils_needed,
+            WithdrawalPhase::AnvilPlacement => self.anvil_withdrawal_complete(),
             WithdrawalPhase::ItemsRetrieval => self.collected.is_fulfilled(&self.quota),
             WithdrawalPhase::Done => true,
         };
@@ -1272,19 +1302,6 @@ impl GuiManager {
 
     /// Select an order slot in 'Orders -> Your Orders' (slots 0..=44) that matches our quota needs.
     async fn select_order_to_claim(&mut self, bot: &Client) -> bool {
-        // Periodically refresh exhausted orders cache (every 45s) so new deliveries can be picked up
-        if let Some(last_check) = self.last_exhausted_check {
-            if last_check.elapsed() > std::time::Duration::from_secs(45) {
-                if !self.exhausted_orders.is_empty() {
-                    info!("Refreshing exhausted orders cache after 45s: {:?}", self.exhausted_orders);
-                    self.exhausted_orders.clear();
-                }
-                self.last_exhausted_check = Some(std::time::Instant::now());
-            }
-        } else {
-            self.last_exhausted_check = Some(std::time::Instant::now());
-        }
-
         info!("Checking orders in 'Your Orders' against quota (Phase: {:?})...", self.phase);
         info!(
             "Current Status: Anvils: {}/{}, Mending: {}/{}, Unb3: {}/{}, Prot4: {}/{}, BlastProt4: {}/{}, XP: {}/{} ({} bottles), Armor (H: {}/{}, C: {}/{}, L: {}/{}, B: {}/{})",
@@ -1325,11 +1342,6 @@ impl GuiManager {
                     let (is_needed, order_name) = self.is_order_needed(&info);
 
                     if is_needed {
-                        if self.exhausted_orders.contains(&order_name.to_string()) {
-                            self.current_menu_skipped_slots.push(slot);
-                            continue;
-                        }
-
                         let Some(listing) = self.order_listing(slot, Some(bot)) else { continue; };
                         if self.stock_audit.is_empty(self.order_page, &listing) {
                             self.current_menu_skipped_slots.push(slot);
@@ -1372,7 +1384,7 @@ impl GuiManager {
 
         if !self.exhausted_orders.is_empty() {
             warn!("============================================================");
-            warn!("*** [OUT OF ITEMS] The following buy orders are currently OUT OF ITEMS on server: {:?} ***", self.exhausted_orders);
+            warn!("*** [EMPTY LISTINGS] At least one listing was empty for: {:?} ***", self.exhausted_orders);
             warn!("*** Missing quota items still needed: {} ***", missing);
             warn!("============================================================");
         }
@@ -1589,13 +1601,7 @@ impl GuiManager {
                     }
 
                     if is_anvil(&info) {
-                        info!(
-                            "Directly dropping anvil stack at slot #{slot} (without transferring to inventory)..."
-                        );
-                        bot.set_direction(bot.direction().y_rot(), 90.0);
-                        self.anvil_stack_dropped = true;
-                        self.drop_slot_stack(bot, slot);
-                        self.current_menu_skipped_slots.clear();
+                        self.throw_one_anvil_at_feet(bot, slot);
                         return false;
                     }
 
@@ -1627,23 +1633,16 @@ impl GuiManager {
 
         if let Some(ref order_type) = self.target_order_type {
             info!("Finished claiming delivery items for order '{order_type}'!");
-            let has_remaining = (0..=26).any(|slot| {
-                self.order_listing(slot, Some(bot)).is_some_and(|entry| &entry.name == order_type)
-            });
-            self.stock_audit.collection_finished(!has_remaining);
-            if has_remaining {
-                self.exhausted_orders.retain(|x| x != order_type);
-            } else if !self.exhausted_orders.contains(order_type) {
-                self.exhausted_orders.push(order_type.clone());
-            }
+            self.stock_audit.collection_finished();
         }
         self.target_order_type = None;
+        self.last_collecting_order_name = None;
 
         info!("Closing delivery container...");
         self.close_current_gui(bot);
 
         let phase_done = match self.phase {
-            WithdrawalPhase::AnvilPlacement => self.anvil_stack_dropped || self.collected.anvils >= self.quota.anvils_needed,
+            WithdrawalPhase::AnvilPlacement => self.anvil_withdrawal_complete(),
             WithdrawalPhase::ItemsRetrieval => self.collected.is_fulfilled(&self.quota),
             WithdrawalPhase::Done => true,
         };
@@ -1691,12 +1690,13 @@ impl GuiManager {
         info!("Phase {:?} not yet fulfilled; opening the next order.", self.phase);
         self.state = OrderWorkflowState::WaitingForNextOrder;
         info!("Sending /order for next item...");
+        self.resume_order_scan = true;
         self.record_command_sent("/order");
         Self::send_command(bot, "/order");
         return true;
     }
 
-    /// Counts how many needed diamond armor orders are available in the open Your Orders container (excluding exhausted and already-fulfilled ones).
+    /// Counts needed diamond armor listings that have not individually been confirmed empty.
     pub fn count_available_armor_orders(&self, bot: Option<&Client>) -> u32 {
         let mut count = 0;
         for slot in 0..=44 {
@@ -1704,7 +1704,8 @@ impl GuiManager {
                 if let Some(info) = inspect_item_with_bot(item, bot) {
                     if is_diamond_armor(&info) {
                         let (needed, name) = self.is_order_needed(&info);
-                        if needed && !self.exhausted_orders.contains(&name.to_string()) {
+                        if needed && self.order_listing(slot, bot).is_some_and(|listing|
+                            listing.name.as_str() == name && !self.stock_audit.is_empty(self.order_page, &listing)) {
                             count += 1;
                         }
                     }
@@ -2422,37 +2423,121 @@ impl GuiManager {
         }
     }
 
-    /// Directly drop an item stack from a container slot into the world (using ClickType::Throw with button 1).
-    pub fn drop_slot_stack(&mut self, bot: &Client, slot: i16) {
-        let packet = ServerboundContainerClick {
+    pub fn anvil_withdrawal_complete(&self) -> bool {
+        self.pending_anvil_pickup.is_none() && self.collected.anvils >= self.quota.anvils_needed
+    }
+
+    /// A source slot shrinking only confirms the throw, not that we picked it up.
+    fn reconcile_anvil_pickup(&mut self) {
+        if self.pending_anvil_pickup.as_ref().is_some_and(|pending|
+            self.collected.anvils > pending.inventory_before) {
+            self.pending_anvil_pickup = None;
+            if self.state == OrderWorkflowState::InCollectDeliveryMenu {
+                if let Some(ref order_type) = self.target_order_type {
+                    self.exhausted_orders.retain(|x| x != order_type);
+                }
+            }
+            self.clear_watchdog();
+            self.last_progress_time = std::time::Instant::now();
+            info!("Server inventory confirmed anvil pickup at feet.");
+            if self.current_container_id == 0 {
+                self.schedule_command("/order".to_string(), std::time::Duration::ZERO);
+            }
+        }
+    }
+
+    /// Send the downward rotation before throwing a single anvil, then await pickup.
+    fn throw_one_anvil_at_feet(&mut self, bot: &Client, slot: i16) -> bool {
+        use azalea::entity::{LookDirection, Physics, inventory::Inventory};
+        use azalea::protocol::{common::movements::MoveFlags, packets::game::ServerboundMovePlayerRot};
+        if self.pending_anvil_pickup.is_some() || self.current_container_id <= 0
+            || self.state != OrderWorkflowState::InCollectDeliveryMenu
+            || self.phase != WithdrawalPhase::AnvilPlacement
+            || !(0..self.open_container_size).contains(&slot)
+            || self.collected.anvils >= self.quota.anvils_needed
+            || !self.current_slots.get(&slot).and_then(|item| inspect_item_with_bot(item, Some(bot)))
+                .is_some_and(|info| is_anvil(&info) && info.count > 0)
+            || !bot.get_component::<Inventory>().is_some_and(|inv|
+                inv.id == self.current_container_id && inv.carried == ItemStack::Empty) {
+            return false;
+        }
+        let Some(flags) = bot.get_component::<Physics>().map(|physics| MoveFlags {
+            on_ground: physics.on_ground(), horizontal_collision: physics.horizontal_collision,
+        }) else { return false; };
+        let yaw = bot.direction().y_rot();
+        bot.set_direction(yaw, 90.0);
+        bot.write_packet(ServerboundMovePlayerRot {
+            look_direction: LookDirection::new(yaw, 90.0),
+            flags,
+        });
+        self.pending_anvil_pickup = Some(PendingAnvilPickup {
+            inventory_before: self.collected.anvils,
+            sent_at: std::time::Instant::now(),
+            warned: false,
+        });
+        bot.write_packet(ServerboundContainerClick {
             container_id: self.current_container_id,
             state_id: self.current_state_id,
             slot_num: slot,
-            button_num: 1, // Drop whole stack (Ctrl+Drop)
+            button_num: 0, // One anvil, never the whole order stack.
             click_type: ClickType::Throw,
             changed_slots: Default::default(),
             carried_item: HashedStack(None),
-        };
-        bot.write_packet(packet);
+        });
         self.record_action_sent(Some(slot), Some(ClickType::Throw));
+        info!("Threw one anvil at feet; waiting for server-confirmed pickup.");
+        true
+    }
+
+    /// Translate a verified player item into the active hopper's slot namespace.
+    /// Only single completed armor pieces and rejected enchanted books may be deposited.
+    pub fn hopper_transfer_slot(&self, slot: i16, expected: &ItemStack, bot: Option<&Client>) -> Option<i16> {
+        use azalea_registry::builtin::ItemKind;
+        let ItemStack::Present(data) = expected else { return None; };
+        if data.count != 1 || !(9..=44).contains(&slot)
+            || !self.hopper_active || self.current_container_id <= 0
+            || self.hopper_container_id != Some(self.current_container_id)
+            || self.open_container_size != 5 || self.current_slots.len() != 41
+        {
+            return None;
+        }
+        let allowed = data.kind == ItemKind::EnchantedBook
+            || inspect_item_with_bot(expected, bot).is_some_and(|info| crate::armor::is_complete(&info));
+        let hopper_slot = slot - 9 + 5;
+        (allowed && self.player_inventory.get(&slot) == Some(expected)
+            && self.current_slots.get(&hopper_slot) == Some(expected))
+            .then_some(hopper_slot)
     }
 
     /// Close the currently opened GUI container.
     pub fn close_current_gui(&mut self, bot: &Client) {
         self.clear_watchdog();
         if self.current_container_id > 0 {
-            bot.write_packet(ServerboundContainerClose {
-                container_id: self.current_container_id,
-            });
+            if bot.get_component::<azalea::entity::inventory::Inventory>()
+                .is_some_and(|inv| inv.id == self.current_container_id) {
+                bot.ecs.write().trigger(azalea::inventory::CloseContainerEvent {
+                    entity: bot.entity,
+                    id: self.current_container_id,
+                });
+            } else {
+                bot.write_packet(ServerboundContainerClose { container_id: self.current_container_id });
+            }
             self.current_container_id = 0;
             self.current_slots.clear();
         }
+        self.hopper_container_id = None;
     }
 
     /// Wall-clock watchdog: refresh stale screens instead of replaying non-idempotent clicks.
     pub async fn check_and_handle_timeout(&mut self, bot: &Client) -> bool {
-        if self.state == OrderWorkflowState::WithdrawalComplete
-            || self.state == OrderWorkflowState::Spawned
+        if let Some(pending) = &mut self.pending_anvil_pickup {
+            if !pending.warned && pending.sent_at.elapsed() >= std::time::Duration::from_secs(10) {
+                error!("Anvil pickup unconfirmed after 10s. Withdrawal paused; check the ground/hopper and return the anvil to inventory. No additional anvils will be thrown.");
+                pending.warned = true;
+            }
+            return false;
+        }
+        if self.hopper_active || self.state == OrderWorkflowState::WithdrawalComplete
             || self.state == OrderWorkflowState::WaitingForSpawn
         {
             return false;
@@ -2519,6 +2604,70 @@ impl GuiManager {
 mod tests {
     use super::*;
 
+    fn test_client() -> Client {
+        use azalea::entity::{LookDirection, Physics, inventory::Inventory};
+        use std::sync::Arc;
+        let mut app = azalea::app::App::new();
+        let entity = app.world_mut().spawn((
+            Inventory::default(), Physics::default(), LookDirection::new(0.0, 0.0),
+        )).id();
+        let world = std::mem::take(app.world_mut());
+        Client::new(entity, Arc::new(world.into()))
+    }
+
+    fn hopper_with_item(slot: i16, item: ItemStack) -> GuiManager {
+        let mut gui = GuiManager::new();
+        gui.hopper_active = true;
+        gui.on_open_screen(7, "Renamed hopper");
+        gui.hopper_container_id = Some(7);
+        let mut items = vec![ItemStack::Empty; 41];
+        items[(slot - 4) as usize] = item;
+        gui.on_set_content(7, 13, &items, None);
+        gui
+    }
+
+    #[test]
+    fn hopper_maps_main_inventory_and_hotbar_without_touching_bottles() {
+        use azalea_registry::builtin::ItemKind;
+        let book = ItemStack::new(ItemKind::EnchantedBook, 1);
+        for slot in 9..=44 {
+            let mut gui = hopper_with_item(slot, book.clone());
+            assert_eq!(gui.hopper_transfer_slot(slot, &book, None), Some(slot - 4));
+            gui.on_set_slot(7, 14, slot - 4, &ItemStack::Empty, None);
+            assert_eq!(gui.player_inventory.get(&slot), Some(&ItemStack::Empty));
+            assert_eq!(gui.hopper_transfer_slot(slot, &book, None), None);
+        }
+        for kind in [ItemKind::ExperienceBottle, ItemKind::Anvil, ItemKind::DiamondHelmet] {
+            let item = ItemStack::new(kind, 1);
+            let gui = hopper_with_item(36, item.clone());
+            assert_eq!(gui.hopper_transfer_slot(36, &item, None), None);
+        }
+    }
+
+    #[test]
+    fn hopper_refuses_wrong_menu_stale_source_and_missing_contents() {
+        use azalea_registry::builtin::ItemKind;
+        let book = ItemStack::new(ItemKind::EnchantedBook, 1);
+        let mut gui = hopper_with_item(44, book.clone());
+        gui.hopper_container_id = Some(8);
+        assert_eq!(gui.hopper_transfer_slot(44, &book, None), None);
+        gui.hopper_container_id = Some(7);
+        gui.current_slots.insert(40, ItemStack::new(ItemKind::ExperienceBottle, 1));
+        assert_eq!(gui.hopper_transfer_slot(44, &book, None), None);
+        gui.current_slots.insert(40, book.clone());
+        gui.open_container_size = 27;
+        assert_eq!(gui.hopper_transfer_slot(44, &book, None), None);
+        gui.open_container_size = 5;
+        gui.current_slots.remove(&0);
+        assert_eq!(gui.hopper_transfer_slot(44, &book, None), None);
+        for slot in [0, 8, 45] {
+            assert_eq!(gui.hopper_transfer_slot(slot, &book, None), None);
+        }
+        let stack = ItemStack::new(ItemKind::EnchantedBook, 2);
+        let gui = hopper_with_item(9, stack.clone());
+        assert_eq!(gui.hopper_transfer_slot(9, &stack, None), None);
+    }
+
     #[test]
     fn stock_alerts_require_fresh_orders_and_zero_actual_inventory() {
         use azalea_registry::builtin::ItemKind;
@@ -2536,6 +2685,109 @@ mod tests {
         assert!(gui.verified_stock_alerts().contains(&"Experience Bottles"));
         gui.record_command_sent("/order");
         assert!(gui.verified_stock_alerts().is_empty());
+    }
+
+    #[test]
+    fn an_empty_order_does_not_hide_another_order_of_the_same_item() {
+        use azalea_registry::builtin::ItemKind;
+        let mut gui = GuiManager::new();
+        gui.phase = WithdrawalPhase::ItemsRetrieval;
+        let icon = ItemStack::new(ItemKind::DiamondHelmet, 1);
+        for slot in [1, 2] {
+            gui.current_slots.insert(slot, icon.clone());
+        }
+        let first = OrderListing { slot: 1, name: "Diamond Helmet".into(), icon };
+        gui.stock_audit.select(0, first);
+        gui.stock_audit.collect_requested();
+        assert!(gui.stock_audit.confirm_empty().is_some());
+        gui.exhausted_orders.push("Diamond Helmet".into());
+        assert_eq!(gui.count_available_armor_orders(None), 1);
+    }
+
+    #[test]
+    fn inventory_reset_starts_a_fresh_order_audit() {
+        let mut gui = GuiManager::new();
+        gui.resume_order_scan = true;
+        gui.exhausted_orders.push("Mending Book".into());
+        gui.reset_and_sync_inventory(None);
+        assert!(!gui.resume_order_scan);
+        assert!(gui.exhausted_orders.is_empty());
+        assert!(gui.verified_stock_alerts().is_empty());
+    }
+
+    #[test]
+    fn no_items_chat_requires_an_active_collect_and_reopens_once_as_a_continuation() {
+        let bot = test_client();
+        let mut gui = GuiManager::new();
+        gui.state = OrderWorkflowState::InOrderSubmenu;
+        gui.target_order_type = Some("Mending Book".into());
+        gui.last_collecting_order_name = Some("Mending Book".into());
+        assert!(gui.record_no_items_to_collect(&bot).is_none());
+        assert_eq!(gui.state, OrderWorkflowState::InOrderSubmenu);
+        assert!(gui.exhausted_orders.is_empty());
+
+        let listing = OrderListing {
+            slot: 3, name: "Mending Book".into(), icon: ItemStack::Empty,
+        };
+        gui.stock_audit.select(0, listing.clone());
+        gui.stock_audit.collect_requested();
+        assert_eq!(gui.record_no_items_to_collect(&bot).as_deref(), Some("Mending Book"));
+        assert_eq!(gui.state, OrderWorkflowState::WaitingForNextOrder);
+        gui.record_command_sent("/order");
+        assert!(gui.stock_audit.is_empty(0, &listing));
+        gui.record_command_sent("/order");
+        assert!(!gui.stock_audit.is_empty(0, &listing));
+        assert!(gui.exhausted_orders.is_empty());
+    }
+
+    #[tokio::test]
+    async fn successful_delivery_does_not_confirm_the_order_empty() {
+        use azalea_registry::builtin::ItemKind;
+        let bot = test_client();
+        let mut gui = GuiManager::new();
+        gui.phase = WithdrawalPhase::ItemsRetrieval;
+        gui.target_order_type = Some("Experience Bottles".into());
+        gui.exhausted_orders.push("Experience Bottles".into());
+        let bottle = ItemStack::new(ItemKind::ExperienceBottle, 1);
+        let listing = OrderListing {
+            slot: 1, name: "Experience Bottles".into(), icon: bottle.clone(),
+        };
+        gui.stock_audit.select(0, listing.clone());
+        gui.stock_audit.collect_requested();
+        gui.on_open_screen(5, "Orders -> Collect Items");
+        let mut items = vec![ItemStack::Empty; 63];
+        items[0] = bottle.clone();
+        gui.on_set_content(5, 1, &items, None);
+        assert!(!gui.transfer_delivery_items(&bot).await);
+
+        items[0] = ItemStack::Empty;
+        items[27] = bottle;
+        gui.on_set_content(5, 2, &items, None);
+        assert!(gui.exhausted_orders.is_empty());
+        assert!(gui.transfer_delivery_items(&bot).await);
+        assert!(!gui.stock_audit.is_empty(0, &listing));
+    }
+
+    #[tokio::test]
+    async fn spawned_state_services_scheduled_commands_and_stalled_order_requests() {
+        let bot = test_client();
+        let mut gui = GuiManager::new();
+        gui.phase = WithdrawalPhase::ItemsRetrieval;
+        gui.state = OrderWorkflowState::Spawned;
+        gui.schedule_command("/order".into(), std::time::Duration::ZERO);
+        assert!(gui.check_and_handle_timeout(&bot).await);
+        assert!(gui.awaiting_response);
+        assert_eq!(gui.last_command_sent.as_deref(), Some("/order"));
+
+        let mut stalled = GuiManager::new();
+        stalled.phase = WithdrawalPhase::ItemsRetrieval;
+        stalled.state = OrderWorkflowState::Spawned;
+        stalled.record_command_sent("/order");
+        stalled.last_action_time = Some(std::time::Instant::now() - std::time::Duration::from_secs(7));
+        assert!(stalled.check_and_handle_timeout(&bot).await);
+        assert_eq!(stalled.action_retry_count, 1);
+        assert_eq!(stalled.state, OrderWorkflowState::WaitingForNextOrder);
+        assert!(stalled.awaiting_response);
     }
 
     #[test]
@@ -2815,33 +3067,99 @@ mod tests {
         let (needed_one, _) = gui.is_order_needed(&anvil_info);
         assert!(needed_one, "Anvil must be needed when bot has 1 anvil (< 2)");
 
-        // 2 anvils and anvil_stack_dropped is true: not needed
+        // Two server-confirmed anvils meet the quota: no throw is needed.
         gui.collected.anvils = 2;
-        gui.anvil_stack_dropped = true;
         let (needed_two, _) = gui.is_order_needed(&anvil_info);
-        assert!(!needed_two, "Anvil must not be needed when bot has >= 2 anvils and stack dropped");
+        assert!(!needed_two, "Anvil must not be needed when the inventory meets the quota");
     }
 
     #[test]
-    fn test_anvil_drop_slot_stack_tracking() {
+    fn anvil_pickup_requires_inventory_growth_not_source_removal() {
+        use azalea_registry::builtin::ItemKind;
+        for inventory_first in [false, true] {
+            let mut gui = GuiManager::new();
+            gui.on_open_screen(5, "Orders -> Collect Items");
+            let mut items = vec![ItemStack::Empty; 63];
+            items[0] = ItemStack::new(ItemKind::Anvil, 64);
+            items[27] = ItemStack::new(ItemKind::Anvil, 1);
+            gui.on_set_content(5, 12, &items, None);
+            gui.pending_anvil_pickup = Some(PendingAnvilPickup {
+                inventory_before: 1, sent_at: std::time::Instant::now(), warned: false,
+            });
+            gui.record_action_sent(Some(0), Some(ClickType::Throw));
+            assert!(!gui.anvil_withdrawal_complete());
+            let source_update = ItemStack::new(ItemKind::Anvil, 63);
+            let pickup = ItemStack::new(ItemKind::Anvil, 2);
+            if inventory_first {
+                gui.on_set_slot(-2, 13, 9, &pickup, None);
+                gui.on_set_slot(5, 14, 0, &source_update, None);
+            } else {
+                gui.on_set_slot(5, 13, 0, &source_update, None);
+                assert!(gui.awaiting_response);
+                assert!(gui.pending_anvil_pickup.is_some());
+                assert!(!gui.anvil_withdrawal_complete());
+                gui.on_set_slot(5, 14, 27, &pickup, None);
+            }
+            assert!(gui.pending_anvil_pickup.is_none());
+            assert!(!gui.awaiting_response);
+            assert!(gui.anvil_withdrawal_complete());
+        }
+    }
+
+    #[tokio::test]
+    async fn anvil_throw_aims_down_before_single_item_click_and_timeout_does_not_repeat() {
+        use azalea::entity::{LookDirection, Physics, inventory::Inventory};
+        use azalea::protocol::packets::game::ServerboundGamePacket;
+        use azalea_registry::builtin::ItemKind;
+        use std::sync::{Arc, Mutex};
+        let packets = Arc::new(Mutex::new(Vec::new()));
+        let observed = packets.clone();
+        let mut app = azalea::app::App::new();
+        app.world_mut().add_observer(move |event: azalea::ecs::prelude::On<azalea::packet::game::SendGamePacketEvent>| {
+            observed.lock().unwrap().push(event.packet.clone());
+        });
+        let entity = app.world_mut().spawn((
+            Inventory { id: 5, ..Default::default() }, Physics::default(), LookDirection::new(40.0, 0.0),
+        )).id();
+        let world = std::mem::take(app.world_mut());
+        let bot = Client::new(entity, Arc::new(world.into()));
         let mut gui = GuiManager::new();
-        gui.current_container_id = 5;
-        gui.current_state_id = 12;
-
-        assert!(!gui.anvil_stack_dropped);
-        assert_eq!(gui.last_click_type, None);
-        assert_eq!(gui.last_clicked_slot, None);
-
-        // Record action sent when dropping slot 0
-        gui.record_action_sent(Some(0), Some(ClickType::Throw));
-        assert_eq!(gui.last_click_type, Some(ClickType::Throw));
-        assert_eq!(gui.last_clicked_slot, Some(0));
-        assert!(gui.awaiting_response);
-
-        // Verify watchdog is cleared on acknowledgement of slot 0 being cleared
-        gui.on_set_slot(5, 13, 0, &ItemStack::Empty, None);
-        assert!(!gui.awaiting_response);
-        assert_eq!(gui.last_action_time, None);
+        gui.on_open_screen(5, "Orders -> Collect Items");
+        let mut items = vec![ItemStack::Empty; 63];
+        items[0] = ItemStack::new(ItemKind::Anvil, 64);
+        gui.on_set_content(5, 12, &items, None);
+        assert!(gui.throw_one_anvil_at_feet(&bot, 0));
+        assert!(!gui.throw_one_anvil_at_feet(&bot, 0));
+        gui.on_set_slot(5, 13, 0, &ItemStack::new(ItemKind::Anvil, 63), None);
+        gui.pending_anvil_pickup.as_mut().unwrap().sent_at -= std::time::Duration::from_secs(11);
+        assert!(!gui.check_and_handle_timeout(&bot).await);
+        assert!(!gui.process_gui_actions(&bot).await);
+        assert!(!gui.anvil_withdrawal_complete());
+        bot.ecs.write().flush();
+        {
+            let packets = packets.lock().unwrap();
+            assert_eq!(packets.len(), 2, "no automatic replay after pickup timeout");
+            let ServerboundGamePacket::MovePlayerRot(look) = &packets[0] else { panic!("aim must precede throw"); };
+            assert_eq!(look.look_direction.x_rot(), 90.0);
+            assert_eq!(look.look_direction.y_rot(), 40.0);
+            let ServerboundGamePacket::ContainerClick(click) = &packets[1] else { panic!("expected throw click"); };
+            assert_eq!(click.click_type, ClickType::Throw);
+            assert_eq!(click.button_num, 0);
+            assert_eq!(click.slot_num, 0);
+            assert_eq!(click.container_id, 5);
+            assert_eq!(click.state_id, 12);
+        }
+        // Fresh inventory snapshots after a close/reconnect reconcile the retained obligation.
+        gui.current_container_id = 0;
+        gui.player_inventory.clear();
+        gui.clear_watchdog();
+        assert!(!gui.anvil_withdrawal_complete());
+        let mut inventory = vec![ItemStack::Empty; 46];
+        inventory[36] = ItemStack::new(ItemKind::Anvil, 1);
+        gui.on_set_content(0, 1, &inventory, None);
+        assert!(gui.pending_anvil_pickup.is_none());
+        assert!(gui.scheduled_command.is_some());
+        assert!(!gui.anvil_withdrawal_complete(), "one picked-up anvil does not meet a two-anvil quota");
     }
 
     #[test]

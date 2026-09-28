@@ -11,12 +11,22 @@
 ## Serial armor fixes
 
 - Default withdrawals now contain two of each armor type and the books for two sets (8 Unbreaking III, 8 Mending, 4 Protection IV, 4 Blast Protection IV), with 256 XP bottles. Both items of each armor type are collected together to reduce order visits.
-- Each set is enchanted and dropped in helmet, chestplate, leggings, boots order. The next stocked set starts immediately in the same worker, without cleaning or opening `/order` between sets.
-- Anvil and drop waits use server-update notifications with bounded timeout fallbacks. Anvil opening no longer holds its manager lock for a fixed two-tick delay after interaction. These remove local delays; server throughput has not been measured.
+- Each set is enchanted and deposited in helmet, chestplate, leggings, boots order. The next stocked set starts immediately in the same worker, without cleaning or opening `/order` between sets.
+- Anvil and hopper waits use server-update notifications with bounded timeout fallbacks. Anvil opening no longer holds its manager lock for a fixed two-tick delay after interaction. These remove local delays; server throughput has not been measured.
 - Enchanting finishes one piece per type in that order. Missing books return the unfinished set to orders instead of claiming success or skipping ahead.
 - The latest withdrawal inventory is copied into the enchanter at handoff. Direct player inventory packets are handled, and armor verification uses one authoritative inventory rather than merging duplicate slot namespaces.
-- Drops use inventory-slot Throw clicks, one piece at a time, rather than hotbar swaps and locally fabricated empty slots. Server inventory counts must confirm each drop. Partial drop progress survives automatic reconnects within the process.
-- A missing hopper or unconfirmed drop prevents starting another set. Hopper capture itself is not verified; only removal from the player inventory is confirmed.
+- Hopper deposits use QuickMove in a verified five-slot hopper menu, one completed armor piece at a time. The player slot is mapped to the hopper menu and checked against the expected item before clicking. Server source-slot and inventory-count updates confirm each transfer. Partial transfer progress survives automatic reconnects within the process. Rejected books also use the hopper GUI; XP bottles cannot pass the transfer guard.
+- A missing/full hopper, closed menu, or unconfirmed transfer prevents starting another set. The menu is closed after the attempt. Items may drain into connected storage immediately; confirmation relies on server updates to the player source slot and inventory, not continued presence in the hopper.
+
+## Anvil pickup and rejected books
+
+- Anvil withdrawal sends an explicit downward rotation before throwing one anvil from the order GUI. It waits for the server inventory anvil count to increase before throwing another, and advances only after the configured quota is held. Source-slot removal alone is not pickup confirmation.
+- If pickup is still unconfirmed after 10 seconds, withdrawal pauses and logs the problem instead of throwing more anvils. Returning the missing anvil to the bot's inventory resumes progress. The pending pickup survives an automatic reconnect within the same process, but not a process restart. Throwing at feet cannot prevent a hopper directly under the drop from collecting it.
+- The order GUI closes before moving confirmed anvils to the offhand, so player-menu swaps target the correct menu.
+- Failed rejected-book disposal is tracked by the exact item and its components instead of inventory slot numbers. Good replacements remain eligible even in the old slot, and successful disposal clears the rejection. Anvil staging also refuses to substitute a rejected hotbar book for a good book with the same enchantment.
+- XP use now reads a packet-only inventory snapshot. A no-op hotbar self-swap with a mismatched state ID requests a fresh full snapshot after the anvil closes. If the server does not return it, the routine aborts safely.
+- XP swaps require matching updates for both source and hotbar slots. Bottle-use requests are tracked separately from actual inventory and never overwrite GUI/enchanter caches. Each batch waits for server-confirmed consumption and XP gain. Partial, rejected, or missing acknowledgements reconnect for reconciliation after a five-second timeout.
+- Anvil close now updates Azalea's active menu as well as sending the server close packet, so XP inventory operations use the player menu.
 
 ## Earlier buyer-order fixes (legacy delivery routine)
 
@@ -32,11 +42,11 @@
 9. **Unsafe retry replay.** Retrying a non-idempotent slot click could transfer a second item or undo a swap. Recovery refreshes the screen and reconciles inventory instead. Command timers are tracked and superseded by newer commands.
 10. **Lock-held polling and stale fallback clicks.** Sell-window polling and anvil result polling prevented packet handlers from updating the state being polled. Sell, withdrawal, deposit, and anvil clicks now advance from acknowledgements. XP throwing releases the shared enchanter lock. Redundant GUI task polling and fixed post-click waits were removed.
 11. **Anvil routing/state contamination.** A 39-slot packet was assumed to be an anvil, and unrelated container data could overwrite repair cost. Routing now uses the tracked anvil container ID; full player inventory packets update the enchanter cache as well.
-12. **XP swap bookkeeping.** After bottles moved into the hotbar, the estimate was decremented at the old inventory slot. The XP worker now tracks the swap and decrements the actual hotbar slot.
+12. **XP swap bookkeeping.** XP actions no longer edit inventory estimates or copy a worker inventory over server updates. Both swapped slots and bottle consumption must be confirmed by server packets.
 
 ## Validation
 
-Run `cargo test --locked`. Regression tests cover four-type completion, duplicate snapshots, rejected confirmations, escrow, late/wrong-container contents, dropped contents after OpenScreen, source/inventory update ordering, consumed quota items, misleading XP stack counts, and anvil completion while work is pending.
+Run `cargo test --locked`. Regression tests cover four-type completion, duplicate snapshots, rejected confirmations, escrow, late/wrong-container contents, dropped contents after OpenScreen, source/inventory update ordering, consumed quota items, misleading XP stack counts, anvil completion while work is pending, rejected XP swaps, both swap packet orders, partial bottle consumption, delayed acknowledgements, and changed held items.
 
 These are local state-machine tests. No live account was connected, no items were sold or delivered during validation, and no server-load or throughput benchmark was performed.
 
@@ -45,5 +55,5 @@ These are local state-machine tests. No live account was connected, no items wer
 - The server exposes separate transactions for individual armor types. Four-piece delivery cannot be atomic: a buyer can close a remaining order after accepting three pieces. The bot retains the outstanding obligation instead of claiming success or starting a new batch.
 - Acceptance is inferred from confirmation plus a fresh server inventory snapshot. There is no server transaction ID/receipt API in this repository. Unexpected inventory changes hold the transaction for reconciliation.
 - Delivery bookkeeping survives automatic reconnects in the same process, but is not persisted to disk. Restarting or killing the bot during a partial delivery loses that ledger; reconcile the buyer's orders and inventory before restarting an interrupted delivery.
-- Existing enchantment inspection accepts lore/name fallbacks as well as applied components. A server that displays misleading enchantment text can still cause false item classification. This compatibility behavior was retained.
+- Book/order identification can use displayed enchantment text, but armor completion requires applied enchantment components. Servers that expose armor enchantments only as lore will require a different authoritative verification path before this bot can mark those pieces complete.
 - Command cooldowns, login/teleport settling, XP animation timing, and restock cooldowns remain. The changes reduce unnecessary waiting; they do not promise a throughput target or an anti-cheat outcome.

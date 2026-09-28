@@ -29,12 +29,8 @@ pub fn armor_type(info: &ItemInfo) -> Option<usize> {
 }
 
 pub fn is_complete(info: &ItemInfo) -> bool {
-    // Completely unenchanted items (empty enchantments AND empty lore) can NEVER be complete!
-    if info.enchantments.is_empty() && info.lore.is_empty() {
-        return false;
-    }
-    // A complete God armor piece requires at least 3 distinct enchantments
-    if info.enchantments.len() < 3 && info.lore.len() < 3 {
+    // Completion requires applied components; editable lore is not proof.
+    if info.enchantments.len() < 3 {
         return false;
     }
     armor_type(info).is_some_and(|kind| {

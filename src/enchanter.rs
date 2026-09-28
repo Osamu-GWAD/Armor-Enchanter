@@ -186,7 +186,7 @@ pub struct EnchanterManager {
     pub restock_needed: bool,
     pub cursed_book_to_discard: Option<ItemStack>,
     pub cursed_book_slot: Option<i16>,
-    pub cursed_inventory_slots: std::collections::HashSet<i16>,
+    rejected_books: Vec<ItemStack>,
     pub last_staged_buttons: Option<(u8, u8)>,
     pub rejection_recovery: bool,
     pub pending_rejection_book: Option<ItemStack>,
@@ -219,7 +219,7 @@ impl EnchanterManager {
             restock_needed: false,
             cursed_book_to_discard: None,
             cursed_book_slot: None,
-            cursed_inventory_slots: Default::default(),
+            rejected_books: Vec::new(),
             last_staged_buttons: None,
             rejection_recovery: false,
             pending_rejection_book: None,
@@ -244,7 +244,6 @@ impl EnchanterManager {
         self.server_anvil_cost.store(0, Ordering::SeqCst);
         self.cursed_book_to_discard = None;
         self.cursed_book_slot = None;
-        self.cursed_inventory_slots.clear();
         self.last_staged_buttons = None;
         self.rejection_recovery = false;
         self.pending_rejection_book = None;
@@ -291,145 +290,6 @@ impl EnchanterManager {
             .into_iter()
             .min()
             .map(|(count, _, slot)| (slot, count))
-    }
-
-    /// Splash the exact number of XP bottles needed to advance from the current level and progress
-    /// to `target_level` using rapid human-like right clicks and arm swing animations.
-    pub async fn throw_exact_xp_bottles(&mut self, bot: &Client, target_level: u32) {
-        let target_level = target_level.min(39);
-        if target_level == 0 {
-            return;
-        }
-
-        // Wait 2 ticks to allow any in-flight SetExperience packet from container transactions to settle
-        bot.wait_ticks(2).await;
-
-        let (mut current_lvl, mut current_prog) = self.get_level_and_progress();
-
-        if current_lvl >= target_level {
-            info!("Already at level {} (target: {}). No XP bottles needed.", current_lvl, target_level);
-            return;
-        }
-
-        let needed_xp = xp_difference(current_lvl, current_prog, target_level);
-        info!(
-            "XP Progression: Current Level {} ({:.1}% progress) -> Target Level {} (Deficit: {} XP). Initiating zero-overshoot throwing...",
-            current_lvl, current_prog * 100.0, target_level, needed_xp
-        );
-
-        // Aim smoothly down at the bot's feet
-        let dir = bot.direction();
-        smooth_look(bot, dir.y_rot(), 90.0).await;
-        bot.wait_ticks(1).await;
-
-        let mut stall_count = 0;
-        let mut last_xp = calculate_current_xp(current_lvl, current_prog);
-
-        while current_lvl < target_level {
-            let needed_xp = xp_difference(current_lvl, current_prog, target_level);
-            if needed_xp == 0 {
-                break;
-            }
-
-            // Calculate the maximum safe batch mathematically proven NEVER to overshoot.
-            // Since max XP from one bottle is 11, throwing `(needed_xp - 1) / 11` bottles cannot reach needed_xp.
-            // When needed_xp <= 11, safe_batch is 0, so we throw strictly 1 bottle at a time.
-            let safe_batch = safe_batch_size(needed_xp);
-            let count_to_throw = if safe_batch > 0 { safe_batch } else { 1 };
-
-            // Find XP bottles in inventory - always prioritize the slot with the lowest amount
-            let (slot, slot_count) = match Self::find_lowest_count_xp_slot(&self.player_inventory, Some(bot)) {
-                Some(s) => s,
-                None => {
-                    warn!("No XP bottles found in inventory to reach level {target_level}!");
-                    break;
-                }
-            };
-
-            // If item is in main inventory (slots 9..35), swap to hotbar slot 0
-            let hotbar_idx = if slot >= 36 && slot <= 44 {
-                (slot - 36) as u8
-            } else {
-                info!("Swapping XP bottles from slot #{slot} to hotbar slot #0...");
-                Self::swap_to_hotbar(bot, slot, 0);
-                let bottles = self.player_inventory.remove(&slot).unwrap_or(ItemStack::Empty);
-                let old_hotbar = self.player_inventory.insert(36, bottles).unwrap_or(ItemStack::Empty);
-                self.player_inventory.insert(slot, old_hotbar);
-                bot.wait_ticks(2).await;
-                0
-            };
-
-            bot.set_selected_hotbar_slot(hotbar_idx);
-            bot.wait_ticks(1).await;
-
-            let actual_throw = count_to_throw.min(slot_count as u32);
-            info!(
-                "Throwing {actual_throw} XP bottle(s) at feet (needed deficit: {needed_xp} XP, target: Level {target_level}, mode: {})...",
-                if safe_batch > 0 { "safe batch" } else { "single-bottle precision" }
-            );
-
-            for _ in 0..actual_throw {
-                bot.write_packet(azalea::protocol::packets::game::s_use_item::ServerboundUseItem {
-                    hand: InteractionHand::MainHand,
-                    seq: 0,
-                    y_rot: dir.y_rot(),
-                    x_rot: 90.0,
-                });
-                swing_arm(bot);
-                bot.wait_ticks(1).await;
-            }
-
-            // Update local inventory count estimate for this slot
-            if let Some(item) = self.player_inventory.get_mut(&(36 + hotbar_idx as i16)) {
-                if let ItemStack::Present(data) = item {
-                    if (data.count as u32) <= actual_throw {
-                        *item = ItemStack::Empty;
-                    } else {
-                        data.count -= actual_throw as i32;
-                    }
-                }
-            }
-
-            // Wait for server SetExperience packet to arrive (handles latency desync gracefully).
-            // Wait up to 500ms (10 ticks) for notification, followed by 2 ticks to allow any trailing orbs to settle.
-            let got_update = tokio::time::timeout(
-                std::time::Duration::from_millis(500),
-                self.experience_updated.notified(),
-            ).await.is_ok();
-
-            if got_update {
-                bot.wait_ticks(2).await;
-            } else {
-                bot.wait_ticks(4).await;
-            }
-
-            let (new_lvl, new_prog) = self.get_level_and_progress();
-            current_lvl = new_lvl;
-            current_prog = new_prog;
-            let current_xp = calculate_current_xp(current_lvl, current_prog);
-            info!(
-                "XP Update: Current Level: {} ({:.1}% progress, True Current XP: {}) [Target: Level {}]",
-                current_lvl, current_prog * 100.0, current_xp, target_level
-            );
-
-            if current_lvl >= target_level {
-                info!("Target Level {target_level} reached! Halting XP bottle consumption immediately (zero overshoot).");
-                break;
-            }
-
-            if current_xp <= last_xp {
-                stall_count += 1;
-                if stall_count >= 5 {
-                    warn!("XP did not increase after 5 throw attempts (out of XP bottles or desync). Exiting XP routine.");
-                    break;
-                }
-            } else {
-                stall_count = 0;
-            }
-            last_xp = current_xp;
-        }
-
-        info!("Finished XP consumption routine. Final level: {current_lvl} (target was {target_level}).");
     }
 
 /// Scans nearby blocks around the bot to find any placed anvil within reach.
@@ -952,7 +812,7 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
                 if let Some(info) = inspect_item_with_bot(item, Some(bot)) {
                     if is_diamond_armor(&info) {
                         armor_slots.push((slot, info));
-                    } else if info.kind.contains("Book") || info.kind.contains("EnchantedBook") {
+                    } else if (info.kind.contains("Book") || info.kind.contains("EnchantedBook")) && !self.is_rejected_book(item) {
                         book_slots.push((slot, info));
                     }
                 }
@@ -983,25 +843,20 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
                 }
             }
 
-            let is_cursed = |slot: i16| -> bool {
-                let inv_slot = if (3..=38).contains(&slot) { slot - 3 + 9 } else { slot };
-                self.cursed_inventory_slots.contains(&inv_slot) || self.cursed_inventory_slots.contains(&slot)
-            };
-
             if let Some((ench_name, req_level, predicate)) = target {
                 // Priority 1: Pick clean book (0 prior work penalty) that has not been marked cursed
                 let clean_book = book_slots.iter()
-                    .filter(|(s, b)| !is_cursed(*s) && predicate(b) && b.repair_cost.unwrap_or(0) == 0)
+                    .filter(|(_, b)| predicate(b) && b.repair_cost.unwrap_or(0) == 0)
                     .filter(|(s, _)| *s >= 30)
-                    .chain(book_slots.iter().filter(|(s, b)| !is_cursed(*s) && predicate(b) && b.repair_cost.unwrap_or(0) == 0 && *s < 30))
+                    .chain(book_slots.iter().filter(|(s, b)| predicate(b) && b.repair_cost.unwrap_or(0) == 0 && *s < 30))
                     .next();
 
                 // Priority 2: Fall back to un-tested candidate book (will be verified in anvil)
                 let selected_book = clean_book.or_else(|| {
                     book_slots.iter()
-                        .filter(|(s, b)| !is_cursed(*s) && predicate(b))
+                        .filter(|(_, b)| predicate(b))
                         .filter(|(s, _)| *s >= 30)
-                        .chain(book_slots.iter().filter(|(s, b)| !is_cursed(*s) && predicate(b) && *s < 30))
+                        .chain(book_slots.iter().filter(|(s, b)| predicate(b) && *s < 30))
                         .next()
                 });
 
@@ -1018,6 +873,19 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
         }
 
         None
+    }
+
+    pub fn is_rejected_book(&self, item: &ItemStack) -> bool {
+        self.rejected_books.contains(item)
+    }
+
+    /// Track failed disposal by item identity, never by mutable inventory slot numbers.
+    pub fn record_book_disposal(&mut self, book: &ItemStack, confirmed: bool) {
+        if confirmed {
+            self.rejected_books.retain(|rejected| rejected != book);
+        } else if !self.is_rejected_book(book) {
+            self.rejected_books.push(book.clone());
+        }
     }
 
     /// Checks whether another book matching the next combine requirement for current armor piece is available in player inventory.
@@ -1540,6 +1408,7 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
         }
 
         let book_already_staged = book_inventory_slot < 30
+            && self.item_at_anvil_slot(30 + book_button as i16).is_some_and(|item| !self.is_rejected_book(&item))
             && self.anvil_slots_match(30 + book_button as i16, book_inventory_slot);
 
         if book_inventory_slot < 30 && !book_already_staged {
@@ -1579,7 +1448,11 @@ pub fn find_placement_pos(bot: &Client) -> (BlockPos, BlockPos) {
     /// Close the anvil container.
     pub fn close_anvil(&mut self, bot: &Client, container_id: i32) {
         info!("Closing Anvil GUI (container #{container_id})...");
-        bot.write_packet(ServerboundContainerClose { container_id });
+        if bot.get_component::<azalea::entity::inventory::Inventory>().is_some_and(|inv| inv.id == container_id) {
+            bot.ecs.write().trigger(azalea::inventory::CloseContainerEvent { entity: bot.entity, id: container_id });
+        } else {
+            bot.write_packet(ServerboundContainerClose { container_id });
+        }
         self.anvil_container_id = None;
         self.anvil_slots.clear();
         self.combine_clicks.clear();
@@ -2021,27 +1894,50 @@ mod tests {
     }
 
     #[test]
-    fn test_cursed_inventory_slots_filtered_in_find_next_combine_task() {
+    fn rejected_books_follow_item_identity_without_blocking_good_slots() {
         use azalea_registry::builtin::ItemKind;
-
+        use azalea_inventory::components::{CustomName, RepairCost};
+        let mut app = azalea::app::App::new();
+        let entity = app.world_mut().spawn_empty().id();
+        let world = std::mem::take(app.world_mut());
+        let bot = Client::new(entity, Arc::new(world.into()));
+        let good = ItemStack::new(ItemKind::EnchantedBook, 1)
+            .with_component(CustomName { name: "Protection IV".into() });
+        let rejected = good.clone().with_component(RepairCost { cost: 7 });
         let mut manager = EnchanterManager::new();
-        // Insert clean chestplate in slot 30 (hotbar 0)
-        manager.anvil_slots.insert(30, ItemStack::new(ItemKind::DiamondChestplate, 1));
+        manager.anvil_slots.insert(30, ItemStack::new(ItemKind::DiamondHelmet, 1));
+        manager.anvil_slots.insert(31, rejected.clone()); // player slot 37
+        manager.anvil_slots.insert(37, good.clone()); // player slot 43
+        manager.record_book_disposal(&rejected, false);
+        assert_eq!(manager.find_next_combine_task(&bot).unwrap().book_slot, 37);
+        // A replacement in the rejected book's old slot is valid immediately.
+        manager.anvil_slots.insert(31, good.clone());
+        manager.anvil_slots.insert(37, rejected.clone());
+        assert_eq!(manager.find_next_combine_task(&bot).unwrap().book_slot, 31);
+        // Failure remains tracked across batch reset; confirmed disposal clears it.
+        manager.reset_for_next_batch();
+        assert!(manager.is_rejected_book(&rejected));
+        manager.record_book_disposal(&rejected, true);
+        assert!(!manager.is_rejected_book(&rejected));
+        // Successful disposal must never add a blacklist entry.
+        manager.record_book_disposal(&good, true);
+        assert!(!manager.is_rejected_book(&good));
+    }
 
-        // Insert Prot IV book in slot 31 (hotbar 1)
-        manager.anvil_slots.insert(31, ItemStack::new(ItemKind::EnchantedBook, 1));
-
-        // Mark slot 31 as cursed
-        manager.cursed_inventory_slots.insert(31);
-
-        // Simulated bot inspection without client
-        // With slot 31 marked cursed, it should not select slot 31
-        let is_cursed = |slot: i16| -> bool {
-            let inv_slot = if (3..=38).contains(&slot) { slot - 3 + 9 } else { slot };
-            manager.cursed_inventory_slots.contains(&inv_slot) || manager.cursed_inventory_slots.contains(&slot)
-        };
-        assert!(is_cursed(31));
-        assert!(!is_cursed(30));
+    #[test]
+    fn staging_cannot_substitute_a_rejected_book_with_the_same_enchantment() {
+        use azalea_registry::builtin::ItemKind;
+        use azalea_inventory::components::{CustomName, RepairCost};
+        let good = ItemStack::new(ItemKind::EnchantedBook, 1)
+            .with_component(CustomName { name: "Protection IV".into() });
+        let rejected = good.clone().with_component(RepairCost { cost: 7 });
+        let mut manager = EnchanterManager::new();
+        manager.anvil_slots.insert(30, ItemStack::new(ItemKind::DiamondHelmet, 1));
+        manager.anvil_slots.insert(31, rejected.clone());
+        manager.anvil_slots.insert(5, good);
+        manager.record_book_disposal(&rejected, false);
+        manager.queue_anvil_combination(30, 5);
+        assert_eq!(manager.next_combine_click(), Some((5, 1, ClickType::Swap)));
     }
 
     #[test]
